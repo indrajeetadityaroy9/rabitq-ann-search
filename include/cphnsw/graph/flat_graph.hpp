@@ -192,7 +192,7 @@ public:
      */
     void prefetch_neighbor_block(NodeId id) const {
         if (id < nodes_.size()) {
-            cphnsw::prefetch(&nodes_[id], 3);
+            cphnsw::prefetch(&nodes_[id]);
         }
     }
 
@@ -201,27 +201,11 @@ public:
     // ========================================================================
 
     /**
-     * Add a neighbor to a node (NOT thread-safe).
-     */
-    bool add_neighbor(NodeId node, NodeId neighbor, const CodeT& neighbor_code, float distance) {
-        if (node >= nodes_.size()) return false;
-        return nodes_[node].add(neighbor, neighbor_code, distance);
-    }
-
-    /**
      * Add a neighbor to a node (thread-safe).
      */
     bool add_neighbor_safe(NodeId node, NodeId neighbor, const CodeT& neighbor_code, float distance) {
         if (node >= nodes_.size()) return false;
         return nodes_[node].add_safe(neighbor, neighbor_code, distance);
-    }
-
-    /**
-     * Try to add a neighbor, replacing worst if full (NOT thread-safe).
-     */
-    bool try_add_neighbor(NodeId node, NodeId neighbor, const CodeT& neighbor_code, float distance) {
-        if (node >= nodes_.size()) return false;
-        return nodes_[node].try_add(neighbor, neighbor_code, distance);
     }
 
     /**

@@ -61,11 +61,7 @@ public:
 
         size_t bytes = n * sizeof(T);
 
-#if defined(_MSC_VER)
-        void* ptr = _aligned_malloc(bytes, Alignment);
-#else
         void* ptr = std::aligned_alloc(Alignment, bytes);
-#endif
 
         if (!ptr) {
             throw std::bad_alloc();
@@ -76,11 +72,7 @@ public:
 
     void deallocate(pointer p, size_type) noexcept {
         if (p) {
-#if defined(_MSC_VER)
-            _aligned_free(p);
-#else
             std::free(p);
-#endif
         }
     }
 
@@ -131,26 +123,14 @@ struct MemoryTraits {
  * @param addr Memory address to prefetch
  */
 inline void prefetch(const void* addr) {
-#if defined(__GNUC__) || defined(__clang__)
     __builtin_prefetch(addr, 0, 3);  // Read, L1 locality
-#elif defined(_MSC_VER)
-    _mm_prefetch(static_cast<const char*>(addr), _MM_HINT_T0);
-#else
-    (void)addr;
-#endif
 }
 
 /**
  * Prefetch for write access (L1, highest locality).
  */
 inline void prefetch_write(void* addr) {
-#if defined(__GNUC__) || defined(__clang__)
     __builtin_prefetch(addr, 1, 3);  // Write, L1 locality
-#elif defined(_MSC_VER)
-    _mm_prefetch(static_cast<const char*>(addr), _MM_HINT_T0);
-#else
-    (void)addr;
-#endif
 }
 
 /**
@@ -159,13 +139,7 @@ inline void prefetch_write(void* addr) {
  */
 template <int Locality = 3>
 inline void prefetch_t(const void* addr) {
-#if defined(__GNUC__) || defined(__clang__)
     __builtin_prefetch(addr, 0, Locality);
-#elif defined(_MSC_VER)
-    _mm_prefetch(static_cast<const char*>(addr), _MM_HINT_T0);
-#else
-    (void)addr;
-#endif
 }
 
 // ============================================================================
@@ -207,11 +181,7 @@ struct alignas(CACHE_LINE_SIZE) CacheLineIsolated {
 struct AlignedDeleter {
     void operator()(void* ptr) const noexcept {
         if (ptr) {
-#if defined(_MSC_VER)
-            _aligned_free(ptr);
-#else
             std::free(ptr);
-#endif
         }
     }
 };
@@ -231,11 +201,7 @@ AlignedUniquePtr<T> make_aligned(size_t count = 1) {
 
     size_t bytes = count * sizeof(T);
 
-#if defined(_MSC_VER)
-    void* ptr = _aligned_malloc(bytes, Alignment);
-#else
     void* ptr = std::aligned_alloc(Alignment, bytes);
-#endif
 
     if (!ptr) {
         throw std::bad_alloc();

@@ -2,41 +2,13 @@
 
 #include <cstddef>
 #include <cassert>
-
-// SIMD detection
-#if defined(__AVX512F__)
-#define CPHNSW_FHT_AVX512 1
 #include <immintrin.h>
-#elif defined(__AVX2__)
-#define CPHNSW_FHT_AVX512 0
-#define CPHNSW_FHT_AVX2 1
-#include <immintrin.h>
-#else
-#define CPHNSW_FHT_AVX512 0
-#define CPHNSW_FHT_AVX2 0
-#endif
 
 namespace cphnsw {
 
 // ============================================================================
 // Fast Hadamard Transform
 // ============================================================================
-
-/**
- * Fast Hadamard Transform (FHT)
- *
- * Computes H * x in-place where H is the Walsh-Hadamard matrix.
- * The transform is its own inverse (up to scaling by 1/sqrt(n)).
- *
- * Mathematical definition (recursive):
- *   H_1 = [1]
- *   H_{2n} = [[H_n, H_n], [H_n, -H_n]]
- *
- * Complexity: O(n log n) time, O(1) auxiliary space
- *
- * Note: No normalization is applied. The transform increases magnitude
- * by sqrt(n), but since we use argmax (scale-invariant), this is fine.
- */
 
 namespace detail {
 
@@ -47,32 +19,10 @@ inline bool is_power_of_two(size_t n) {
 }  // namespace detail
 
 // ============================================================================
-// Scalar Implementation (Reference/Fallback)
-// ============================================================================
-
-/**
- * Scalar Fast Hadamard Transform using classic butterfly algorithm.
- */
-inline void fht_scalar(float* vec, size_t len) {
-    assert(detail::is_power_of_two(len) && "FHT requires power-of-2 length");
-
-    for (size_t h = 1; h < len; h *= 2) {
-        for (size_t i = 0; i < len; i += h * 2) {
-            for (size_t j = i; j < i + h; ++j) {
-                float x = vec[j];
-                float y = vec[j + h];
-                vec[j] = x + y;
-                vec[j + h] = x - y;
-            }
-        }
-    }
-}
-
-// ============================================================================
 // AVX2 Implementation
 // ============================================================================
 
-#if CPHNSW_FHT_AVX2 || CPHNSW_FHT_AVX512
+#if defined(__AVX2__)
 
 /**
  * AVX2 Fast Hadamard Transform.
@@ -80,11 +30,6 @@ inline void fht_scalar(float* vec, size_t len) {
  */
 inline void fht_avx2(float* vec, size_t len) {
     assert(detail::is_power_of_two(len) && "FHT requires power-of-2 length");
-
-    if (len < 8) {
-        fht_scalar(vec, len);
-        return;
-    }
 
     constexpr size_t SIMD_WIDTH = 8;
 
@@ -126,13 +71,13 @@ inline void fht_avx2(float* vec, size_t len) {
     }
 }
 
-#endif  // CPHNSW_FHT_AVX2 || CPHNSW_FHT_AVX512
+#endif
 
 // ============================================================================
 // AVX-512 Implementation
 // ============================================================================
 
-#if CPHNSW_FHT_AVX512
+#if defined(__AVX512F__)
 
 /**
  * AVX-512 Fast Hadamard Transform.
@@ -142,7 +87,9 @@ inline void fht_avx512(float* vec, size_t len) {
     assert(detail::is_power_of_two(len) && "FHT requires power-of-2 length");
 
     if (len < 16) {
+#if defined(__AVX2__)
         fht_avx2(vec, len);
+#endif
         return;
     }
 
@@ -195,7 +142,7 @@ inline void fht_avx512(float* vec, size_t len) {
     }
 }
 
-#endif  // CPHNSW_FHT_AVX512
+#endif
 
 // ============================================================================
 // Dispatcher
@@ -205,12 +152,12 @@ inline void fht_avx512(float* vec, size_t len) {
  * Fast Hadamard Transform with automatic SIMD dispatch.
  */
 inline void fht(float* vec, size_t len) {
-#if CPHNSW_FHT_AVX512
+#if defined(__AVX512F__)
     fht_avx512(vec, len);
-#elif CPHNSW_FHT_AVX2
+#elif defined(__AVX2__)
     fht_avx2(vec, len);
 #else
-    fht_scalar(vec, len);
+    #error "CP-HNSW requires AVX2 or AVX-512 support."
 #endif
 }
 

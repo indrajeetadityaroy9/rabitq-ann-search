@@ -1,1 +1,0 @@
-# CP-HNSW Baseline Comparisons

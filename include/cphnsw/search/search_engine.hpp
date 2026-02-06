@@ -222,28 +222,4 @@ public:
     }
 };
 
-// ============================================================================
-// Type Aliases for Common Configurations
-// ============================================================================
-
-// Phase 1 search engines (no residual)
-using SearchEngine32 = SearchEngine<UnifiedMetricPolicy<32, 0, 0>>;
-using SearchEngine64 = SearchEngine<UnifiedMetricPolicy<64, 0, 0>>;
-
-// Phase 2 search engines (with residual)
-using SearchEngine64_32 = SearchEngine<UnifiedMetricPolicy<64, 32, 2>>;
-using SearchEngine32_16 = SearchEngine<UnifiedMetricPolicy<32, 16, 2>>;
-
-// ============================================================================
-// SearchEngineTraits: Compile-time information
-// ============================================================================
-
-template <typename Engine>
-struct SearchEngineTraits {
-    using Policy = typename Engine::Policy;
-    using CodeType = typename Engine::CodeType;
-    using QueryType = typename Engine::QueryType;
-    using Graph = typename Engine::Graph;
-};
-
 }  // namespace cphnsw

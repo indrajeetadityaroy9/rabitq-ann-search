@@ -6,14 +6,7 @@
 #include <algorithm>
 #include <limits>
 #include <cstring>
-
-// For _mm_pause() on x86
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
-#define CPHNSW_HAS_PAUSE 1
-#else
-#define CPHNSW_HAS_PAUSE 0
-#endif
 
 namespace cphnsw {
 
@@ -49,9 +42,7 @@ class Spinlock {
 public:
     void lock() noexcept {
         while (flag_.test_and_set(std::memory_order_acquire)) {
-#if CPHNSW_HAS_PAUSE
             _mm_pause();
-#endif
         }
     }
 
@@ -92,7 +83,7 @@ static_assert(sizeof(Spinlock) == 1, "Spinlock must be 1 byte");
  *   - ids[MAX_NEIGHBORS]: Neighbor node IDs
  *   - codes: SoA transposed code storage (adapts to CodeT)
  *   - distances[MAX_NEIGHBORS]: Cached edge distances
- *   - count: Actual neighbor count (0 to MAX_NEIGHBORS)
+ *   - count: Actual number of neighbors (0 to MAX_NEIGHBORS)
  *   - lock: Per-node spinlock for thread-safe updates
  *
  * @tparam CodeT The code type (ResidualCode<K, R>)
@@ -161,18 +152,14 @@ struct alignas(CACHE_LINE_SIZE) UnifiedNeighborBlock {
     }
 
     // ========================================================================
-    // Neighbor Management
+    // Neighbor Management (Thread-Safe Only)
     // ========================================================================
 
     /**
-     * Add a neighbor (NOT thread-safe - use add_safe for concurrent access).
-     *
-     * @param id Neighbor node ID
-     * @param code Neighbor's binary code
-     * @param distance Distance to neighbor
-     * @return true if added, false if block is full
+     * Add a neighbor (thread-safe with spinlock).
      */
-    bool add(NodeId id, const CodeT& code, float distance) {
+    bool add_safe(NodeId id, const CodeT& code, float distance) {
+        Spinlock::Guard guard(lock);
         if (count >= MAX_NEIGHBORS) {
             return false;
         }
@@ -187,24 +174,24 @@ struct alignas(CACHE_LINE_SIZE) UnifiedNeighborBlock {
     }
 
     /**
-     * Add a neighbor (thread-safe with spinlock).
-     */
-    bool add_safe(NodeId id, const CodeT& code, float distance) {
-        Spinlock::Guard guard(lock);
-        return add(id, code, distance);
-    }
-
-    /**
-     * Try to add a neighbor if it improves the set.
+     * Try to add a neighbor if it improves the set (thread-safe).
      *
      * If the block is full, replaces the worst (highest distance) neighbor
      * if the new distance is better.
      *
      * @return true if the neighbor was added or replaced an existing one
      */
-    bool try_add(NodeId id, const CodeT& code, float distance) {
+    bool try_add_safe(NodeId id, const CodeT& code, float distance) {
+        Spinlock::Guard guard(lock);
+        
         if (count < MAX_NEIGHBORS) {
-            return add(id, code, distance);
+            // Re-implement inline to avoid calling removed unsafe method
+            size_t idx = count;
+            ids[idx] = id;
+            codes.store(idx, code);
+            distances[idx] = distance;
+            ++count;
+            return true;
         }
 
         // Find worst neighbor
@@ -229,44 +216,11 @@ struct alignas(CACHE_LINE_SIZE) UnifiedNeighborBlock {
     }
 
     /**
-     * Thread-safe try_add.
-     */
-    bool try_add_safe(NodeId id, const CodeT& code, float distance) {
-        Spinlock::Guard guard(lock);
-        return try_add(id, code, distance);
-    }
-
-    /**
      * Check if a node ID is already a neighbor.
      */
     bool contains(NodeId id) const {
         for (size_t i = 0; i < count; ++i) {
             if (ids[i] == id) return true;
-        }
-        return false;
-    }
-
-    /**
-     * Remove a neighbor by ID.
-     * @return true if found and removed
-     */
-    bool remove(NodeId id) {
-        for (size_t i = 0; i < count; ++i) {
-            if (ids[i] == id) {
-                // Swap with last and decrement count
-                size_t last = count - 1;
-                if (i != last) {
-                    ids[i] = ids[last];
-                    CodeT temp;
-                    codes.load(last, temp);
-                    codes.store(i, temp);
-                    distances[i] = distances[last];
-                }
-                ids[last] = INVALID_NODE;
-                distances[last] = std::numeric_limits<float>::max();
-                --count;
-                return true;
-            }
         }
         return false;
     }

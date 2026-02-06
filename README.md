@@ -1,38 +1,44 @@
 # CP-HNSW
 
-Cross-Polytope Hierarchical Navigable Small World - a memory-efficient approximate nearest neighbor search algorithm optimized for angular/cosine similarity.
+Cross-Polytope Navigable Small World - a memory-efficient approximate nearest neighbor search algorithm optimized for angular/cosine similarity.
 
 ## Overview
 
 CP-HNSW combines two state-of-the-art techniques:
-- **Cross-Polytope LSH** (Andoni et al. 2015): Asymptotically optimal hashing for angular distance
-- **HNSW** (Malkov & Yashunin 2018): Hierarchical graph for logarithmic-time navigation
+- **Cross-Polytope LSH** (Andoni et al. 2015): Asymptotically optimal hashing for angular distance.
+- **Navigable Small World (NSW)**: Memory-efficient graph for logarithmic-time navigation.
 
 Key benefits:
-- **Memory efficient**: ~32x compression vs standard HNSW (K bytes per vector vs 4d bytes)
-- **Fast distance computation**: O(1) SIMD Hamming distance vs O(d) float dot product
-- **Optimal hashing**: Cross-Polytope LSH provides theoretical optimality guarantees
+- **Memory efficient**: ~32x compression vs standard HNSW (K bytes per vector vs 4d bytes) using "Flash" layout.
+- **Flash Layout**: Neighbors and their quantized codes are stored inline to eliminate pointer-chasing and maximize cache efficiency.
+- **Fast distance computation**: SIMD-optimized Hamming distance (XOR + PopCount) using AVX2 or AVX-512.
+- **Unified Precision**: Supports Phase 1 (RaBitQ) and Phase 2 (Residual) quantization in a single unified API.
 
 ## Quick Start
 
 ```cpp
-#include <cphnsw/index/cp_hnsw_index.hpp>
+#include <cphnsw/api/index.hpp>
 
 using namespace cphnsw;
 
-// Create index for 128-dimensional vectors (optimized defaults)
-CPHNSWIndex8 index(128, /*M=*/32, /*ef_construction=*/200);
+// Create index for 128-dimensional vectors (using Phase 1 RaBitQ, 32-bit codes)
+Index32 index(128);
 
-// Add vectors (guaranteed 100% connectivity)
+// Or create with custom parameters
+IndexParams params;
+params.set_dim(128).set_M(32).set_ef_construction(200);
+Index32 custom_index(params);
+
+// Add vectors in parallel (OpenMP)
 std::vector<float> vectors = ...;  // N x 128
 index.add_batch(vectors.data(), N);
 
-// Or add with parallel construction (~4x faster, 100% connectivity)
-index.add_batch_parallel(vectors.data(), N);
-
 // Search with re-ranking for high recall
 std::vector<float> query(128);
-auto results = index.search_and_rerank(query.data(), /*k=*/10, /*ef=*/100, /*rerank_k=*/500);
+SearchParams search_params;
+search_params.set_k(10).set_ef(100).set_rerank(true, 500);
+
+auto results = index.search(query.data(), search_params);
 
 for (const auto& r : results) {
     std::cout << "ID: " << r.id << " Distance: " << r.distance << "\n";
@@ -46,82 +52,69 @@ mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j
 
-# Run evaluation
-./eval_cphnsw
+# Run master evaluation protocol
+./eval_master --sift data/sift/ --output results/
 ```
 
-### CMake Options
+### Build Requirements
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `CPHNSW_USE_AVX512` | ON | Enable AVX-512 SIMD |
-| `CPHNSW_USE_OPENMP` | ON | Enable OpenMP parallelization |
-| `CPHNSW_USE_CUDA` | ON | Enable CUDA GPU acceleration |
-| `CPHNSW_BUILD_TESTS` | ON | Build unit tests |
-| `CPHNSW_BUILD_EVAL` | ON | Build evaluation framework |
-| `CPHNSW_BUILD_BENCHMARKS` | OFF | Build benchmarks |
+- C++17 compiler (GCC 9+, Clang, or AppleClang)
+- AVX2 or AVX-512 supported CPU
+- OpenMP (Required for parallel construction)
 
 ## API Reference
 
-### `CPHNSWIndex<ComponentT, K>`
+### `CPHNSWIndex<K, R, Shift>`
 
 Template parameters:
-- `ComponentT`: `uint8_t` for d ≤ 128, `uint16_t` for d > 128
-- `K`: Code width (number of rotations, default 32)
+- `K`: Primary code bits (e.g., 32, 64)
+- `R`: Residual code bits (0 for Phase 1, >0 for Phase 2)
+- `Shift`: Bit-shift for residual weighting (default 2)
 
-#### Constructor
+#### Type Aliases
 
-```cpp
-CPHNSWIndex(size_t dim, size_t M = 32, size_t ef_construction = 200);
-```
+- `Index32`: 32-bit RaBitQ
+- `Index64`: 64-bit RaBitQ
+- `Index64_32`: 64-bit Primary + 32-bit Residual
 
 #### Methods
 
 | Method | Description |
 |--------|-------------|
-| `add(const Float* vec)` | Add single vector (sequential) |
-| `add_batch(const Float* vecs, size_t count)` | Add multiple vectors (sequential, 100% connectivity) |
-| `add_batch_parallel(const Float* vecs, size_t count)` | Add multiple vectors (~4x faster, 100% connectivity) |
-| `search(const Float* query, size_t k, size_t ef)` | K-NN search with CP distance |
-| `search_and_rerank(const Float* query, size_t k, size_t ef, size_t rerank_k)` | Search + exact re-ranking (recommended) |
-| `search_multiprobe(...)` | Search with multiprobe for higher recall |
+| `add(const float* vec)` | Add single vector (thread-safe) |
+| `add_batch(const float* vecs, size_t count)` | Add vectors in parallel using OpenMP |
+| `search(const float* query, const SearchParams& params)` | K-NN search with CP distance and optional reranking |
 | `size()` | Number of indexed vectors |
-| `verify_connectivity()` | Check graph connectivity |
+| `get_stats()` | Get graph connectivity and degree statistics |
 
 ## Architecture
 
 ```
 include/cphnsw/
-├── core/types.hpp           # Type definitions, CPCode, CPQuery
-├── quantizer/
-│   ├── hadamard.hpp         # Fast Hadamard Transform (FHT)
-│   ├── rotation_chain.hpp   # Ψ(x) = H D₃ H D₂ H D₁ x
-│   ├── cp_encoder.hpp       # Vector → CPCode encoding
-│   └── multiprobe.hpp       # Multiprobe sequence generator
-├── distance/hamming.hpp     # SIMD Hamming distance
+├── api/
+│   └── index.hpp           # Unified public API (Index, Params)
+├── core/
+│   ├── codes.hpp           # Unified Primary/Residual code storage
+│   ├── memory.hpp          # Aligned allocators and prefetch hints
+│   └── types.hpp           # Base types (NodeId, DistanceType)
+├── distance/
+│   ├── detail/             # SIMD Kernels (AVX2, AVX-512)
+│   └── metric_policy.hpp   # Unified distance interface
+├── encoder/
+│   ├── transform/
+│   │   └── fht.hpp         # Optimized Fast Hadamard Transform
+│   ├── cp_encoder.hpp      # Vector → Binary code encoding
+│   └── rotation.hpp        # Pseudo-random rotation chains
 ├── graph/
-│   ├── flat_graph.hpp       # Memory-efficient graph structure
-│   └── priority_queue.hpp   # Min/Max heaps for search
-├── algorithms/
-│   ├── search_layer.hpp     # SEARCH-LAYER (Algorithm 2)
-│   ├── select_neighbors.hpp # SELECT-NEIGHBORS-HEURISTIC (Algorithm 4)
-│   ├── insert.hpp           # INSERT (Algorithm 3)
-│   └── knn_search.hpp       # K-NN-SEARCH
-└── index/cp_hnsw_index.hpp  # Main public API
+│   ├── flat_graph.hpp      # Memory-efficient NSW graph storage
+│   ├── neighbor_block.hpp  # Inline "Flash" neighbor storage
+│   └── visitation_table.hpp# Epoch-based visitation tracking
+└── search/
+    └── search_engine.hpp   # Greedy beam search logic
 ```
-
-## Complexity
-
-| Operation | Time | Space |
-|-----------|------|-------|
-| Add (single) | O(log N × ef_c × M × K) | O(M × L) |
-| Search | O(log N + ef × M × K) | O(ef) |
-| FHT | O(d log d) | O(1) |
-| Hamming distance | O(1) SIMD | O(1) |
-
-**Memory per vector**: K bytes (code) + ~16 bytes (graph metadata)
 
 ## References
 
 - Andoni et al. (2015): "Practical and Optimal LSH for Angular Distance"
 - Malkov & Yashunin (2018): "Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs"
+- SIGMOD (2024): "RaBitQ: Quantizing High-Dimensional Vectors with a Theoretical Error Bound"

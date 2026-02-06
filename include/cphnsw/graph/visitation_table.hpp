@@ -139,57 +139,6 @@ private:
     std::atomic<uint64_t> current_epoch_;
 };
 
-// ============================================================================
-// ThreadLocalVisitationTable: Per-thread table for parallel queries
-// ============================================================================
 
-/**
- * ThreadLocalVisitationTable: Avoids atomic contention by giving each thread
- * its own visited set. Useful when queries don't share state.
- *
- * This is faster than VisitationTable when queries are fully independent
- * but uses more memory (one table per thread).
- */
-class ThreadLocalVisitationTable {
-public:
-    explicit ThreadLocalVisitationTable(size_t capacity)
-        : epochs_(capacity, 0), current_epoch_(0) {}
-
-    /**
-     * Start a new query.
-     */
-    uint64_t new_query() {
-        return ++current_epoch_;
-    }
-
-    /**
-     * Check and mark (non-atomic, single-threaded use only).
-     */
-    bool check_and_mark(NodeId node_id, uint64_t query_id) {
-        if (node_id >= epochs_.size()) return true;
-
-        if (epochs_[node_id] == query_id) {
-            return true;  // Already visited
-        }
-
-        epochs_[node_id] = query_id;
-        return false;  // First visit
-    }
-
-    bool is_visited(NodeId node_id, uint64_t query_id) const {
-        if (node_id >= epochs_.size()) return true;
-        return epochs_[node_id] == query_id;
-    }
-
-    void resize(size_t new_capacity) {
-        epochs_.resize(new_capacity, 0);
-    }
-
-    size_t capacity() const { return epochs_.size(); }
-
-private:
-    std::vector<uint64_t> epochs_;
-    uint64_t current_epoch_;
-};
 
 }  // namespace cphnsw

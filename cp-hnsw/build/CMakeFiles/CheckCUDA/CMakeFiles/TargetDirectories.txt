@@ -1,2 +1,0 @@
-/lambda/nfs/lambda-cloud-data/sparse-text-kmeans/cp-hnsw/build/CMakeFiles/CheckCUDA/CMakeFiles/edit_cache.dir
-/lambda/nfs/lambda-cloud-data/sparse-text-kmeans/cp-hnsw/build/CMakeFiles/CheckCUDA/CMakeFiles/rebuild_cache.dir

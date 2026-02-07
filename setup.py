@@ -21,12 +21,9 @@ class CMakeBuild(build_ext):
         cfg = "Release"
 
         cmake_args = [
-            f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir / 'cphnsw'}",
+            f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}",
             f"-DPYTHON_EXECUTABLE={sys.executable}",
             f"-DCMAKE_BUILD_TYPE={cfg}",
-            "-DCPHNSW_BUILD_PYTHON=ON",
-            "-DCPHNSW_BUILD_TESTS=OFF",
-            "-DCPHNSW_BUILD_EVAL=OFF",
         ]
 
         build_args = ["--config", cfg, "--target", "_core"]
@@ -47,4 +44,6 @@ class CMakeBuild(build_ext):
 setup(
     ext_modules=[CMakeExtension("cphnsw._core")],
     cmdclass={"build_ext": CMakeBuild},
+    package_dir={"": "python"},
+    packages=["cphnsw"],
 )

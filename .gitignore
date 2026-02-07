@@ -1,6 +1,4 @@
-# =============================================================================
 # Build artifacts
-# =============================================================================
 build/
 cmake-build-*/
 *.o
@@ -8,139 +6,61 @@ cmake-build-*/
 *.so
 *.dylib
 
-# =============================================================================
-# Python virtual environment (CRITICAL - never commit)
-# =============================================================================
-# Standard virtual environment directory names
+# Python
 .venv/
 venv/
 env/
-ENV/
-.ENV/
-virtualenv/
-
-# Python version management
-.python-version
-.pyenv/
-
-# Conda environments
-.conda/
-conda-env/
-
-# Poetry/PDM virtual environments
-.pdm-build/
-
-# Python bytecode
 __pycache__/
 *.py[cod]
 *$py.class
-*.pyo
-*.pyd
-
-# Python packaging
 *.egg
 *.egg-info/
 dist/
 wheels/
 *.whl
 .eggs/
-pip-wheel-metadata/
 
-# =============================================================================
-# Data files and directories (CRITICAL - large files, never commit)
-# =============================================================================
-# Common data directory names
+# Data (large binary files)
 data/
-datasets/
-dataset/
-sift/
-sift1m/
-gist/
-glove/
-deep/
-
-# Project-specific data directories
-evaluation/data/
-cp-hnsw/evaluation/data/
-
-# Dataset files (large binary formats)
 *.fvecs
 *.ivecs
 *.bvecs
 *.bin
 *.npy
 *.npz
-
-# HDF5 files
 *.h5
 *.hdf5
-
-# Pickle files (can be large)
 *.pkl
-*.pickle
-
-# Compressed datasets
 *.tar
 *.tar.gz
 *.tgz
-*.tar.bz2
 *.zip
-*.7z
-*.rar
 *.gz
-*.xz
 
-# CSV data (can be large)
+# Generated results
+results/
+checkpoints/
 *.csv
-!evaluation/results/*.csv
+!experiments/**/*.yaml
 
-# Parquet files
-*.parquet
-
-# Arrow/Feather files
-*.arrow
-*.feather
-
-# =============================================================================
-# Results and outputs (optional - uncomment to ignore)
-# =============================================================================
-# evaluation/results/
-# *.pdf
-# *.png
-
-# =============================================================================
-# IDE and editor files
-# =============================================================================
+# IDE
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
 .DS_Store
-Thumbs.db
 
-# =============================================================================
-# Temporary and cache files
-# =============================================================================
+# Misc
 *.tmp
-*.temp
 *.cache
 .cache/
 *.log
-
-# Test and coverage
 .coverage
-htmlcov/
 .pytest_cache/
-.tox/
-.nox/
 
-# =============================================================================
-# Secrets and credentials (safety)
-# =============================================================================
+# Secrets
 .env
 .env.*
 *.pem
 *.key
-secrets.json
-credentials.json

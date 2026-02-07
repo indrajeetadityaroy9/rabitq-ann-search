@@ -1,0 +1,16 @@
+index:
+  M: 32
+  ef_construction: 200
+  seed: 42
+
+search:
+  k: 10
+  ef_values: [100]
+
+data:
+  base_dir: data/
+  dataset: sift1m
+
+eval:
+  num_threads: 1
+  warmup_queries: 50

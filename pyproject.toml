@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64", "pybind11>=2.12", "cmake>=3.18"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cphnsw"
+version = "0.1.0"
+description = "RaBitQ + SymphonyQG approximate nearest neighbor search"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+dependencies = [
+    "numpy>=1.20",
+    "pyyaml>=5.0",
+]
+
+[project.optional-dependencies]
+eval = [
+    "matplotlib>=3.5",
+    "pandas>=1.3",
+]
+dev = [
+    "pytest>=7.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

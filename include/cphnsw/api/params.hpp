@@ -22,19 +22,19 @@ struct IndexParams {
 struct BuildParams {
     size_t num_threads = 0;
     bool verbose = false;
-    bool stochastic_rounding = false;
 
     BuildParams& set_threads(size_t n) { num_threads = n; return *this; }
     BuildParams& set_verbose(bool v) { verbose = v; return *this; }
-    BuildParams& set_stochastic_rounding(bool s) { stochastic_rounding = s; return *this; }
 };
 
 struct SearchParams {
     size_t k = 10;
     size_t ef = 100;
+    float error_epsilon = 1.9f;
 
     SearchParams& set_k(size_t num) { k = num; return *this; }
     SearchParams& set_ef(size_t e) { ef = e; return *this; }
+    SearchParams& set_error_epsilon(float e) { error_epsilon = e; return *this; }
 };
 
 }  // namespace cphnsw

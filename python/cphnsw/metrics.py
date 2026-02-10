@@ -20,20 +20,22 @@ def recall_at_k(results: np.ndarray, ground_truth: np.ndarray, k: int) -> float:
 
 
 def recall_at_k_batch(results: np.ndarray, ground_truth: np.ndarray, k: int) -> float:
-    """Compute mean recall@k over a batch of queries.
+    """Compute mean recall@k over a batch of queries (vectorized).
 
     Args:
-        results: (n_queries, k) array of returned neighbor IDs.
-        ground_truth: (n_queries, k_gt) array of true neighbor IDs.
+        results: (n_queries, >=k) array of returned neighbor IDs.
+        ground_truth: (n_queries, >=k) array of true neighbor IDs.
         k: Number of neighbors to evaluate.
 
     Returns:
         Mean recall@k across all queries.
     """
-    total = 0.0
-    for i in range(len(results)):
-        total += recall_at_k(results[i], ground_truth[i], k)
-    return total / len(results) if len(results) > 0 else 0.0
+    if len(results) == 0:
+        return 0.0
+    res = results[:, :k]
+    gt = ground_truth[:, :k]
+    hits = np.any(res[:, :, None] == gt[:, None, :], axis=2)
+    return float(hits.sum(axis=1).mean()) / k
 
 
 def memory_usage(index) -> dict:

@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <stdexcept>
 
 namespace cphnsw {
 
@@ -68,7 +69,7 @@ public:
     size_t original_dim() const { return dim_; }
     size_t padded_dim() const { return padded_dim_; }
     
-    // Support for learning/updating the matrix (Future ITQ hook)
+    // Support for learning/updating the matrix
     void set_matrix(const std::vector<float>& new_mat) {
         if (new_mat.size() != dim_ * dim_) {
             throw std::invalid_argument("Matrix size mismatch");
@@ -76,10 +77,140 @@ public:
         matrix_ = new_mat;
     }
 
+    // ITQ Learned Rotation (Gong et al., TPAMI 2013).
+    // Alternating optimization: fix R and quantize, fix quantization and solve
+    // Procrustes for optimal R. Converges in ~50 iterations.
+    // data: n x dim row-major, assumed centered and unit-normalized.
+    void learn_rotation(const float* data, size_t n, size_t max_iters = 50) {
+        if (n < dim_ || dim_ == 0) return;
+
+        std::vector<float> rotated(n * dim_);
+        std::vector<float> signs(n * dim_);
+        std::vector<float> M(dim_ * dim_);
+
+        for (size_t iter = 0; iter < max_iters; ++iter) {
+            // 1. Rotate all training vectors: Y[k] = R * X[k]
+            #pragma omp parallel for schedule(static)
+            for (size_t k = 0; k < n; ++k) {
+                apply_copy(data + k * dim_, rotated.data() + k * dim_);
+            }
+
+            // 2. Quantize: B = sign(Y)
+            for (size_t i = 0; i < n * dim_; ++i) {
+                signs[i] = (rotated[i] >= 0.0f) ? 1.0f : -1.0f;
+            }
+
+            // 3. M = X^T * B (dim x dim), the Procrustes target
+            std::fill(M.begin(), M.end(), 0.0f);
+            #pragma omp parallel
+            {
+                std::vector<float> M_local(dim_ * dim_, 0.0f);
+                #pragma omp for schedule(static)
+                for (size_t k = 0; k < n; ++k) {
+                    const float* x = data + k * dim_;
+                    const float* b = signs.data() + k * dim_;
+                    for (size_t i = 0; i < dim_; ++i) {
+                        float xi = x[i];
+                        #pragma omp simd
+                        for (size_t j = 0; j < dim_; ++j) {
+                            M_local[i * dim_ + j] += xi * b[j];
+                        }
+                    }
+                }
+                #pragma omp critical
+                for (size_t i = 0; i < dim_ * dim_; ++i) M[i] += M_local[i];
+            }
+
+            // 4. R = polar_factor(M) via Newton iteration
+            polar_decomposition(M.data());
+
+            // 5. Update rotation matrix
+            matrix_ = M;
+        }
+    }
+
 private:
     size_t dim_;
     size_t padded_dim_;
     std::vector<float> matrix_; // D x D flattened
+
+    // Newton iteration for polar decomposition: X_{k+1} = (X_k + X_k^{-T}) / 2.
+    // Converges quadratically to the orthogonal polar factor of M.
+    void polar_decomposition(float* M) const {
+        // Scale for stability: M /= ||M||_F * sqrt(dim)
+        float m_norm = 0.0f;
+        for (size_t i = 0; i < dim_ * dim_; ++i) m_norm += M[i] * M[i];
+        m_norm = std::sqrt(m_norm);
+        if (m_norm < 1e-10f) return;
+        float scale = std::sqrt(static_cast<float>(dim_)) / m_norm;
+        for (size_t i = 0; i < dim_ * dim_; ++i) M[i] *= scale;
+
+        std::vector<float> Mt(dim_ * dim_);
+        std::vector<float> inv_t(dim_ * dim_);
+
+        for (size_t polar_iter = 0; polar_iter < 20; ++polar_iter) {
+            // Transpose M
+            for (size_t i = 0; i < dim_; ++i)
+                for (size_t j = 0; j < dim_; ++j)
+                    Mt[i * dim_ + j] = M[j * dim_ + i];
+
+            // Invert M^T
+            if (!invert_matrix(Mt.data(), inv_t.data())) break;
+
+            // M = (M + inv(M^T)) / 2
+            float diff = 0.0f;
+            for (size_t i = 0; i < dim_ * dim_; ++i) {
+                float new_val = (M[i] + inv_t[i]) * 0.5f;
+                diff += (new_val - M[i]) * (new_val - M[i]);
+                M[i] = new_val;
+            }
+            if (diff < 1e-10f * static_cast<float>(dim_ * dim_)) break;
+        }
+    }
+
+    // Gaussian elimination with partial pivoting: inv = A^{-1}
+    bool invert_matrix(const float* A, float* inv) const {
+        size_t n = dim_;
+        std::vector<float> work(n * n);
+        std::memcpy(work.data(), A, n * n * sizeof(float));
+
+        for (size_t i = 0; i < n * n; ++i) inv[i] = 0.0f;
+        for (size_t i = 0; i < n; ++i) inv[i * n + i] = 1.0f;
+
+        for (size_t col = 0; col < n; ++col) {
+            // Partial pivot
+            size_t max_row = col;
+            float max_val = std::abs(work[col * n + col]);
+            for (size_t row = col + 1; row < n; ++row) {
+                float val = std::abs(work[row * n + col]);
+                if (val > max_val) { max_val = val; max_row = row; }
+            }
+            if (max_val < 1e-12f) return false;
+
+            if (max_row != col) {
+                for (size_t j = 0; j < n; ++j) {
+                    std::swap(work[col * n + j], work[max_row * n + j]);
+                    std::swap(inv[col * n + j], inv[max_row * n + j]);
+                }
+            }
+
+            float inv_pivot = 1.0f / work[col * n + col];
+            for (size_t j = 0; j < n; ++j) {
+                work[col * n + j] *= inv_pivot;
+                inv[col * n + j] *= inv_pivot;
+            }
+
+            for (size_t row = 0; row < n; ++row) {
+                if (row == col) continue;
+                float factor = work[row * n + col];
+                for (size_t j = 0; j < n; ++j) {
+                    work[row * n + j] -= factor * work[col * n + j];
+                    inv[row * n + j] -= factor * inv[col * n + j];
+                }
+            }
+        }
+        return true;
+    }
 
     void generate_orthogonal_matrix(uint64_t seed) {
         matrix_.resize(dim_ * dim_);

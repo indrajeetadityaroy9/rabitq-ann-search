@@ -115,4 +115,64 @@ using FastScanNeighbors128_32 = FastScanNeighborBlock<128, 32, 32>;
 using FastScanNeighbors256_32 = FastScanNeighborBlock<256, 32, 32>;
 using FastScanNeighbors1024_32 = FastScanNeighborBlock<1024, 32, 32>;
 
+// === Multi-bit FastScan Layout (Extended RaBitQ) ===
+// One standard 1-bit FastScan code block per bit plane.
+
+template <size_t D, size_t BitWidth, size_t BatchSize = 32>
+struct NbitFastScanCodeBlock {
+    static constexpr size_t BIT_WIDTH = BitWidth;
+    static constexpr size_t DIMS = D;
+    static constexpr size_t BATCH_SIZE = BatchSize;
+
+    FastScanCodeBlock<D, BatchSize> planes[BitWidth];
+
+    void store(size_t idx, const NbitCodeStorage<D, BitWidth>& code) {
+        for (size_t b = 0; b < BitWidth; ++b) {
+            BinaryCodeStorage<D> plane_binary;
+            std::memcpy(plane_binary.signs, code.planes[b],
+                        BinaryCodeStorage<D>::NUM_WORDS * sizeof(uint64_t));
+            planes[b].store(idx, plane_binary);
+        }
+    }
+
+    void clear() { for (auto& p : planes) p.clear(); }
+};
+
+template <size_t D, size_t R, size_t BitWidth, size_t BatchSize = 32>
+struct NbitFastScanNeighborBlock {
+    static_assert(R % BatchSize == 0);
+    static constexpr size_t DEGREE = R;
+    static constexpr size_t NUM_BATCHES = R / BatchSize;
+    static constexpr size_t BIT_WIDTH = BitWidth;
+
+    NbitFastScanCodeBlock<D, BitWidth, BatchSize> code_blocks[NUM_BATCHES];
+    alignas(64) VertexAuxData aux[R];
+    alignas(64) uint16_t popcounts[R];
+    alignas(64) uint16_t weighted_popcounts[R];
+    alignas(64) uint32_t neighbor_ids[R];
+    uint32_t count;
+
+    NbitFastScanNeighborBlock() : count(0) {
+        std::memset(neighbor_ids, 0xFF, sizeof(neighbor_ids));
+        std::memset(popcounts, 0, sizeof(popcounts));
+        std::memset(weighted_popcounts, 0, sizeof(weighted_popcounts));
+    }
+
+    void set_neighbor(size_t slot, uint32_t id,
+                      const NbitCodeStorage<D, BitWidth>& code,
+                      const VertexAuxData& aux_data) {
+        size_t batch = slot / BatchSize;
+        size_t idx_in_batch = slot % BatchSize;
+        neighbor_ids[slot] = id;
+        code_blocks[batch].store(idx_in_batch, code);
+        aux[slot] = aux_data;
+        popcounts[slot] = static_cast<uint16_t>(code.msb_popcount());
+        weighted_popcounts[slot] = static_cast<uint16_t>(code.weighted_popcount());
+        if (slot >= count) count = static_cast<uint32_t>(slot + 1);
+    }
+
+    size_t size() const { return count; }
+    bool empty() const { return count == 0; }
+};
+
 }  // namespace cphnsw

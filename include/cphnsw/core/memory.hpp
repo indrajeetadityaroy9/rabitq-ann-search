@@ -6,6 +6,7 @@
 #include <new>
 #include <vector>
 #include <type_traits>
+#include <immintrin.h>
 
 namespace cphnsw {
 
@@ -120,6 +121,45 @@ AlignedUniquePtr<T> make_aligned(size_t count = 1) {
     void* ptr = std::aligned_alloc(Alignment, bytes);
     if (!ptr) throw std::bad_alloc();
     return AlignedUniquePtr<T>(static_cast<T*>(ptr));
+}
+
+// AVX2-accelerated L2 squared distance (compile-time dimension).
+template <size_t D>
+inline float l2_distance_simd(const float* a, const float* b) {
+    static_assert(D % 8 == 0, "D must be a multiple of 8 for AVX2");
+    __m256 sum = _mm256_setzero_ps();
+    for (size_t i = 0; i < D; i += 8) {
+        __m256 diff = _mm256_sub_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i));
+        sum = _mm256_fmadd_ps(diff, diff, sum);
+    }
+    __m128 hi = _mm256_extractf128_ps(sum, 1);
+    __m128 lo = _mm256_castps256_ps128(sum);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    return _mm_cvtss_f32(s);
+}
+
+// AVX2-accelerated L2 squared distance (runtime dimension, must be multiple of 8).
+inline float l2_distance_simd_runtime(const float* a, const float* b, size_t dim) {
+    __m256 sum = _mm256_setzero_ps();
+    size_t i = 0;
+    for (; i + 8 <= dim; i += 8) {
+        __m256 diff = _mm256_sub_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i));
+        sum = _mm256_fmadd_ps(diff, diff, sum);
+    }
+    __m128 hi = _mm256_extractf128_ps(sum, 1);
+    __m128 lo = _mm256_castps256_ps128(sum);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    float result = _mm_cvtss_f32(s);
+    // Handle remaining elements (if dim is not multiple of 8)
+    for (; i < dim; ++i) {
+        float d = a[i] - b[i];
+        result += d * d;
+    }
+    return result;
 }
 
 }  // namespace cphnsw

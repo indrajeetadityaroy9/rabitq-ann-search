@@ -91,13 +91,14 @@ inline void convert_to_distances(
     const uint16_t* popcounts,
     size_t count,
     float* out,
-    float parent_norm,
-    float dist_qp_sq)
+    float /*parent_norm*/,
+    float /*dist_qp_sq*/)
 {
     float A = query.coeff_fastscan;
     float B = query.coeff_popcount;
     float C = query.coeff_constant;
     float query_norm = query.query_norm;
+    float query_norm_sq = query.query_norm_sq;
 
     for (size_t i = 0; i < count; ++i) {
         float ip_approx = A * static_cast<float>(fastscan_sums[i])
@@ -106,14 +107,14 @@ inline void convert_to_distances(
 
         float ip_qo = aux[i].ip_quantized_original;
 
-        // SymphonyQG correction: subtract precomputed per-edge term
-        // ip_corrected ∝ <x_bar, P^{-1}*(q - p)>, ||q-p|| cancels
-        float ip_corrected = query_norm * ip_approx
-                           - parent_norm * aux[i].ip_xbar_Pinv_c;
-        float ip_est = (ip_qo > 1e-10f) ? ip_corrected / ip_qo : 0.0f;
+        // Standard RaBitQ distance estimate (Eq. 19 of SIGMOD'24 paper):
+        //   ||q - o||^2 = ||o-c||^2 + ||q-c||^2 - 2*||o-c||*||q-c||*<unit(q-c), unit(o-c)>
+        // where <unit(q-c), unit(o-c)> ≈ ip_approx / ip_qo
+        float ip_est = (ip_qo > 1e-10f) ? ip_approx / ip_qo : 0.0f;
 
         float dist_o = aux[i].dist_to_centroid;
-        out[i] = dist_o * dist_o + dist_qp_sq - 2.0f * dist_o * ip_est;
+        out[i] = dist_o * dist_o + query_norm_sq
+               - 2.0f * dist_o * query_norm * ip_est;
     }
 }
 
@@ -126,13 +127,14 @@ inline void convert_to_distances_with_bounds(
     size_t count,
     float* out_dist,
     float* out_lower,
-    float parent_norm,
-    float dist_qp_sq)
+    float /*parent_norm*/,
+    float /*dist_qp_sq*/)
 {
     float A = query.coeff_fastscan;
     float B = query.coeff_popcount;
     float C = query.coeff_constant;
     float query_norm = query.query_norm;
+    float query_norm_sq = query.query_norm_sq;
     float epsilon = query.error_epsilon;
 
     for (size_t i = 0; i < count; ++i) {
@@ -142,26 +144,121 @@ inline void convert_to_distances_with_bounds(
 
         float ip_qo = aux[i].ip_quantized_original;
 
-        // SymphonyQG-corrected inner product
-        float ip_corrected = query_norm * ip_approx
-                           - parent_norm * aux[i].ip_xbar_Pinv_c;
-        float ip_est = (ip_qo > 1e-10f) ? ip_corrected / ip_qo : 0.0f;
+        // Standard RaBitQ distance estimate
+        float ip_est = (ip_qo > 1e-10f) ? ip_approx / ip_qo : 0.0f;
 
         float dist_o = aux[i].dist_to_centroid;
 
-        out_dist[i] = dist_o * dist_o + dist_qp_sq
-                    - 2.0f * dist_o * ip_est;
+        out_dist[i] = dist_o * dist_o + query_norm_sq
+                    - 2.0f * dist_o * query_norm * ip_est;
 
         // Error bound on ip_approx (Theorem 3.2)
         float ip_qo_sq = ip_qo * ip_qo;
+        if (ip_qo_sq < 1e-10f) {
+            out_lower[i] = 0.0f;
+            continue;
+        }
         float bound_on_ip = epsilon * std::sqrt(
             (1.0f - ip_qo_sq) / (ip_qo_sq * static_cast<float>(D)));
 
-        float ip_corrected_upper = ip_corrected + query_norm * bound_on_ip;
-        float ip_est_upper = (ip_qo > 1e-10f) ? ip_corrected_upper / ip_qo : 0.0f;
+        // Upper bound on cosine → lower bound on distance
+        // Clamp cosine to 1.0 (mathematical maximum) to ensure
+        // lower >= (dist_o - query_norm)^2 (triangle inequality)
+        float ip_est_upper = std::min((ip_approx + bound_on_ip) / ip_qo, 1.0f);
 
-        out_lower[i] = dist_o * dist_o + dist_qp_sq
-                      - 2.0f * dist_o * ip_est_upper;
+        out_lower[i] = dist_o * dist_o + query_norm_sq
+                      - 2.0f * dist_o * query_norm * ip_est_upper;
+        if (out_lower[i] < 0.0f) out_lower[i] = 0.0f;
+    }
+}
+
+// === Multi-bit FastScan (Extended RaBitQ) ===
+// Weighted sum of per-plane inner products. Also outputs MSB-only sums
+// for coarse lower bounds.
+
+template <size_t D, size_t BitWidth>
+inline void compute_nbit_inner_products(
+    const uint8_t lut[][16],
+    const NbitFastScanCodeBlock<D, BitWidth, 32>& block,
+    uint32_t* out_nbit,
+    uint32_t* out_msb)
+{
+    std::memset(out_nbit, 0, 32 * sizeof(uint32_t));
+    alignas(64) uint32_t plane_sums[32];
+
+    for (size_t b = 0; b < BitWidth; ++b) {
+        compute_inner_products<D>(lut, block.planes[b], plane_sums);
+        if (b == 0) {
+            std::memcpy(out_msb, plane_sums, 32 * sizeof(uint32_t));
+        }
+        uint32_t weight = 1u << (BitWidth - 1 - b);
+        for (size_t i = 0; i < 32; ++i) {
+            out_nbit[i] += weight * plane_sums[i];
+        }
+    }
+}
+
+// Multi-bit distance conversion with bounds.
+// Uses full B-bit weighted sums for distance estimates, MSB (1-bit) sums
+// for conservative lower bounds.
+
+template <size_t D, size_t BitWidth>
+inline void convert_nbit_to_distances_with_bounds(
+    const RaBitQQuery<D>& query,
+    const uint32_t* nbit_fastscan_sums,
+    const uint32_t* msb_fastscan_sums,
+    const VertexAuxData* aux,
+    const uint16_t* msb_popcounts,
+    const uint16_t* weighted_popcounts,
+    size_t count,
+    float* out_dist,
+    float* out_lower,
+    float /*parent_norm*/,
+    float /*dist_qp_sq*/)
+{
+    constexpr float K = static_cast<float>((1u << BitWidth) - 1);
+    constexpr float inv_K = 1.0f / K;
+
+    float A_nbit = query.coeff_fastscan * inv_K;
+    float B_nbit = query.coeff_popcount * inv_K;
+    float C = query.coeff_constant;
+    float query_norm = query.query_norm;
+    float query_norm_sq = query.query_norm_sq;
+    float epsilon = query.error_epsilon;
+
+    float A_msb = query.coeff_fastscan;
+    float B_msb = query.coeff_popcount;
+
+    for (size_t i = 0; i < count; ++i) {
+        // Full B-bit distance estimate (standard RaBitQ formula)
+        float ip_approx = A_nbit * static_cast<float>(nbit_fastscan_sums[i])
+                        + B_nbit * static_cast<float>(weighted_popcounts[i])
+                        + C;
+
+        float ip_qo = aux[i].ip_quantized_original;
+        float ip_est = (ip_qo > 1e-10f) ? ip_approx / ip_qo : 0.0f;
+
+        float dist_o = aux[i].dist_to_centroid;
+        out_dist[i] = dist_o * dist_o + query_norm_sq
+                    - 2.0f * dist_o * query_norm * ip_est;
+
+        // Lower bound using MSB (1-bit) estimate + error bound
+        float ip_approx_msb = A_msb * static_cast<float>(msb_fastscan_sums[i])
+                            + B_msb * static_cast<float>(msb_popcounts[i])
+                            + C;
+
+        float ip_qo_sq = ip_qo * ip_qo;
+        if (ip_qo_sq < 1e-10f) {
+            out_lower[i] = 0.0f;
+            continue;
+        }
+        float bound_on_ip = epsilon * std::sqrt(
+            (1.0f - ip_qo_sq) / (ip_qo_sq * static_cast<float>(D)));
+
+        float ip_est_upper = std::min((ip_approx_msb + bound_on_ip) / ip_qo, 1.0f);
+
+        out_lower[i] = dist_o * dist_o + query_norm_sq
+                     - 2.0f * dist_o * query_norm * ip_est_upper;
         if (out_lower[i] < 0.0f) out_lower[i] = 0.0f;
     }
 }
@@ -175,6 +272,16 @@ struct RaBitQMetricPolicy {
 
     static constexpr size_t DIMS = D;
 
+    // Entry-point distance estimation using global-centroid RaBitQ formula.
+    //
+    // This method uses per-vector metadata (code.dist_to_centroid = ||o_r - centroid||,
+    // code.ip_quantized_original = <o_bar, o>) which are relative to the dataset centroid.
+    // It does NOT apply the SymphonyQG parent-relative correction because at the search
+    // entry point there is no parent vertex.
+    //
+    // For neighbor distance estimation during graph traversal, use the SIMD batch path
+    // (fastscan::convert_to_distances / convert_to_distances_with_bounds) which applies
+    // the SymphonyQG correction via per-edge VertexAuxData.
     static inline float compute_distance(
         const QueryType& query, const CodeType& code)
     {
@@ -201,6 +308,39 @@ struct RaBitQMetricPolicy {
                      : 0.0f;
 
         float dist_o = code.dist_to_centroid;
+        return dist_o * dist_o + query.query_norm_sq
+             - 2.0f * dist_o * query.query_norm * ip_est;
+    }
+
+    // Scalar distance estimation using per-edge VertexAuxData.
+    // Uses the same standard RaBitQ formula as the SIMD batch path.
+    static inline float compute_distance_with_aux(
+        const QueryType& query, const CodeType& code,
+        const VertexAuxData& aux,
+        float /*parent_norm*/, float /*dist_qp_sq*/)
+    {
+        constexpr size_t NUM_SUB_SEGMENTS = (D + 3) / 4;
+        uint32_t fastscan_sum = 0;
+
+        for (size_t j = 0; j < NUM_SUB_SEGMENTS; ++j) {
+            size_t bit_base = j * 4;
+            uint8_t pattern = 0;
+            for (size_t b = 0; b < 4 && (bit_base + b) < D; ++b) {
+                if (code.signs.get_bit(bit_base + b)) {
+                    pattern |= (1 << b);
+                }
+            }
+            fastscan_sum += query.lut[j][pattern];
+        }
+
+        float ip_approx = query.coeff_fastscan * static_cast<float>(fastscan_sum)
+                        + query.coeff_popcount * static_cast<float>(code.code_popcount)
+                        + query.coeff_constant;
+
+        float ip_qo = aux.ip_quantized_original;
+        float ip_est = (ip_qo > 1e-10f) ? ip_approx / ip_qo : 0.0f;
+
+        float dist_o = aux.dist_to_centroid;
         return dist_o * dist_o + query.query_norm_sq
              - 2.0f * dist_o * query.query_norm * ip_est;
     }

@@ -16,19 +16,9 @@ def load_fvecs(path: str) -> np.ndarray:
     Returns:
         (n, dim) float32 array.
     """
-    path = Path(path)
-    with open(path, "rb") as f:
-        d = struct.unpack("i", f.read(4))[0]
-        f.seek(0, 2)
-        file_size = f.tell()
-        record_size = 4 + d * 4
-        n = file_size // record_size
-        f.seek(0)
-        data = np.empty((n, d), dtype=np.float32)
-        for i in range(n):
-            f.read(4)  # skip dim
-            data[i] = np.frombuffer(f.read(d * 4), dtype=np.float32)
-    return data
+    data = np.fromfile(path, dtype=np.float32)
+    d = data[:1].view(np.int32)[0]
+    return data.reshape(-1, d + 1)[:, 1:].copy()
 
 
 def load_ivecs(path: str) -> np.ndarray:
@@ -39,19 +29,9 @@ def load_ivecs(path: str) -> np.ndarray:
     Returns:
         (n, k) int32 array.
     """
-    path = Path(path)
-    with open(path, "rb") as f:
-        k = struct.unpack("i", f.read(4))[0]
-        f.seek(0, 2)
-        file_size = f.tell()
-        record_size = 4 + k * 4
-        n = file_size // record_size
-        f.seek(0)
-        data = np.empty((n, k), dtype=np.int32)
-        for i in range(n):
-            f.read(4)  # skip dim
-            data[i] = np.frombuffer(f.read(k * 4), dtype=np.int32)
-    return data
+    data = np.fromfile(path, dtype=np.int32)
+    k = int(data[0])
+    return data.reshape(-1, k + 1)[:, 1:].copy()
 
 
 def download_sift1m(dest: str = "data/sift1m/"):

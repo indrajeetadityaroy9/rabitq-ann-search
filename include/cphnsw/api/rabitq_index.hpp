@@ -12,6 +12,7 @@
 #include <vector>
 #include <random>
 #include <stdexcept>
+#include <type_traits>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -19,18 +20,22 @@
 
 namespace cphnsw {
 
-template <size_t D, size_t R = 32, typename RotationPolicy = RandomHadamardRotation>
+template <size_t D, size_t R = 32, size_t BitWidth = 1, typename RotationPolicy = RandomHadamardRotation>
 class RaBitQIndex {
 public:
-    using CodeType = RaBitQCode<D>;
+    using CodeType = std::conditional_t<BitWidth == 1,
+        RaBitQCode<D>, NbitRaBitQCode<D, BitWidth>>;
     using QueryType = RaBitQQuery<D>;
-    using Encoder = RaBitQEncoder<D, RotationPolicy>;
-    using Graph = RaBitQGraph<D, R>;
-    using Engine = RaBitQSearchEngine<D, R>;
-    using Refinement = GraphRefinement<D, R>;
+    using Encoder = std::conditional_t<BitWidth == 1,
+        RaBitQEncoder<D, RotationPolicy>,
+        NbitRaBitQEncoder<D, BitWidth, RotationPolicy>>;
+    using Graph = RaBitQGraph<D, R, BitWidth>;
+    using Engine = RaBitQSearchEngine<D, R, BitWidth>;
+    using Refinement = GraphRefinement<D, R, BitWidth>;
 
     static constexpr size_t DIMS = D;
     static constexpr size_t DEGREE = R;
+    static constexpr size_t BIT_WIDTH = BitWidth;
 
     explicit RaBitQIndex(const IndexParams& params)
         : params_(params)
@@ -50,19 +55,14 @@ public:
 
         CodeType code = encoder_.encode(vec);
         NodeId id = graph_.add_node(code, vec);
-        
-        // Mark as needing optimization. 
-        // Edges will be built in finalize().
-        needs_build_ = true;
 
+        needs_build_ = true;
         return id;
     }
 
     void add_batch(const float* vecs, size_t num_vecs,
                    const BuildParams& build_params = BuildParams()) {
         if (num_vecs == 0) return;
-
-        encoder_.set_stochastic_rounding(build_params.stochastic_rounding);
 
         graph_.reserve(graph_.size() + num_vecs);
 
@@ -76,7 +76,8 @@ public:
         needs_build_ = true;
 
         if (build_params.verbose) {
-            printf("[RaBitQIndex] Added %zu vectors. Edges will be built in finalize().\n", num_vecs);
+            printf("[RaBitQIndex] Added %zu vectors (B=%zu). Edges will be built in finalize().\n",
+                   num_vecs, BitWidth);
         }
     }
 
@@ -96,6 +97,7 @@ public:
         if (graph_.empty()) return {};
 
         QueryType encoded = encoder_.encode_query(query);
+        encoded.error_epsilon = params.error_epsilon;
 
         return Engine::search(
             encoded, query, graph_,
@@ -136,19 +138,24 @@ private:
     Graph graph_;
     bool finalized_ = false;
     bool needs_build_ = false;
-
-
 };
 
+// 1-bit aliases (backward compatible)
 using RaBitQIndex128 = RaBitQIndex<128, 32>;
 using RaBitQIndex256 = RaBitQIndex<256, 32>;
 using RaBitQIndex512 = RaBitQIndex<512, 32>;
 using RaBitQIndex1024 = RaBitQIndex<1024, 32>;
 
 // Dense (SOTA) variants
-using RaBitQIndexDense128 = RaBitQIndex<128, 32, DenseRotation>;
-using RaBitQIndexDense256 = RaBitQIndex<256, 32, DenseRotation>;
-using RaBitQIndexDense512 = RaBitQIndex<512, 32, DenseRotation>;
-using RaBitQIndexDense1024 = RaBitQIndex<1024, 32, DenseRotation>;
+using RaBitQIndexDense128 = RaBitQIndex<128, 32, 1, DenseRotation>;
+using RaBitQIndexDense256 = RaBitQIndex<256, 32, 1, DenseRotation>;
+using RaBitQIndexDense512 = RaBitQIndex<512, 32, 1, DenseRotation>;
+using RaBitQIndexDense1024 = RaBitQIndex<1024, 32, 1, DenseRotation>;
+
+// Multi-bit aliases (Extended RaBitQ)
+using RaBitQIndex128_2bit = RaBitQIndex<128, 32, 2>;
+using RaBitQIndex128_4bit = RaBitQIndex<128, 32, 4>;
+using RaBitQIndex256_2bit = RaBitQIndex<256, 32, 2>;
+using RaBitQIndex256_4bit = RaBitQIndex<256, 32, 4>;
 
 }  // namespace cphnsw

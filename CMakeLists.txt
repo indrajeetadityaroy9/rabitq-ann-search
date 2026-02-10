@@ -22,7 +22,6 @@ endif()
 
 # OpenMP support
 find_package(OpenMP REQUIRED)
-target_link_libraries(cphnsw INTERFACE OpenMP::OpenMP_CXX)
 
 # Header-only library target
 add_library(cphnsw INTERFACE)
@@ -42,6 +41,18 @@ foreach(D_VAL 128 256 512)
     target_compile_definitions(benchmark_d${D_VAL} PRIVATE EVAL_D=${D_VAL})
     target_link_libraries(benchmark_d${D_VAL} PRIVATE cphnsw)
 endforeach()
+
+# Multi-bit test
+add_executable(test_nbit apps/test_nbit.cpp)
+target_link_libraries(test_nbit PRIVATE cphnsw)
+
+# ITQ test
+add_executable(test_itq apps/test_itq.cpp)
+target_link_libraries(test_itq PRIVATE cphnsw)
+
+# HNSW test
+add_executable(test_hnsw apps/test_hnsw.cpp)
+target_link_libraries(test_hnsw PRIVATE cphnsw)
 
 # Python bindings
 find_package(pybind11 QUIET)

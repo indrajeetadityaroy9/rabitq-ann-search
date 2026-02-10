@@ -11,16 +11,36 @@
 #include <atomic>
 #include <stdexcept>
 #include <random>
+#include <cstring>
+#include <type_traits>
 
 namespace cphnsw {
 
-template <size_t D, size_t R = 32>
+// Colocated per-vertex data for cache-friendly access during search.
+// All data needed to visit a vertex (code, neighbors, raw vector) is stored
+// contiguously, reducing cache misses from 3 (separate vectors) to 1.
+// BitWidth=1 uses original 1-bit types; BitWidth>1 uses Extended RaBitQ types.
+template <size_t D, size_t R, size_t BitWidth = 1>
+struct alignas(64) VertexData {
+    using CodeType = std::conditional_t<BitWidth == 1,
+        RaBitQCode<D>, NbitRaBitQCode<D, BitWidth>>;
+    using NeighborBlockType = std::conditional_t<BitWidth == 1,
+        FastScanNeighborBlock<D, R, 32>,
+        NbitFastScanNeighborBlock<D, R, BitWidth, 32>>;
+
+    CodeType code;
+    NeighborBlockType neighbors;
+    alignas(64) float vector[D];
+};
+
+template <size_t D, size_t R = 32, size_t BitWidth = 1>
 class RaBitQGraph {
 public:
     static_assert(R % 32 == 0, "R must be a multiple of 32 for AVX2 FastScan");
 
-    using CodeType = RaBitQCode<D>;
-    using NeighborBlockType = FastScanNeighborBlock<D, R, 32>;
+    using VertexDataType = VertexData<D, R, BitWidth>;
+    using CodeType = typename VertexDataType::CodeType;
+    using NeighborBlockType = typename VertexDataType::NeighborBlockType;
 
     static constexpr size_t DIMS = D;
     static constexpr size_t DEGREE = R;
@@ -28,20 +48,21 @@ public:
     explicit RaBitQGraph(size_t dim, size_t capacity = 1024)
         : dim_(dim) {
         entry_point_.store(INVALID_NODE, std::memory_order_relaxed);
-        codes_.reserve(capacity);
-        neighbors_.reserve(capacity);
-        vectors_.reserve(capacity);
+        vertices_.reserve(capacity);
     }
 
     NodeId add_node(const CodeType& code, const float* vec) {
         std::lock_guard<std::mutex> lock(graph_mutex_);
 
-        NodeId id = static_cast<NodeId>(codes_.size());
-        codes_.push_back(code);
-        neighbors_.emplace_back();
-
-        AlignedVector<float> v(vec, vec + dim_);
-        vectors_.push_back(std::move(v));
+        NodeId id = static_cast<NodeId>(vertices_.size());
+        vertices_.emplace_back();
+        auto& vd = vertices_.back();
+        vd.code = code;
+        std::memcpy(vd.vector, vec, dim_ * sizeof(float));
+        // Zero-pad remaining dimensions if dim_ < D
+        if (dim_ < D) {
+            std::memset(vd.vector + dim_, 0, (D - dim_) * sizeof(float));
+        }
 
         NodeId expected = INVALID_NODE;
         entry_point_.compare_exchange_strong(
@@ -52,13 +73,11 @@ public:
     }
 
     void reserve(size_t capacity) {
-        codes_.reserve(capacity);
-        neighbors_.reserve(capacity);
-        vectors_.reserve(capacity);
+        vertices_.reserve(capacity);
     }
 
-    size_t size() const { return codes_.size(); }
-    bool empty() const { return codes_.empty(); }
+    size_t size() const { return vertices_.size(); }
+    bool empty() const { return vertices_.empty(); }
     size_t dim() const { return dim_; }
 
     NodeId entry_point() const {
@@ -69,48 +88,61 @@ public:
         entry_point_.store(id, std::memory_order_release);
     }
 
-    const CodeType& get_code(NodeId id) const { return codes_[id]; }
-    CodeType& get_code(NodeId id) { return codes_[id]; }
+    const CodeType& get_code(NodeId id) const { return vertices_[id].code; }
+    CodeType& get_code(NodeId id) { return vertices_[id].code; }
 
-    const float* get_vector(NodeId id) const { return vectors_[id].data(); }
+    const float* get_vector(NodeId id) const { return vertices_[id].vector; }
 
     const NeighborBlockType& get_neighbors(NodeId id) const {
-        return neighbors_[id];
+        return vertices_[id].neighbors;
     }
 
     NeighborBlockType& get_neighbors(NodeId id) {
-        return neighbors_[id];
+        return vertices_[id].neighbors;
     }
 
+    template <typename CodeData>
     void set_neighbor(NodeId node, size_t slot, NodeId neighbor_id,
-                      const BinaryCodeStorage<D>& neighbor_signs,
+                      const CodeData& neighbor_code_data,
                       const VertexAuxData& aux) {
-        neighbors_[node].set_neighbor(slot, neighbor_id, neighbor_signs, aux);
+        vertices_[node].neighbors.set_neighbor(slot, neighbor_id, neighbor_code_data, aux);
     }
 
     size_t neighbor_count(NodeId id) const {
-        return (id < neighbors_.size()) ? neighbors_[id].size() : 0;
+        return (id < vertices_.size()) ? vertices_[id].neighbors.size() : 0;
+    }
+
+    // Prefetch a vertex's data into cache. Call this 1-2 iterations ahead of access.
+    // Prefetches 5 cache lines (320 bytes) covering code + neighbor block header.
+    void prefetch_vertex(NodeId id) const {
+        if (id >= vertices_.size()) return;
+        const auto* vd = &vertices_[id];
+        prefetch_t<1>(vd);
+        prefetch_t<1>(reinterpret_cast<const char*>(vd) + 64);
+        prefetch_t<1>(reinterpret_cast<const char*>(vd) + 128);
+        prefetch_t<1>(reinterpret_cast<const char*>(vd) + 192);
+        prefetch_t<1>(reinterpret_cast<const char*>(vd) + 256);
     }
 
     float average_degree() const {
-        if (neighbors_.empty()) return 0.0f;
+        if (vertices_.empty()) return 0.0f;
         size_t total = 0;
-        for (const auto& nb : neighbors_) total += nb.size();
-        return static_cast<float>(total) / neighbors_.size();
+        for (const auto& vd : vertices_) total += vd.neighbors.size();
+        return static_cast<float>(total) / vertices_.size();
     }
 
     size_t max_degree() const {
         size_t m = 0;
-        for (const auto& nb : neighbors_) {
-            if (nb.size() > m) m = nb.size();
+        for (const auto& vd : vertices_) {
+            if (vd.neighbors.size() > m) m = vd.neighbors.size();
         }
         return m;
     }
 
     size_t count_isolated() const {
         size_t c = 0;
-        for (const auto& nb : neighbors_) {
-            if (nb.empty()) ++c;
+        for (const auto& vd : vertices_) {
+            if (vd.neighbors.empty()) ++c;
         }
         return c;
     }
@@ -118,21 +150,24 @@ public:
     NodeId find_medoid() const {
         if (empty()) return INVALID_NODE;
 
+        size_t n = vertices_.size();
         std::vector<double> centroid(dim_, 0.0);
-        for (size_t i = 0; i < vectors_.size(); ++i) {
+        for (size_t i = 0; i < n; ++i) {
+            const float* v = vertices_[i].vector;
             for (size_t j = 0; j < dim_; ++j) {
-                centroid[j] += vectors_[i][j];
+                centroid[j] += v[j];
             }
         }
-        double inv_n = 1.0 / vectors_.size();
+        double inv_n = 1.0 / n;
         for (size_t j = 0; j < dim_; ++j) centroid[j] *= inv_n;
 
         NodeId best = 0;
         double best_dist = std::numeric_limits<double>::max();
-        for (size_t i = 0; i < vectors_.size(); ++i) {
+        for (size_t i = 0; i < n; ++i) {
+            const float* v = vertices_[i].vector;
             double dist = 0.0;
             for (size_t j = 0; j < dim_; ++j) {
-                double d = vectors_[i][j] - centroid[j];
+                double d = v[j] - centroid[j];
                 dist += d * d;
             }
             if (dist < best_dist) {
@@ -146,9 +181,7 @@ public:
 
 private:
     size_t dim_;
-    std::vector<CodeType> codes_;
-    std::vector<NeighborBlockType> neighbors_;
-    std::vector<AlignedVector<float>> vectors_;
+    std::vector<VertexDataType, AlignedAllocator<VertexDataType>> vertices_;
     std::atomic<NodeId> entry_point_;
     mutable std::mutex graph_mutex_;
 };
@@ -156,5 +189,9 @@ private:
 using RaBitQGraph128 = RaBitQGraph<128, 32>;
 using RaBitQGraph256 = RaBitQGraph<256, 32>;
 using RaBitQGraph1024 = RaBitQGraph<1024, 32>;
+
+// Multi-bit graph aliases
+template <size_t D, size_t R = 32, size_t BitWidth = 2>
+using NbitRaBitQGraph = RaBitQGraph<D, R, BitWidth>;
 
 }  // namespace cphnsw

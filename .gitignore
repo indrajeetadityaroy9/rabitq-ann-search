@@ -51,6 +51,9 @@ checkpoints/
 *~
 .DS_Store
 
+# External benchmark framework (cloned)
+bench/vibe/
+
 # Misc
 *.tmp
 *.cache

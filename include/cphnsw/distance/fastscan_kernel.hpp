@@ -4,6 +4,8 @@
 #include "fastscan_layout.hpp"
 #include <cstdint>
 #include <cmath>
+#include <limits>
+#include <algorithm>
 #include <immintrin.h>
 
 namespace cphnsw {
@@ -155,7 +157,7 @@ inline void convert_to_distances_with_bounds(
         // Error bound on ip_approx (Theorem 3.2)
         float ip_qo_sq = ip_qo * ip_qo;
         if (ip_qo_sq < 1e-10f) {
-            out_lower[i] = 0.0f;
+            out_lower[i] = std::numeric_limits<float>::max();
             continue;
         }
         float bound_on_ip = epsilon * std::sqrt(
@@ -164,8 +166,9 @@ inline void convert_to_distances_with_bounds(
         // Upper bound on cosine → lower bound on distance
         // Clamp cosine to 1.0 (mathematical maximum) to ensure
         // lower >= (dist_o - query_norm)^2 (triangle inequality)
-        float ip_est_upper = std::min((ip_approx + bound_on_ip) / ip_qo, 1.0f);
+        float ip_est_upper = std::min(ip_est + bound_on_ip, 1.0f);
 
+        out_dist[i] = std::max(out_dist[i], 0.0f);
         out_lower[i] = dist_o * dist_o + query_norm_sq
                       - 2.0f * dist_o * query_norm * ip_est_upper;
         if (out_lower[i] < 0.0f) out_lower[i] = 0.0f;
@@ -249,14 +252,16 @@ inline void convert_nbit_to_distances_with_bounds(
 
         float ip_qo_sq = ip_qo * ip_qo;
         if (ip_qo_sq < 1e-10f) {
-            out_lower[i] = 0.0f;
+            out_lower[i] = std::numeric_limits<float>::max();
             continue;
         }
         float bound_on_ip = epsilon * std::sqrt(
             (1.0f - ip_qo_sq) / (ip_qo_sq * static_cast<float>(D)));
 
-        float ip_est_upper = std::min((ip_approx_msb + bound_on_ip) / ip_qo, 1.0f);
+        float ip_est_msb = ip_approx_msb / ip_qo;
+        float ip_est_upper = std::min(ip_est_msb + bound_on_ip, 1.0f);
 
+        out_dist[i] = std::max(out_dist[i], 0.0f);
         out_lower[i] = dist_o * dist_o + query_norm_sq
                      - 2.0f * dist_o * query_norm * ip_est_upper;
         if (out_lower[i] < 0.0f) out_lower[i] = 0.0f;

@@ -113,15 +113,17 @@ public:
     }
 
     // Prefetch a vertex's data into cache. Call this 1-2 iterations ahead of access.
-    // Prefetches 5 cache lines (320 bytes) covering code + neighbor block header.
+    // Dynamically prefetches cache lines based on actual VertexData size.
+    static constexpr size_t PREFETCH_LINES =
+        (sizeof(VertexDataType) / CACHE_LINE_SIZE < 12)
+            ? (sizeof(VertexDataType) / CACHE_LINE_SIZE) : 12;
+
     void prefetch_vertex(NodeId id) const {
         if (id >= vertices_.size()) return;
-        const auto* vd = &vertices_[id];
-        prefetch_t<1>(vd);
-        prefetch_t<1>(reinterpret_cast<const char*>(vd) + 64);
-        prefetch_t<1>(reinterpret_cast<const char*>(vd) + 128);
-        prefetch_t<1>(reinterpret_cast<const char*>(vd) + 192);
-        prefetch_t<1>(reinterpret_cast<const char*>(vd) + 256);
+        const char* base = reinterpret_cast<const char*>(&vertices_[id]);
+        for (size_t line = 0; line < PREFETCH_LINES; ++line) {
+            prefetch_t<1>(base + line * CACHE_LINE_SIZE);
+        }
     }
 
     float average_degree() const {

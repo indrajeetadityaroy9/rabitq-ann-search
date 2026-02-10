@@ -65,4 +65,37 @@ endif()
 install(TARGETS cphnsw EXPORT cphnsw-targets)
 install(DIRECTORY include/cphnsw/ DESTINATION include/cphnsw)
 
+# === Test Infrastructure ===
+include(FetchContent)
+FetchContent_Declare(
+    googletest
+    GIT_REPOSITORY https://github.com/google/googletest.git
+    GIT_TAG v1.14.0
+)
+set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(googletest)
+
+enable_testing()
+
+# Test executables
+add_executable(test_fastscan_correctness tests/test_fastscan_correctness.cpp)
+target_link_libraries(test_fastscan_correctness PRIVATE cphnsw GTest::gtest_main)
+add_test(NAME FastScanCorrectness COMMAND test_fastscan_correctness)
+
+add_executable(test_encoder_roundtrip tests/test_encoder_roundtrip.cpp)
+target_link_libraries(test_encoder_roundtrip PRIVATE cphnsw GTest::gtest_main)
+add_test(NAME EncoderRoundtrip COMMAND test_encoder_roundtrip)
+
+add_executable(test_neighbor_selection tests/test_neighbor_selection.cpp)
+target_link_libraries(test_neighbor_selection PRIVATE cphnsw GTest::gtest_main)
+add_test(NAME NeighborSelection COMMAND test_neighbor_selection)
+
+add_executable(test_graph_construction tests/test_graph_construction.cpp)
+target_link_libraries(test_graph_construction PRIVATE cphnsw GTest::gtest_main)
+add_test(NAME GraphConstruction COMMAND test_graph_construction)
+
+add_executable(test_serialization tests/test_serialization.cpp)
+target_link_libraries(test_serialization PRIVATE cphnsw GTest::gtest_main)
+add_test(NAME Serialization COMMAND test_serialization)
+
 message(STATUS "CP-HNSW SOTA Configuration Active")

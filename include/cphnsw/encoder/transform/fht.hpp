@@ -70,7 +70,8 @@ inline void fht_avx2(float* vec, size_t len) {
     }
 }
 
-inline void fht(float* vec, size_t len) {
+#ifdef __AVX512F__
+inline void fht_avx512(float* vec, size_t len) {
     assert(detail::is_power_of_two(len));
 
     if (len < 16) {
@@ -119,6 +120,20 @@ inline void fht(float* vec, size_t len) {
             }
         }
     }
+}
+#endif
+
+inline void fht(float* vec, size_t len) {
+    assert(detail::is_power_of_two(len));
+
+#ifdef __AVX512F__
+    static bool has_avx512 = __builtin_cpu_supports("avx512f");
+    if (has_avx512 && len >= 16) {
+        fht_avx512(vec, len);
+        return;
+    }
+#endif
+    fht_avx2(vec, len);
 }
 
 }  // namespace cphnsw

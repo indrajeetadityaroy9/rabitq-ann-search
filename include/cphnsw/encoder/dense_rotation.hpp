@@ -8,6 +8,10 @@
 #include <algorithm>
 #include <stdexcept>
 
+#ifdef CPHNSW_USE_BLAS
+#include <cblas.h>
+#endif
+
 namespace cphnsw {
 
 // Implements a full Dense Random Orthogonal Rotation.
@@ -48,15 +52,19 @@ public:
         // matrix_ is row-major (D x D)
         
         std::memset(output, 0, padded_dim_ * sizeof(float));
-        
-        // Simple O(D^2) multiplication. 
-        // TODO: Optimize with BLAS or Tiling if D is large.
-        // For D=128, this is small enough.
-        
+
+#ifdef CPHNSW_USE_BLAS
+        // Use BLAS for O(D^2) matrix-vector multiply: output = matrix_ * input
+        cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                    static_cast<int>(dim_), static_cast<int>(dim_),
+                    1.0f, matrix_.data(), static_cast<int>(dim_),
+                    input, 1,
+                    0.0f, output, 1);
+#else
         for (size_t i = 0; i < dim_; ++i) {
             float sum = 0.0f;
             const float* row = matrix_.data() + i * dim_;
-            
+
             // Vectorize this inner loop
             #pragma omp simd reduction(+:sum)
             for (size_t j = 0; j < dim_; ++j) {
@@ -64,6 +72,7 @@ public:
             }
             output[i] = sum;
         }
+#endif
     }
 
     size_t original_dim() const { return dim_; }

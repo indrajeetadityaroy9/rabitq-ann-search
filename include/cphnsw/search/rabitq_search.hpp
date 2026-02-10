@@ -10,8 +10,50 @@
 #include <queue>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace cphnsw {
+
+template <typename T>
+class BoundedMaxHeap {
+public:
+    explicit BoundedMaxHeap(size_t capacity) : capacity_(capacity) {
+        data_.reserve(capacity + 1);
+    }
+
+    bool empty() const { return data_.empty(); }
+    size_t size() const { return data_.size(); }
+    const T& top() const { return data_.front(); }
+
+    void push(const T& val) {
+        if (data_.size() < capacity_) {
+            data_.push_back(val);
+            std::push_heap(data_.begin(), data_.end());
+        } else if (val < data_.front()) {
+            std::pop_heap(data_.begin(), data_.end());
+            data_.back() = val;
+            std::push_heap(data_.begin(), data_.end());
+        }
+    }
+
+    void pop() {
+        std::pop_heap(data_.begin(), data_.end());
+        data_.pop_back();
+    }
+
+    std::vector<T> extract_sorted() {
+        std::sort_heap(data_.begin(), data_.end());
+        return std::move(data_);
+    }
+
+    float worst_distance() const {
+        return data_.empty() ? std::numeric_limits<float>::max() : data_.front().distance;
+    }
+
+private:
+    std::vector<T> data_;
+    size_t capacity_;
+};
 
 template <size_t D, size_t R = 32, size_t BitWidth = 1>
 class RaBitQSearchEngine {
@@ -48,7 +90,7 @@ public:
 
         std::priority_queue<BeamEntry, std::vector<BeamEntry>,
                            std::greater<BeamEntry>> beam;
-        MaxHeap nn;
+        BoundedMaxHeap<SearchResult> nn(k);
 
         // Entry-point distance estimation
         float ep_est;
@@ -87,8 +129,16 @@ public:
             // Early termination: best estimated candidate is worse than k-th exact
             if (nn.size() >= k && current.est_distance > nn.top().distance) break;
 
+            // Prefetch top 2 beam candidates' vertex data for reduced cache misses
             if (!beam.empty()) {
                 graph.prefetch_vertex(beam.top().id);
+                // Peek at second-best candidate by temporarily popping
+                BeamEntry first_beam = beam.top();
+                beam.pop();
+                if (!beam.empty()) {
+                    graph.prefetch_vertex(beam.top().id);
+                }
+                beam.push(first_beam);
             }
 
             // Two-stage check: skip exact distance if lower bound exceeds k-th best
@@ -100,12 +150,7 @@ public:
             const float* vertex_vec = graph.get_vector(current.id);
             float exact_dist = l2_distance_simd<D>(raw_query, vertex_vec);
 
-            if (nn.size() < k) {
-                nn.push({current.id, exact_dist});
-            } else if (exact_dist < nn.top().distance) {
-                nn.pop();
-                nn.push({current.id, exact_dist});
-            }
+            nn.push({current.id, exact_dist});
 
             const auto& nb = graph.get_neighbors(current.id);
             size_t n_neighbors = nb.size();
@@ -172,14 +217,7 @@ public:
             }
         }
 
-        std::vector<SearchResult> results;
-        results.reserve(nn.size());
-        while (!nn.empty()) {
-            results.push_back(nn.top());
-            nn.pop();
-        }
-        std::reverse(results.begin(), results.end());
-        return results;
+        return nn.extract_sorted();
     }
 
     // Convenience: thread-local visitation, default entry point
@@ -218,21 +256,37 @@ using RaBitQSearch128 = RaBitQSearchEngine<128, 32>;
 using RaBitQSearch256 = RaBitQSearchEngine<256, 32>;
 using RaBitQSearch1024 = RaBitQSearchEngine<1024, 32>;
 
-// Exact L2 beam search for graph construction (Vamana-style).
-// Uses only exact L2 distances — no RaBitQ approximations.
-// This produces correct graph topology; RaBitQ is used only at query time.
-template <size_t D, size_t R = 32, size_t BitWidth = 1>
-class ExactL2SearchEngine {
+// Distance policy for exact L2 computation during graph construction
+struct ExactL2Policy {
+    template <size_t D>
+    static float compute(const float* a, const float* b) {
+        return l2_distance_simd<D>(a, b);
+    }
+};
+
+// Distance policy for quantized computation (used in Phase 3 QRG construction)
+struct QuantizedPolicy {
+    // Placeholder: will use RaBitQ codes for approximate distance
+    // Falls back to exact L2 for now
+    template <size_t D>
+    static float compute(const float* a, const float* b) {
+        return l2_distance_simd<D>(a, b);
+    }
+};
+
+// Policy-parameterized beam search engine for graph construction.
+// DistancePolicy must provide: template<size_t D> static float compute(const float* a, const float* b)
+template <size_t D, size_t R = 32, size_t BitWidth = 1, typename DistancePolicy = ExactL2Policy>
+class GraphSearchEngine {
 public:
     using Graph = RaBitQGraph<D, R, BitWidth>;
 
     struct BeamEntry {
-        float distance;  // exact L2²
+        float distance;  // from policy
         NodeId id;
         bool operator>(const BeamEntry& o) const { return distance > o.distance; }
     };
 
-    // Beam search using exact L2 distances for all navigation.
     static std::vector<SearchResult> search(
         const float* raw_query,
         const Graph& graph,
@@ -251,10 +305,9 @@ public:
 
         std::priority_queue<BeamEntry, std::vector<BeamEntry>,
                            std::greater<BeamEntry>> beam;
-        MaxHeap nn;
+        BoundedMaxHeap<SearchResult> nn(k);
 
-        // Entry point: exact L2 distance
-        float ep_dist = l2_distance_simd<D>(raw_query, graph.get_vector(ep));
+        float ep_dist = DistancePolicy::template compute<D>(raw_query, graph.get_vector(ep));
         beam.push({ep_dist, ep});
         visited.check_and_mark(ep, query_id);
 
@@ -262,28 +315,18 @@ public:
             BeamEntry current = beam.top();
             beam.pop();
 
-            // Early termination: best candidate worse than k-th result
             if (nn.size() >= k && current.distance > nn.top().distance) break;
 
-            // Prefetch next beam candidate's vertex data
             if (!beam.empty()) {
                 graph.prefetch_vertex(beam.top().id);
             }
 
-            // Update result set
-            if (nn.size() < k) {
-                nn.push({current.id, current.distance});
-            } else if (current.distance < nn.top().distance) {
-                nn.pop();
-                nn.push({current.id, current.distance});
-            }
+            nn.push({current.id, current.distance});
 
-            // Expand neighbors
             const auto& nb = graph.get_neighbors(current.id);
             size_t n_neighbors = nb.size();
 
             for (size_t i = 0; i < n_neighbors; ++i) {
-                // Prefetch vector 2 positions ahead
                 if (i + 2 < n_neighbors) {
                     NodeId prefetch_id = nb.neighbor_ids[i + 2];
                     if (prefetch_id != INVALID_NODE) {
@@ -295,15 +338,13 @@ public:
                 if (neighbor_id == INVALID_NODE) continue;
                 if (visited.check_and_mark(neighbor_id, query_id)) continue;
 
-                float dist = l2_distance_simd<D>(raw_query, graph.get_vector(neighbor_id));
+                float dist = DistancePolicy::template compute<D>(raw_query, graph.get_vector(neighbor_id));
 
-                // Prune: skip if worse than k-th best
                 if (nn.size() >= k && dist >= nn.top().distance) continue;
 
                 beam.push({dist, neighbor_id});
             }
 
-            // Beam size management
             if (beam.size() > ef * 3) {
                 std::priority_queue<BeamEntry, std::vector<BeamEntry>,
                                    std::greater<BeamEntry>> new_beam;
@@ -317,15 +358,12 @@ public:
             }
         }
 
-        std::vector<SearchResult> results;
-        results.reserve(nn.size());
-        while (!nn.empty()) {
-            results.push_back(nn.top());
-            nn.pop();
-        }
-        std::reverse(results.begin(), results.end());
-        return results;
+        return nn.extract_sorted();
     }
 };
+
+// Backward-compatible alias: ExactL2SearchEngine is GraphSearchEngine with ExactL2Policy
+template <size_t D, size_t R = 32, size_t BitWidth = 1>
+using ExactL2SearchEngine = GraphSearchEngine<D, R, BitWidth, ExactL2Policy>;
 
 }  // namespace cphnsw

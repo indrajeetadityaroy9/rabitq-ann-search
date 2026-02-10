@@ -16,14 +16,8 @@
 #include <cmath>
 #include <algorithm>
 #include <type_traits>
-#include <unordered_map>
 
-#ifdef _OPENMP
-#include <omp.h>
-#else
-inline int omp_get_thread_num() { return 0; }
-inline int omp_get_max_threads() { return 1; }
-#endif
+#include "../core/omp_compat.hpp"
 
 namespace cphnsw {
 
@@ -201,10 +195,39 @@ private:
     // Upper-layer adjacency lists.
     // upper_neighbors_[level-1][node] = vector of neighbor NodeIds at that level.
     // Only allocated for nodes with level >= that layer.
-    struct UpperLayerNode {
-        std::vector<NodeId> neighbors;
+    struct UpperLayerEdge {
+        NodeId node;
+        std::vector<NodeId> neighbors;  // up to M_UPPER neighbors
+
+        bool operator<(const UpperLayerEdge& other) const { return node < other.node; }
     };
-    std::vector<std::unordered_map<NodeId, UpperLayerNode>> upper_layers_;  // [level-1][node_id]
+    std::vector<std::vector<UpperLayerEdge>> upper_layers_;  // [level-1], sorted by node ID
+
+    // Find edge for node at given level, or nullptr if not present
+    UpperLayerEdge* find_edge(int level, NodeId node) {
+        auto& layer = upper_layers_[level - 1];
+        UpperLayerEdge target{node, {}};
+        auto it = std::lower_bound(layer.begin(), layer.end(), target);
+        if (it != layer.end() && it->node == node) return &(*it);
+        return nullptr;
+    }
+
+    const UpperLayerEdge* find_edge(int level, NodeId node) const {
+        const auto& layer = upper_layers_[level - 1];
+        UpperLayerEdge target{node, {}};
+        auto it = std::lower_bound(layer.begin(), layer.end(), target);
+        if (it != layer.end() && it->node == node) return &(*it);
+        return nullptr;
+    }
+
+    // Get or create edge for node at given level
+    UpperLayerEdge& get_or_create_edge(int level, NodeId node) {
+        auto& layer = upper_layers_[level - 1];
+        UpperLayerEdge target{node, {}};
+        auto it = std::lower_bound(layer.begin(), layer.end(), target);
+        if (it != layer.end() && it->node == node) return *it;
+        return *layer.insert(it, UpperLayerEdge{node, {}});
+    }
 
     // Assign a random level to each node: floor(-log(uniform) * mL_)
     void assign_layers(size_t n) {
@@ -269,7 +292,7 @@ private:
                 auto selected = select_neighbors_heuristic(std::move(candidates), M_UPPER, dist_fn);
 
                 // Set forward edges: node -> selected neighbors
-                auto& node_neighbors = upper_layers_[level - 1][node].neighbors;
+                auto& node_neighbors = get_or_create_edge(level, node).neighbors;
                 node_neighbors.clear();
                 node_neighbors.reserve(selected.size());
                 for (const auto& s : selected) {
@@ -278,7 +301,7 @@ private:
 
                 // Set reverse edges: each neighbor -> node (with pruning)
                 for (const auto& s : selected) {
-                    auto& nb = upper_layers_[level - 1][s.id].neighbors;
+                    auto& nb = get_or_create_edge(level, s.id).neighbors;
                     nb.push_back(node);
                     if (nb.size() > M_UPPER) {
                         prune_upper_neighbors(s.id, level);
@@ -297,8 +320,8 @@ private:
                 const auto& layer = upper_layers_[l - 1];
                 size_t count = layer.size();
                 size_t edges = 0;
-                for (const auto& [node_id, node_data] : layer) {
-                    edges += node_data.neighbors.size();
+                for (const auto& edge : layer) {
+                    edges += edge.neighbors.size();
                 }
                 printf("[HNSW] Layer %d: %zu nodes, %.1f avg degree\n",
                        l, count, count > 0 ? static_cast<float>(edges) / count : 0.0f);
@@ -316,9 +339,9 @@ private:
 
         while (improved) {
             improved = false;
-            auto it = upper_layers_[level - 1].find(best_id);
-            if (it == upper_layers_[level - 1].end()) break;
-            const auto& neighbors = it->second.neighbors;
+            const auto* edge = find_edge(level, best_id);
+            if (!edge) break;
+            const auto& neighbors = edge->neighbors;
             for (NodeId nb : neighbors) {
                 float d = exact_distance(query, graph_.get_vector(nb));
                 if (d < best_dist) {
@@ -364,9 +387,9 @@ private:
                 break;
             }
 
-            auto it = upper_layers_[level - 1].find(current.id);
-            if (it == upper_layers_[level - 1].end()) continue;
-            const auto& neighbors = it->second.neighbors;
+            const auto* edge = find_edge(level, current.id);
+            if (!edge) continue;
+            const auto& neighbors = edge->neighbors;
             for (NodeId nb : neighbors) {
                 if (visited_table.check_and_mark(nb, qid)) continue;
 
@@ -395,7 +418,7 @@ private:
 
     // Prune an upper-layer node's neighbors to at most M_UPPER, keeping closest.
     void prune_upper_neighbors(NodeId node, int level) {
-        auto& nb = upper_layers_[level - 1][node].neighbors;
+        auto& nb = get_or_create_edge(level, node).neighbors;
         if (nb.size() <= M_UPPER) return;
 
         const float* vec = graph_.get_vector(node);

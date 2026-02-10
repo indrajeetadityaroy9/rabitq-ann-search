@@ -43,6 +43,7 @@ public:
     pointer allocate(size_type n) {
         if (n == 0) return nullptr;
         size_t bytes = n * sizeof(T);
+        bytes = ((bytes + Alignment - 1) / Alignment) * Alignment;
         void* ptr = std::aligned_alloc(Alignment, bytes);
         if (!ptr) throw std::bad_alloc();
         return static_cast<pointer>(ptr);
@@ -95,7 +96,10 @@ struct alignas(CACHE_LINE_SIZE) CacheLinePad {
 template <typename T>
 struct alignas(CACHE_LINE_SIZE) CacheLineIsolated {
     T value;
-    char padding[CACHE_LINE_SIZE - sizeof(T) % CACHE_LINE_SIZE];
+    // Pad to fill cache line. When T already fills a cache line, use 1 byte (alignas handles alignment).
+    static constexpr size_t REMAINDER = sizeof(T) % CACHE_LINE_SIZE;
+    static constexpr size_t PAD_SIZE = (REMAINDER == 0) ? 1 : (CACHE_LINE_SIZE - REMAINDER);
+    char padding[PAD_SIZE];
 
     CacheLineIsolated() = default;
     explicit CacheLineIsolated(const T& v) : value(v) {}
@@ -118,6 +122,7 @@ template <typename T, size_t Alignment = SIMD_ALIGNMENT>
 AlignedUniquePtr<T> make_aligned(size_t count = 1) {
     static_assert((Alignment & (Alignment - 1)) == 0, "Alignment must be power of 2");
     size_t bytes = count * sizeof(T);
+    bytes = ((bytes + Alignment - 1) / Alignment) * Alignment;
     void* ptr = std::aligned_alloc(Alignment, bytes);
     if (!ptr) throw std::bad_alloc();
     return AlignedUniquePtr<T>(static_cast<T*>(ptr));
@@ -160,6 +165,34 @@ inline float l2_distance_simd_runtime(const float* a, const float* b, size_t dim
         result += d * d;
     }
     return result;
+}
+
+// AVX-512 accelerated L2 squared distance (compile-time dimension).
+#ifdef __AVX512F__
+template <size_t D>
+inline float l2_distance_avx512(const float* a, const float* b) {
+    static_assert(D % 16 == 0, "D must be a multiple of 16 for AVX-512");
+    __m512 sum = _mm512_setzero_ps();
+    for (size_t i = 0; i < D; i += 16) {
+        __m512 diff = _mm512_sub_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i));
+        sum = _mm512_fmadd_ps(diff, diff, sum);
+    }
+    return _mm512_reduce_add_ps(sum);
+}
+#endif
+
+// Runtime dispatcher: picks AVX-512 if available, else AVX2.
+template <size_t D>
+inline float l2_distance_best(const float* a, const float* b) {
+#ifdef __AVX512F__
+    if constexpr (D % 16 == 0) {
+        static const bool has_avx512 = __builtin_cpu_supports("avx512f");
+        if (has_avx512) {
+            return l2_distance_avx512<D>(a, b);
+        }
+    }
+#endif
+    return l2_distance_simd<D>(a, b);
 }
 
 }  // namespace cphnsw

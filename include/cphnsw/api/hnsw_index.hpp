@@ -3,6 +3,7 @@
 #include "../core/types.hpp"
 #include "../core/codes.hpp"
 #include "../core/memory.hpp"
+#include "../core/adaptive_defaults.hpp"
 #include "../encoder/rabitq_encoder.hpp"
 #include "../distance/fastscan_kernel.hpp"
 #include "../graph/rabitq_graph.hpp"
@@ -21,17 +22,6 @@
 
 namespace cphnsw {
 
-// HNSW hierarchical multi-layer index.
-//
-// Upper layers (1..max_level): sparse graphs with simple adjacency lists,
-// exact distance computation, and greedy 1-NN search for routing.
-//
-// Layer 0: RaBitQ FastScan graph with colocated memory layout and
-// Vamana-style refinement. Uses beam search with quantized distance
-// estimation for high-throughput retrieval.
-//
-// Layer assignment follows geometric distribution: P(l >= L) = exp(-L * ln(M)).
-// This gives O(log n) expected layers and O(log n) search complexity.
 template <size_t D, size_t R = 32, size_t BitWidth = 1, typename RotationPolicy = RandomHadamardRotation>
 class HNSWIndex {
 public:
@@ -49,15 +39,13 @@ public:
     static constexpr size_t DEGREE = R;
     static constexpr size_t BIT_WIDTH = BitWidth;
 
-    // Upper-layer neighbor list per node per layer.
-    // M_upper neighbors max, stored as simple adjacency list.
     static constexpr size_t M_UPPER = R / 2;
 
     explicit HNSWIndex(const IndexParams& params)
         : params_(params)
         , encoder_(params.dim, params.seed)
-        , graph_(params.dim, params.initial_capacity)
-        , mL_(1.0 / std::log(static_cast<double>(params.M)))
+        , graph_(params.dim)
+        , mL_(1.0 / std::log(static_cast<double>(R)))
         , rng_(params.seed)
     {
         if (params.dim == 0) throw std::invalid_argument("dim must be > 0");
@@ -66,7 +54,6 @@ public:
     explicit HNSWIndex(size_t dim)
         : HNSWIndex(IndexParams().set_dim(dim)) {}
 
-    // Add vectors in batch (deferred build — call finalize() after).
     void add_batch(const float* vecs, size_t num_vecs,
                    const BuildParams& build_params = BuildParams()) {
         if (num_vecs == 0) return;
@@ -88,54 +75,69 @@ public:
         }
     }
 
-    // Build HNSW structure: assign layers, build upper layers via incremental
-    // insertion, then refine layer 0 with Vamana-style optimization.
-    void finalize(size_t num_threads = 0, bool verbose = false) {
+    void finalize(const BuildParams& params) {
         size_t n = graph_.size();
         if (n == 0 || !needs_build_) { finalized_ = true; return; }
 
-        // 1. Assign layers to all nodes
-        if (verbose) printf("[HNSW] Assigning layers to %zu nodes...\n", n);
+        // Resolve adaptive defaults from sentinels
+        size_t ef_c = params.ef_construction > 0
+            ? params.ef_construction
+            : AdaptiveDefaults::ef_construction(n, R);
+        float err_tol = params.error_tolerance >= 0.0f
+            ? params.error_tolerance
+            : AdaptiveDefaults::error_tolerance(D);
+        float err_eps = params.error_epsilon > 0.0f
+            ? params.error_epsilon
+            : AdaptiveDefaults::ERROR_EPSILON_BUILD;
+
+        if (params.verbose) printf("[HNSW] Assigning layers to %zu nodes...\n", n);
         assign_layers(n);
 
-        // 2. Build upper layers (sequential incremental insertion)
-        if (verbose) printf("[HNSW] Building %d upper layers...\n", max_level_);
-        build_upper_layers(verbose);
+        if (params.verbose) printf("[HNSW] Building %d upper layers...\n", max_level_);
+        build_upper_layers(params.verbose);
 
-        // 3. Build and refine layer 0 using existing Vamana pipeline
-        if (verbose) printf("[HNSW] Optimizing layer 0 (Vamana refinement)...\n");
-        Refinement::optimize_graph(graph_, encoder_, params_.ef_construction, num_threads, verbose);
+        if (params.verbose) printf("[HNSW] Optimizing layer 0 (ef_c=%zu, err_tol=%.4f, err_eps=%.3f)...\n",
+                                   ef_c, err_tol, err_eps);
+        Refinement::optimize_graph_adaptive(graph_, encoder_,
+            ef_c, err_tol, err_eps, params.num_threads, params.verbose);
 
         needs_build_ = false;
         finalized_ = true;
-        if (verbose) printf("[HNSW] Build complete. max_level=%d, entry=%u\n",
-                           max_level_, entry_point_);
+        if (params.verbose) printf("[HNSW] Build complete. max_level=%d, entry=%u\n",
+                                      max_level_, entry_point_);
     }
 
-    // Multi-layer search: greedy descent through upper layers, then
-    // FastScan beam search at layer 0.
+    void finalize() {
+        finalize(BuildParams{});
+    }
+
     std::vector<SearchResult> search(
         const float* query,
         const SearchParams& params = SearchParams()) const
     {
         if (graph_.empty()) return {};
 
-        QueryType encoded = encoder_.encode_query(query);
-        encoded.error_epsilon = params.error_epsilon;
+        // Resolve adaptive defaults from sentinels
+        size_t ef = params.ef > 0
+            ? params.ef
+            : AdaptiveDefaults::ef_search(params.k, params.recall_target);
+        float eps = params.error_epsilon > 0.0f
+            ? params.error_epsilon
+            : AdaptiveDefaults::error_epsilon_search(params.recall_target);
 
-        // If no upper layers, fall back to flat search
+        QueryType encoded = encoder_.encode_query(query);
+        encoded.error_epsilon = eps;
+
         if (max_level_ <= 0 || entry_point_ == INVALID_NODE) {
-            return Engine::search(encoded, query, graph_, params.ef, params.k);
+            return Engine::search(encoded, query, graph_, ef, params.k);
         }
 
-        // Greedy descent through upper layers to find best entry point for layer 0
         NodeId ep = entry_point_;
         for (int level = max_level_; level >= 1; --level) {
             ep = greedy_search_layer(query, ep, level);
         }
 
-        // Layer 0: full FastScan beam search from the routed entry point
-        return Engine::search_from(encoded, query, graph_, ep, params.ef, params.k);
+        return Engine::search_from(encoded, query, graph_, ep, ef, params.k);
     }
 
     std::vector<SearchResult> search(const float* query, size_t k) const {
@@ -182,28 +184,21 @@ private:
     bool finalized_ = false;
     bool needs_build_ = false;
 
-    // HNSW layer structure
-    double mL_;  // 1/ln(M), controls layer probability
+    double mL_;
     std::mt19937_64 rng_;
 
     int max_level_ = 0;
     NodeId entry_point_ = INVALID_NODE;
 
-    // Per-node assigned level (0 = base layer only)
     std::vector<int> node_levels_;
 
-    // Upper-layer adjacency lists.
-    // upper_neighbors_[level-1][node] = vector of neighbor NodeIds at that level.
-    // Only allocated for nodes with level >= that layer.
     struct UpperLayerEdge {
         NodeId node;
-        std::vector<NodeId> neighbors;  // up to M_UPPER neighbors
-
+        std::vector<NodeId> neighbors;
         bool operator<(const UpperLayerEdge& other) const { return node < other.node; }
     };
-    std::vector<std::vector<UpperLayerEdge>> upper_layers_;  // [level-1], sorted by node ID
+    std::vector<std::vector<UpperLayerEdge>> upper_layers_;
 
-    // Find edge for node at given level, or nullptr if not present
     UpperLayerEdge* find_edge(int level, NodeId node) {
         auto& layer = upper_layers_[level - 1];
         UpperLayerEdge target{node, {}};
@@ -220,7 +215,6 @@ private:
         return nullptr;
     }
 
-    // Get or create edge for node at given level
     UpperLayerEdge& get_or_create_edge(int level, NodeId node) {
         auto& layer = upper_layers_[level - 1];
         UpperLayerEdge target{node, {}};
@@ -229,7 +223,6 @@ private:
         return *layer.insert(it, UpperLayerEdge{node, {}});
     }
 
-    // Assign a random level to each node: floor(-log(uniform) * mL_)
     void assign_layers(size_t n) {
         node_levels_.resize(n);
         std::uniform_real_distribution<double> dist(0.0, 1.0);
@@ -239,7 +232,6 @@ private:
 
         for (size_t i = 0; i < n; ++i) {
             double r = dist(rng_);
-            // Avoid log(0)
             if (r < 1e-15) r = 1e-15;
             int level = static_cast<int>(-std::log(r) * mL_);
             node_levels_[i] = level;
@@ -249,18 +241,12 @@ private:
             }
         }
 
-        // Allocate upper-layer structures (sparse maps, no per-node allocation)
         upper_layers_.resize(max_level_);
     }
 
-    // Build upper layers via incremental HNSW insertion.
-    // For each node at level >= 1, greedily search to find nearest neighbors
-    // at each layer, then add bidirectional edges with pruning.
     void build_upper_layers(bool verbose) {
         size_t n = graph_.size();
 
-        // Insertion order: process nodes with highest levels first to ensure
-        // the entry point and high-level nodes are connected early.
         std::vector<NodeId> insertion_order(n);
         for (size_t i = 0; i < n; ++i) insertion_order[i] = static_cast<NodeId>(i);
         std::sort(insertion_order.begin(), insertion_order.end(),
@@ -269,29 +255,23 @@ private:
         for (size_t idx = 0; idx < n; ++idx) {
             NodeId node = insertion_order[idx];
             int node_level = node_levels_[node];
-            if (node_level == 0) break;  // All remaining nodes are layer-0 only
+            if (node_level == 0) break;
 
-            // Find entry point: greedy descent from global entry through layers
-            // above this node's level
             NodeId ep = entry_point_;
             for (int level = max_level_; level > node_level; --level) {
                 ep = greedy_search_layer(graph_.get_vector(node), ep, level);
             }
 
-            // Insert at each layer from node_level down to 1
             for (int level = std::min(node_level, max_level_); level >= 1; --level) {
-                // Search for ef_construction nearest neighbors at this layer
                 auto candidates = search_upper_layer(
                     graph_.get_vector(node), ep, level,
                     std::min<size_t>(params_.ef_construction, 64));
 
-                // Select M_UPPER neighbors using diversity-aware heuristic
                 auto dist_fn = [this](NodeId a, NodeId b) {
                     return exact_distance(graph_.get_vector(a), graph_.get_vector(b));
                 };
                 auto selected = select_neighbors_heuristic(std::move(candidates), M_UPPER, dist_fn);
 
-                // Set forward edges: node -> selected neighbors
                 auto& node_neighbors = get_or_create_edge(level, node).neighbors;
                 node_neighbors.clear();
                 node_neighbors.reserve(selected.size());
@@ -299,7 +279,6 @@ private:
                     node_neighbors.push_back(s.id);
                 }
 
-                // Set reverse edges: each neighbor -> node (with pruning)
                 for (const auto& s : selected) {
                     auto& nb = get_or_create_edge(level, s.id).neighbors;
                     nb.push_back(node);
@@ -308,7 +287,6 @@ private:
                     }
                 }
 
-                // Use closest neighbor as entry point for next lower layer
                 if (!selected.empty()) {
                     ep = selected[0].id;
                 }
@@ -329,7 +307,6 @@ private:
         }
     }
 
-    // Greedy 1-NN search at a given upper layer. Returns the nearest node found.
     NodeId greedy_search_layer(const float* query, NodeId ep, int level) const {
         if (ep == INVALID_NODE) return INVALID_NODE;
 
@@ -355,22 +332,18 @@ private:
         return best_id;
     }
 
-    // Beam search at an upper layer, returning ef nearest candidates.
     std::vector<NeighborCandidate> search_upper_layer(
         const float* query, NodeId ep, int level, size_t ef) const
     {
         if (ep == INVALID_NODE) return {};
 
-        // Min-heap of candidates to explore
         MinHeap candidates;
-        // Max-heap of current nearest
         MaxHeap nearest;
 
         float ep_dist = exact_distance(query, graph_.get_vector(ep));
         candidates.push({ep, ep_dist});
         nearest.push({ep, ep_dist});
 
-        // Epoch-based visited set — avoids O(n) allocation per search
         thread_local VisitationTable visited_table(0);
         if (visited_table.capacity() < graph_.size()) {
             visited_table.resize(graph_.size() + 1024);
@@ -382,7 +355,6 @@ private:
             auto current = candidates.top();
             candidates.pop();
 
-            // If the closest candidate is farther than the farthest in our results, stop
             if (nearest.size() >= ef && current.distance > nearest.top().distance) {
                 break;
             }
@@ -405,7 +377,6 @@ private:
             }
         }
 
-        // Convert to NeighborCandidate vector
         std::vector<NeighborCandidate> results;
         results.reserve(nearest.size());
         while (!nearest.empty()) {
@@ -416,7 +387,6 @@ private:
         return results;
     }
 
-    // Prune an upper-layer node's neighbors to at most M_UPPER, keeping closest.
     void prune_upper_neighbors(NodeId node, int level) {
         auto& nb = get_or_create_edge(level, node).neighbors;
         if (nb.size() <= M_UPPER) return;
@@ -444,15 +414,5 @@ private:
         return l2_distance_simd<D>(a, b);
     }
 };
-
-// 1-bit aliases
-using HNSWIndex128 = HNSWIndex<128, 32>;
-using HNSWIndex256 = HNSWIndex<256, 32>;
-using HNSWIndex512 = HNSWIndex<512, 32>;
-using HNSWIndex1024 = HNSWIndex<1024, 32>;
-
-// Multi-bit aliases
-using HNSWIndex128_2bit = HNSWIndex<128, 32, 2>;
-using HNSWIndex128_4bit = HNSWIndex<128, 32, 4>;
 
 }  // namespace cphnsw

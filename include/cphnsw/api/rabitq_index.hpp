@@ -3,6 +3,7 @@
 #include "../core/types.hpp"
 #include "../core/codes.hpp"
 #include "../core/memory.hpp"
+#include "../core/adaptive_defaults.hpp"
 #include "../encoder/rabitq_encoder.hpp"
 #include "../distance/fastscan_kernel.hpp"
 #include "../graph/rabitq_graph.hpp"
@@ -40,7 +41,7 @@ public:
     explicit RaBitQIndex(const IndexParams& params)
         : params_(params)
         , encoder_(params.dim, params.seed)
-        , graph_(params.dim, params.initial_capacity) {
+        , graph_(params.dim) {
         if (params.dim == 0) throw std::invalid_argument("dim must be > 0");
     }
 
@@ -81,13 +82,33 @@ public:
         }
     }
 
-    void finalize(size_t num_threads = 0, bool verbose = false) {
+    void finalize(const BuildParams& params) {
         if (needs_build_) {
-            if (verbose) printf("[RaBitQIndex] Running graph optimization...\n");
-            Refinement::optimize_graph(graph_, encoder_, params_.ef_construction, num_threads, verbose);
+            // Resolve adaptive defaults from sentinels
+            size_t ef_c = params.ef_construction > 0
+                ? params.ef_construction
+                : AdaptiveDefaults::ef_construction(graph_.size(), R);
+            float err_tol = params.error_tolerance >= 0.0f
+                ? params.error_tolerance
+                : AdaptiveDefaults::error_tolerance(D);
+            float err_eps = params.error_epsilon > 0.0f
+                ? params.error_epsilon
+                : AdaptiveDefaults::ERROR_EPSILON_BUILD;
+
+            if (params.verbose)
+                printf("[RaBitQIndex] Running graph optimization (ef_c=%zu, err_tol=%.4f, err_eps=%.3f)...\n",
+                       ef_c, err_tol, err_eps);
+
+            Refinement::optimize_graph_adaptive(graph_, encoder_,
+                ef_c, err_tol, err_eps, params.num_threads, params.verbose);
+
             needs_build_ = false;
         }
         finalized_ = true;
+    }
+
+    void finalize() {
+        finalize(BuildParams{});
     }
 
     std::vector<SearchResult> search(
@@ -96,12 +117,18 @@ public:
     {
         if (graph_.empty()) return {};
 
-        QueryType encoded = encoder_.encode_query(query);
-        encoded.error_epsilon = params.error_epsilon;
+        // Resolve adaptive defaults from sentinels
+        size_t ef = params.ef > 0
+            ? params.ef
+            : AdaptiveDefaults::ef_search(params.k, params.recall_target);
+        float eps = params.error_epsilon > 0.0f
+            ? params.error_epsilon
+            : AdaptiveDefaults::error_epsilon_search(params.recall_target);
 
-        return Engine::search(
-            encoded, query, graph_,
-            params.ef, params.k);
+        QueryType encoded = encoder_.encode_query(query);
+        encoded.error_epsilon = eps;
+
+        return Engine::search(encoded, query, graph_, ef, params.k);
     }
 
     std::vector<SearchResult> search(const float* query, size_t k) const {
@@ -139,23 +166,5 @@ private:
     bool finalized_ = false;
     bool needs_build_ = false;
 };
-
-// 1-bit aliases (backward compatible)
-using RaBitQIndex128 = RaBitQIndex<128, 32>;
-using RaBitQIndex256 = RaBitQIndex<256, 32>;
-using RaBitQIndex512 = RaBitQIndex<512, 32>;
-using RaBitQIndex1024 = RaBitQIndex<1024, 32>;
-
-// Dense (SOTA) variants
-using RaBitQIndexDense128 = RaBitQIndex<128, 32, 1, DenseRotation>;
-using RaBitQIndexDense256 = RaBitQIndex<256, 32, 1, DenseRotation>;
-using RaBitQIndexDense512 = RaBitQIndex<512, 32, 1, DenseRotation>;
-using RaBitQIndexDense1024 = RaBitQIndex<1024, 32, 1, DenseRotation>;
-
-// Multi-bit aliases (Extended RaBitQ)
-using RaBitQIndex128_2bit = RaBitQIndex<128, 32, 2>;
-using RaBitQIndex128_4bit = RaBitQIndex<128, 32, 4>;
-using RaBitQIndex256_2bit = RaBitQIndex<256, 32, 2>;
-using RaBitQIndex256_4bit = RaBitQIndex<256, 32, 4>;
 
 }  // namespace cphnsw

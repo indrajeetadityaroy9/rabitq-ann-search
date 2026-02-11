@@ -132,11 +132,11 @@ int main(int argc, char** argv) {
     std::string sift_dir = (argc > 1) ? argv[1] : "data/sift";
     Dataset sift = load_sift1m(sift_dir);
     
-    RaBitQIndex<PADDED_DIM, 32> index(IndexParams().set_dim(sift.dim).set_M(32).set_ef_construction(200));
+    RaBitQIndex<PADDED_DIM, 32> index(IndexParams().set_dim(sift.dim).set_ef_construction(200));
     Timer timer;
     timer.start();
     index.add_batch(sift.base_vectors.data(), sift.num_base);
-    index.finalize(true);
+    index.finalize(BuildParams().set_verbose(true));
     std::cout << "Build time: " << index.size() / timer.elapsed_s() << " vec/s\n";
 
     std::vector<size_t> ef_values = {10, 20, 40, 80, 100, 200, 400};

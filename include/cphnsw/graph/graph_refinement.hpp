@@ -2,6 +2,7 @@
 
 #include "../core/codes.hpp"
 #include "../core/memory.hpp"
+#include "../core/adaptive_defaults.hpp"
 #include "../distance/fastscan_layout.hpp"
 #include "../encoder/rabitq_encoder.hpp"
 #include "rabitq_graph.hpp"
@@ -31,19 +32,22 @@ public:
     template <typename EncType>
     static void prune_and_write(Graph& graph, const EncType& encoder,
                                 NodeId node, std::vector<NeighborCandidate>& candidates,
-                                float alpha, bool fill_slots) {
+                                float alpha, float error_tolerance = 0.0f) {
         auto dist_fn = [&](NodeId a, NodeId b) -> float {
             return l2_distance_simd<D>(graph.get_vector(a), graph.get_vector(b));
         };
-        auto error_fn = [](NodeId) -> float { return 0.0f; };
+        auto error_fn = [&](NodeId nid) -> float {
+            if (error_tolerance <= 0.0f) return 0.0f;
+            const auto& code = graph.get_code(nid);
+            float ip_qo = code.ip_quantized_original;
+            if (ip_qo < 1e-10f) return 0.0f;
+            float ip_qo_sq = ip_qo * ip_qo;
+            float variance = (1.0f - ip_qo_sq) / (ip_qo_sq * static_cast<float>(D));
+            return error_tolerance * std::sqrt(variance) * code.dist_to_centroid;
+        };
 
         auto selected = select_neighbors_robust_prune(
             std::move(candidates), GraphR, dist_fn, error_fn, alpha);
-
-        // Fill remaining slots if requested
-        if (fill_slots && selected.size() < GraphR) {
-            // Already handled by robust_prune's fill phase
-        }
 
         write_neighbors(graph, encoder, node, selected);
     }
@@ -70,36 +74,28 @@ public:
         }
     }
 
-    // ── Phase 1: Sequential incremental insertion ──
+    // ── Phase 1: Sequential incremental insertion (always quantized) ──
 
     template <typename EncType>
     static void run_insertion_pass(Graph& graph, const EncType& encoder,
-                                   const BuildParams& params,
+                                   size_t ef_construction, float alpha,
+                                   float error_tolerance, float error_epsilon,
+                                   bool verbose,
                                    const std::vector<NodeId>& order,
                                    NodeId entry_point) {
         size_t n = order.size();
-        size_t search_ef = std::max<size_t>(GraphR, params.ef_construction);
-        VisitationTable visited(n + 1024);
+        size_t search_ef = std::max<size_t>(GraphR, ef_construction);
 
-        for (size_t idx = 0; idx < n; ++idx) {
-            NodeId u = order[idx];
-
-            if (idx == 0) continue;  // First node: no neighbors
-
-            const float* vec_u = graph.get_vector(u);
-            auto results = ExactL2SearchEngine<D, R, BitWidth>::search(
-                vec_u, graph, search_ef, search_ef, visited, entry_point);
-
+        auto insert_node = [&](NodeId u, const float* vec_u,
+                               std::vector<SearchResult> results) {
             std::vector<NeighborCandidate> candidates;
             candidates.reserve(results.size());
             for (const auto& r : results) {
                 if (r.id != u) candidates.push_back({r.id, r.distance});
             }
 
-            // Set u's forward edges
-            prune_and_write(graph, encoder, u, candidates, params.alpha, params.fill_slots);
+            prune_and_write(graph, encoder, u, candidates, alpha, error_tolerance);
 
-            // Add reverse edges
             auto& nb_u = graph.get_neighbors(u);
             for (size_t j = 0; j < nb_u.count; ++j) {
                 NodeId v = nb_u.neighbor_ids[j];
@@ -109,8 +105,8 @@ public:
                 std::vector<NeighborCandidate> v_cands;
                 v_cands.reserve(nb_v.count + 1);
                 const float* vec_v = graph.get_vector(v);
-                for (size_t k = 0; k < nb_v.count; ++k) {
-                    NodeId w = nb_v.neighbor_ids[k];
+                for (size_t ki = 0; ki < nb_v.count; ++ki) {
+                    NodeId w = nb_v.neighbor_ids[ki];
                     if (w == INVALID_NODE) continue;
                     float d = l2_distance_simd<D>(vec_v, graph.get_vector(w));
                     v_cands.push_back({w, d});
@@ -121,17 +117,27 @@ public:
                 if (v_cands.size() <= GraphR) {
                     write_neighbors(graph, encoder, v, v_cands);
                 } else {
-                    prune_and_write(graph, encoder, v, v_cands, params.alpha, params.fill_slots);
+                    prune_and_write(graph, encoder, v, v_cands, alpha, error_tolerance);
                 }
             }
+        };
 
-            if (params.verbose && n >= 10 && (idx + 1) % (n / 10) == 0) {
-                printf("[Build]   %zu/%zu (%.0f%%)\n", idx + 1, n, 100.0 * (idx + 1) / n);
+        TwoLevelVisitationTable visited(n + 1024);
+        for (size_t idx = 1; idx < n; ++idx) {
+            NodeId u = order[idx];
+            const float* vec_u = graph.get_vector(u);
+            auto results = QuantizedBuildSearchEngine<D, R, BitWidth>::search(
+                vec_u, graph, encoder, search_ef, search_ef, visited,
+                error_epsilon, entry_point);
+            insert_node(u, vec_u, std::move(results));
+
+            if (verbose && n >= 10 && idx % (n / 10) == 0) {
+                printf("[Build]   %zu/%zu (%.0f%%)\n", idx, n, 100.0 * idx / n);
             }
         }
     }
 
-    // ── Phase 2: Parallel refinement pass ──
+    // ── Phase 2: Parallel refinement pass (always quantized) ──
 
     struct Spinlock {
         std::atomic_flag flag = ATOMIC_FLAG_INIT;
@@ -141,25 +147,23 @@ public:
 
     template <typename EncType>
     static void run_refinement_pass(Graph& graph, const EncType& encoder,
-                                     const BuildParams& params,
+                                     size_t ef_construction, float alpha,
+                                     float error_tolerance, float error_epsilon,
                                      size_t actual_threads) {
         size_t n = graph.size();
-        size_t search_ef = std::max<size_t>(GraphR, params.ef_construction);
-        float alpha = params.enable_pass2 ? params.alpha_pass2 : params.alpha;
+        size_t search_ef = std::max<size_t>(GraphR, ef_construction);
 
         std::vector<Spinlock> node_locks(n);
 
         #pragma omp parallel num_threads(actual_threads)
         {
-            VisitationTable local_visited(n + 1024);
-
             #pragma omp for schedule(dynamic, 256)
             for (size_t i = 0; i < n; ++i) {
                 NodeId u = static_cast<NodeId>(i);
                 const float* vec_u = graph.get_vector(u);
 
-                auto results = ExactL2SearchEngine<D, R, BitWidth>::search(
-                    vec_u, graph, search_ef, search_ef, local_visited);
+                auto results = QuantizedBuildSearchEngine<D, R, BitWidth>::search(
+                    vec_u, graph, encoder, search_ef, search_ef, error_epsilon);
 
                 std::vector<NeighborCandidate> candidates;
                 candidates.reserve(results.size() + GraphR);
@@ -167,7 +171,6 @@ public:
                     if (r.id != u) candidates.push_back({r.id, r.distance});
                 }
 
-                // Keep existing neighbors as candidates
                 const auto& nb = graph.get_neighbors(u);
                 for (size_t j = 0; j < nb.count; ++j) {
                     NodeId v = nb.neighbor_ids[j];
@@ -177,7 +180,7 @@ public:
                 }
 
                 node_locks[u].lock();
-                prune_and_write(graph, encoder, u, candidates, alpha, params.fill_slots);
+                prune_and_write(graph, encoder, u, candidates, alpha, error_tolerance);
                 node_locks[u].unlock();
             }
         }
@@ -187,7 +190,7 @@ public:
 
     template <typename EncType>
     static void run_reverse_edge_pass(Graph& graph, const EncType& encoder,
-                                       const BuildParams& params,
+                                       float alpha, float error_tolerance,
                                        size_t actual_threads) {
         size_t n = graph.size();
 
@@ -225,39 +228,21 @@ public:
                 all.push_back(cand);
             }
 
-            prune_and_write(graph, encoder, v, all, params.alpha, params.fill_slots);
+            prune_and_write(graph, encoder, v, all, alpha, error_tolerance);
         }
     }
 
-    // ── Analytically optimal degree R* ──
-
-    static uint16_t calibrate_active_degree(const Graph& graph) {
-        size_t n = graph.size();
-        if (n < 100) return static_cast<uint16_t>(GraphR);
-
-        // Ma et al. (arXiv 2509.15531v2) SNG degree bound: O(n^{2/3+ε})
-        // Practical formula: R* = clamp(C * log(n) / alpha², R/2, R)
-        // where C is calibrated from a small sample
-        float log_n = std::log(static_cast<float>(n));
-        float raw_degree = 4.0f * log_n;  // C=4 empirically good
-        float lo = static_cast<float>(GraphR) / 2.0f;
-        float hi = static_cast<float>(GraphR);
-        uint16_t r_star = static_cast<uint16_t>(
-            raw_degree < lo ? lo : (raw_degree > hi ? hi : raw_degree));
-        // Round up to multiple of 4 for SIMD alignment
-        r_star = ((r_star + 3) / 4) * 4;
-        return std::min(r_star, static_cast<uint16_t>(GraphR));
-    }
-
-    // ── Adaptive Bit-Width Construction Pipeline (QRG) ──
+    // ── Main entry point: adaptive two-pass construction pipeline ──
 
     template <typename EncType>
     static void optimize_graph_adaptive(Graph& graph, const EncType& encoder,
-                                        const BuildParams& params) {
+                                        size_t ef_construction, float error_tolerance,
+                                        float error_epsilon, size_t num_threads,
+                                        bool verbose) {
         size_t n = graph.size();
         if (n == 0) return;
 
-        size_t actual_threads = params.num_threads ? params.num_threads : omp_get_max_threads();
+        size_t actual_threads = num_threads ? num_threads : omp_get_max_threads();
 
         // Find medoid for entry point
         NodeId entry_point = graph.find_medoid();
@@ -275,112 +260,38 @@ public:
             }
         }
 
-        // Phase 1: Sequential incremental insertion
-        if (params.verbose) printf("[QRG] Phase 1: Insertion pass (alpha=%.2f, n=%zu, R=%zu)\n",
-                                   params.alpha, n, static_cast<size_t>(GraphR));
-        run_insertion_pass(graph, encoder, params, order, entry_point);
+        // Phase 1: Sequential incremental insertion (alpha=1.0)
+        if (verbose) printf("[QRG] Phase 1: Insertion pass (alpha=%.2f, n=%zu, R=%zu, ef=%zu)\n",
+                           AdaptiveDefaults::ALPHA, n, static_cast<size_t>(GraphR), ef_construction);
+        run_insertion_pass(graph, encoder, ef_construction, AdaptiveDefaults::ALPHA,
+                          error_tolerance, error_epsilon, verbose, order, entry_point);
 
         // Phase 1b: Re-insertion with different seed and alpha_pass2 (Vamana two-pass)
-        if (params.enable_pass2) {
-            if (params.verbose) printf("[QRG] Phase 1b: Re-insertion pass (alpha=%.2f)\n",
-                                       params.alpha_pass2);
-
-            // Shuffle with a different seed for phase 1b
-            std::mt19937 rng2(137);
-            std::shuffle(order.begin(), order.end(), rng2);
-            for (size_t i = 0; i < n; ++i) {
-                if (order[i] == entry_point) {
-                    std::swap(order[0], order[i]);
-                    break;
-                }
-            }
-
-            // Create modified params with alpha_pass2
-            BuildParams pass2_params = params;
-            pass2_params.alpha = params.alpha_pass2;
-
-            run_insertion_pass(graph, encoder, pass2_params, order, entry_point);
-        }
-
-        // Phase 2: Parallel refinement (exact L2, quality safety net)
-        if (params.verbose) printf("[QRG] Phase 2: Refinement pass...\n");
-        run_refinement_pass(graph, encoder, params, actual_threads);
-
-        // Phase 3: Reverse edges
-        if (params.verbose) printf("[QRG] Phase 3: Reverse edge pass...\n");
-        run_reverse_edge_pass(graph, encoder, params, actual_threads);
-
-        if (params.verbose) printf("[QRG] Done.\n");
-    }
-
-    // ── Main entry point ──
-
-    template <typename EncType>
-    static void optimize_graph(Graph& graph, const EncType& encoder,
-                             const BuildParams& params) {
-        size_t n = graph.size();
-        if (n == 0) return;
-
-        size_t actual_threads = params.num_threads ? params.num_threads : omp_get_max_threads();
-
-        // Auto-degree calibration
-        if (params.auto_degree) {
-            uint16_t r_star = calibrate_active_degree(graph);
-            if (params.verbose) printf("[Build] Auto-degree: R*=%u (max R=%zu)\n",
-                                       r_star, static_cast<size_t>(GraphR));
-            for (size_t i = 0; i < n; ++i) {
-                auto& nb = graph.get_neighbors(static_cast<NodeId>(i));
-                nb.active_degree = r_star;
-            }
-        }
-
-        // Find medoid for entry point
-        NodeId entry_point = graph.find_medoid();
-        graph.set_entry_point(entry_point);
-
-        // Random insertion order with medoid first
-        std::mt19937 rng(42);
-        std::vector<NodeId> order(n);
-        std::iota(order.begin(), order.end(), 0);
-        std::shuffle(order.begin(), order.end(), rng);
+        if (verbose) printf("[QRG] Phase 1b: Re-insertion pass (alpha=%.2f)\n",
+                           AdaptiveDefaults::ALPHA_PASS2);
+        std::mt19937 rng2(137);
+        std::shuffle(order.begin(), order.end(), rng2);
         for (size_t i = 0; i < n; ++i) {
             if (order[i] == entry_point) {
                 std::swap(order[0], order[i]);
                 break;
             }
         }
-
-        if (params.verbose) printf("[Build] Incremental insertion (n=%zu, R=%zu, ef=%zu)\n",
-                                   n, static_cast<size_t>(GraphR), params.ef_construction);
-
-        // Phase 1: Sequential incremental insertion
-        run_insertion_pass(graph, encoder, params, order, entry_point);
+        run_insertion_pass(graph, encoder, ef_construction, AdaptiveDefaults::ALPHA_PASS2,
+                          error_tolerance, error_epsilon, verbose, order, entry_point);
 
         // Phase 2: Parallel refinement
-        if (params.verbose) printf("[Build] Refinement pass...\n");
-        run_refinement_pass(graph, encoder, params, actual_threads);
+        if (verbose) printf("[QRG] Phase 2: Refinement pass...\n");
+        run_refinement_pass(graph, encoder, ef_construction, AdaptiveDefaults::ALPHA_PASS2,
+                           error_tolerance, error_epsilon, actual_threads);
 
         // Phase 3: Reverse edges
-        if (params.verbose) printf("[Build] Adding reverse edges...\n");
-        run_reverse_edge_pass(graph, encoder, params, actual_threads);
+        if (verbose) printf("[QRG] Phase 3: Reverse edge pass...\n");
+        run_reverse_edge_pass(graph, encoder, AdaptiveDefaults::ALPHA, error_tolerance,
+                             actual_threads);
 
-        if (params.verbose) printf("[Build] Done.\n");
-    }
-
-    // Legacy overload for backward compatibility
-    template <typename EncType>
-    static void optimize_graph(Graph& graph, const EncType& encoder,
-                             size_t ef_construction, size_t num_threads = 0, bool verbose = false) {
-        BuildParams params;
-        params.ef_construction = ef_construction;
-        params.num_threads = num_threads;
-        params.verbose = verbose;
-        optimize_graph(graph, encoder, params);
+        if (verbose) printf("[QRG] Done.\n");
     }
 };
-
-using GraphRefinement128 = GraphRefinement<128, 32>;
-using GraphRefinement256 = GraphRefinement<256, 32>;
-using GraphRefinement1024 = GraphRefinement<1024, 32>;
 
 }  // namespace cphnsw

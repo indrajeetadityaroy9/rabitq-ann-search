@@ -352,9 +352,4 @@ struct RaBitQMetricPolicy {
 
 };
 
-using RaBitQPolicy128 = RaBitQMetricPolicy<128>;
-using RaBitQPolicy256 = RaBitQMetricPolicy<256>;
-using RaBitQPolicy512 = RaBitQMetricPolicy<512>;
-using RaBitQPolicy1024 = RaBitQMetricPolicy<1024>;
-
 }  // namespace cphnsw

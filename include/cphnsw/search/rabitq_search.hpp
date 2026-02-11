@@ -204,7 +204,7 @@ public:
                 graph.prefetch_vertex(neighbor_id);
             }
 
-            if (beam.size() > ef * 3) {
+            if (beam.size() > ef * 2) {
                 std::priority_queue<BeamEntry, std::vector<BeamEntry>,
                                    std::greater<BeamEntry>> new_beam;
                 size_t kept = 0;
@@ -252,22 +252,8 @@ public:
     }
 };
 
-using RaBitQSearch128 = RaBitQSearchEngine<128, 32>;
-using RaBitQSearch256 = RaBitQSearchEngine<256, 32>;
-using RaBitQSearch1024 = RaBitQSearchEngine<1024, 32>;
-
 // Distance policy for exact L2 computation during graph construction
 struct ExactL2Policy {
-    template <size_t D>
-    static float compute(const float* a, const float* b) {
-        return l2_distance_simd<D>(a, b);
-    }
-};
-
-// Distance policy for quantized computation (used in Phase 3 QRG construction)
-struct QuantizedPolicy {
-    // Placeholder: will use RaBitQ codes for approximate distance
-    // Falls back to exact L2 for now
     template <size_t D>
     static float compute(const float* a, const float* b) {
         return l2_distance_simd<D>(a, b);
@@ -345,7 +331,7 @@ public:
                 beam.push({dist, neighbor_id});
             }
 
-            if (beam.size() > ef * 3) {
+            if (beam.size() > ef * 2) {
                 std::priority_queue<BeamEntry, std::vector<BeamEntry>,
                                    std::greater<BeamEntry>> new_beam;
                 size_t kept = 0;
@@ -365,5 +351,50 @@ public:
 // Backward-compatible alias: ExactL2SearchEngine is GraphSearchEngine with ExactL2Policy
 template <size_t D, size_t R = 32, size_t BitWidth = 1>
 using ExactL2SearchEngine = GraphSearchEngine<D, R, BitWidth, ExactL2Policy>;
+
+// Quantized construction search engine.
+// Wraps RaBitQSearchEngine to provide FastScan-guided beam search for graph
+// construction. Each inserted vector is encoded as a query, then the existing
+// SIMD FastScan + lower-bound machinery guides candidate exploration.
+// Results always contain exact L2 distances (computed per beam expansion).
+template <size_t D, size_t R = 32, size_t BitWidth = 1>
+class QuantizedBuildSearchEngine {
+public:
+    using Graph = RaBitQGraph<D, R, BitWidth>;
+
+    // Core overload: explicit visitation table and entry point (for insertion pass)
+    template <typename EncoderType>
+    static std::vector<SearchResult> search(
+        const float* raw_query,
+        const Graph& graph,
+        const EncoderType& encoder,
+        size_t ef, size_t k,
+        TwoLevelVisitationTable& visited,
+        float error_epsilon,
+        NodeId entry = INVALID_NODE)
+    {
+        if (graph.empty()) return {};
+        auto query = encoder.encode_query(raw_query);
+        query.error_epsilon = error_epsilon;
+        return RaBitQSearchEngine<D, R, BitWidth>::search(
+            query, raw_query, graph, ef, k, visited, entry);
+    }
+
+    // Convenience overload: thread-local visitation (for refinement pass)
+    template <typename EncoderType>
+    static std::vector<SearchResult> search(
+        const float* raw_query,
+        const Graph& graph,
+        const EncoderType& encoder,
+        size_t ef, size_t k,
+        float error_epsilon)
+    {
+        if (graph.empty()) return {};
+        auto query = encoder.encode_query(raw_query);
+        query.error_epsilon = error_epsilon;
+        return RaBitQSearchEngine<D, R, BitWidth>::search(
+            query, raw_query, graph, ef, k);
+    }
+};
 
 }  // namespace cphnsw

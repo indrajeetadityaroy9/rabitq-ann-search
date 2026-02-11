@@ -73,9 +73,9 @@ int main() {
 
     // Build index with ITQ rotation
     RaBitQIndex<128, 32, 1, DenseRotation> index(
-        IndexParams().set_dim(DIM).set_M(32).set_ef_construction(100));
+        IndexParams().set_dim(DIM).set_ef_construction(100));
     index.add_batch(data.data(), N_TOTAL);
-    index.finalize(0, false);
+    index.finalize();
 
     auto stats = index.get_stats();
     std::cout << "Nodes: " << stats.num_nodes

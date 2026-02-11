@@ -9,10 +9,12 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Compiler flags - SOTA Hardware assumed
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     add_compile_options(-Wall -Wextra -O3)
-    add_compile_options(-mavx512f -mavx512bw -mavx512vl -mavx2)
-    
-    if(NOT APPLE)
-        add_compile_options(-march=native)
+
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+        add_compile_options(-mavx512f -mavx512bw -mavx512vl -mavx2)
+        if(NOT APPLE)
+            add_compile_options(-march=native)
+        endif()
     endif()
 
 elseif(MSVC)
@@ -93,6 +95,10 @@ add_test(NAME NeighborSelection COMMAND test_neighbor_selection)
 add_executable(test_graph_construction tests/test_graph_construction.cpp)
 target_link_libraries(test_graph_construction PRIVATE cphnsw GTest::gtest_main)
 add_test(NAME GraphConstruction COMMAND test_graph_construction)
+
+add_executable(test_quantized_construction tests/test_quantized_construction.cpp)
+target_link_libraries(test_quantized_construction PRIVATE cphnsw GTest::gtest_main)
+add_test(NAME QuantizedConstruction COMMAND test_quantized_construction)
 
 add_executable(test_serialization tests/test_serialization.cpp)
 target_link_libraries(test_serialization PRIVATE cphnsw GTest::gtest_main)

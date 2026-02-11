@@ -30,11 +30,11 @@ int main() {
     std::cout << "=== HNSW Index Test (N=" << N << ", D=" << DIM << ") ===" << std::endl;
 
     HNSWIndex<128, 32, 1> index(
-        IndexParams().set_dim(DIM).set_M(32).set_ef_construction(100));
+        IndexParams().set_dim(DIM).set_ef_construction(100));
 
     auto t0 = std::chrono::high_resolution_clock::now();
     index.add_batch(data.data(), N);
-    index.finalize(0, true);
+    index.finalize(BuildParams().set_verbose(true));
     auto t1 = std::chrono::high_resolution_clock::now();
     double build_time = std::chrono::duration<double>(t1 - t0).count();
 
@@ -69,11 +69,11 @@ int main() {
     std::cout << "\n=== RaBitQIndex (flat) Comparison ===" << std::endl;
 
     RaBitQIndex<128, 32, 1> flat_index(
-        IndexParams().set_dim(DIM).set_M(32).set_ef_construction(100));
+        IndexParams().set_dim(DIM).set_ef_construction(100));
 
     auto t4 = std::chrono::high_resolution_clock::now();
     flat_index.add_batch(data.data(), N);
-    flat_index.finalize(0, false);
+    flat_index.finalize();
     auto t5 = std::chrono::high_resolution_clock::now();
     double flat_build_time = std::chrono::duration<double>(t5 - t4).count();
 

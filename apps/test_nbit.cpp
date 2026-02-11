@@ -13,7 +13,7 @@ void test_nbit_index(size_t actual_dim, size_t num_vecs) {
               << " n=" << num_vecs << "..." << std::flush;
 
     RaBitQIndex<D, 32, BitWidth> index(
-        IndexParams().set_dim(actual_dim).set_M(32).set_ef_construction(100));
+        IndexParams().set_dim(actual_dim).set_ef_construction(100));
 
     std::mt19937 rng(42);
     std::normal_distribution<float> dist(0.0f, 1.0f);
@@ -31,7 +31,7 @@ void test_nbit_index(size_t actual_dim, size_t num_vecs) {
     }
 
     index.add_batch(vecs.data(), num_vecs);
-    index.finalize(0, false);
+    index.finalize();
 
     auto stats = index.get_stats();
     std::cout << " nodes=" << stats.num_nodes

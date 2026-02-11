@@ -341,17 +341,6 @@ public:
     }
 };
 
-using RaBitQEncoder128 = RaBitQEncoder<128>;
-using RaBitQEncoder256 = RaBitQEncoder<256>;
-using RaBitQEncoder512 = RaBitQEncoder<512>;
-using RaBitQEncoder1024 = RaBitQEncoder<1024>;
-
-// Dense Rotation Variants (SOTA Quality)
-using RaBitQEncoderDense128 = RaBitQEncoder<128, DenseRotation>;
-using RaBitQEncoderDense256 = RaBitQEncoder<256, DenseRotation>;
-using RaBitQEncoderDense512 = RaBitQEncoder<512, DenseRotation>;
-using RaBitQEncoderDense1024 = RaBitQEncoder<1024, DenseRotation>;
-
 // === Extended RaBitQ: Multi-bit Encoder (SIGMOD'25) ===
 
 template <size_t D, size_t BitWidth, typename RotationPolicy = RandomHadamardRotation>

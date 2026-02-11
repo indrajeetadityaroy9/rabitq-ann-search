@@ -86,7 +86,6 @@ struct FastScanNeighborBlock {
     alignas(64) float cached_distances[R];
 
     uint32_t count;
-    uint16_t active_degree = R;  // effective degree (≤ R), set by R* calibration
 
     FastScanNeighborBlock() : count(0) {
         std::memset(neighbor_ids, 0xFF, sizeof(neighbor_ids));
@@ -159,7 +158,6 @@ struct NbitFastScanNeighborBlock {
     alignas(64) uint32_t neighbor_ids[R];
     alignas(64) float cached_distances[R];
     uint32_t count;
-    uint16_t active_degree = R;  // effective degree (≤ R), set by R* calibration
 
     NbitFastScanNeighborBlock() : count(0) {
         std::memset(neighbor_ids, 0xFF, sizeof(neighbor_ids));

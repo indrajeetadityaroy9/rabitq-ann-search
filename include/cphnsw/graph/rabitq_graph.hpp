@@ -188,10 +188,6 @@ private:
     mutable std::mutex graph_mutex_;
 };
 
-using RaBitQGraph128 = RaBitQGraph<128, 32>;
-using RaBitQGraph256 = RaBitQGraph<256, 32>;
-using RaBitQGraph1024 = RaBitQGraph<1024, 32>;
-
 // Multi-bit graph aliases
 template <size_t D, size_t R = 32, size_t BitWidth = 2>
 using NbitRaBitQGraph = RaBitQGraph<D, R, BitWidth>;

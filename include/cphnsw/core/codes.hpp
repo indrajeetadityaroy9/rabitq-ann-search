@@ -92,16 +92,6 @@ struct RaBitQQuery {
     float inv_sqrt_d;
 };
 
-using RaBitQCode128 = RaBitQCode<128>;
-using RaBitQCode256 = RaBitQCode<256>;
-using RaBitQCode512 = RaBitQCode<512>;
-using RaBitQCode1024 = RaBitQCode<1024>;
-
-using RaBitQQuery128 = RaBitQQuery<128>;
-using RaBitQQuery256 = RaBitQQuery<256>;
-using RaBitQQuery512 = RaBitQQuery<512>;
-using RaBitQQuery1024 = RaBitQQuery<1024>;
-
 // === Extended RaBitQ: Multi-bit Code Storage (SIGMOD'25) ===
 // Bit-plane layout enables reuse of 1-bit FastScan kernel per plane.
 

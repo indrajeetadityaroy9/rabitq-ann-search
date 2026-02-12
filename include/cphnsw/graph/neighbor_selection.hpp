@@ -54,8 +54,9 @@ std::vector<NeighborCandidate> select_neighbors_heuristic(
 // Preserves O(n^{2/3+ε}) degree bounds under quantized distances.
 //
 // Phase 1: Diversity pruning with alpha scaling and error margins.
-//   Prunes candidate if: dist(candidate, existing) < alpha * dist(candidate, query) + margin
+//   Prunes candidate if: alpha * dist(candidate, existing) < dist(candidate, query) + margin
 //   where margin = error_fn(candidate) + error_fn(existing) is the worst-case error on both sides.
+//   With alpha > 1, the pruning condition is harder to satisfy, keeping more long-range edges (Vamana §3.4).
 // Phase 2: Fill remaining slots with closest unused candidates.
 //
 // When error_fn returns 0 for all nodes (exact distances), this reduces to standard Vamana RobustPrune.
@@ -96,7 +97,7 @@ std::vector<NeighborCandidate> select_neighbors_robust_prune(
             float err_existing = error_fn(existing.id);
             float margin = err_candidate + err_existing;
 
-            if (dist_to_existing < alpha * candidates[i].distance + margin) {
+            if (alpha * dist_to_existing < candidates[i].distance + margin) {
                 should_add = false;
                 break;
             }

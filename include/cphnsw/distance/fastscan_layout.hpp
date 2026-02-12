@@ -83,20 +83,17 @@ struct FastScanNeighborBlock {
     alignas(64) VertexAuxData aux[R];
     alignas(64) uint16_t popcounts[R];
     alignas(64) uint32_t neighbor_ids[R];
-    alignas(64) float cached_distances[R];
 
     uint32_t count;
 
     FastScanNeighborBlock() : count(0) {
         std::memset(neighbor_ids, 0xFF, sizeof(neighbor_ids));
         std::memset(popcounts, 0, sizeof(popcounts));
-        std::fill(cached_distances, cached_distances + R, FLT_MAX);
     }
 
     void set_neighbor(size_t slot, uint32_t id,
                       const BinaryCodeStorage<D>& code,
-                      const VertexAuxData& aux_data,
-                      float distance = std::numeric_limits<float>::max()) {
+                      const VertexAuxData& aux_data) {
         size_t batch = slot / BatchSize;
         size_t idx_in_batch = slot % BatchSize;
 
@@ -104,7 +101,6 @@ struct FastScanNeighborBlock {
         code_blocks[batch].store(idx_in_batch, code);
         aux[slot] = aux_data;
         popcounts[slot] = static_cast<uint16_t>(code.popcount());
-        cached_distances[slot] = distance;
 
         if (slot >= count) count = static_cast<uint32_t>(slot + 1);
     }
@@ -156,20 +152,17 @@ struct NbitFastScanNeighborBlock {
     alignas(64) uint16_t popcounts[R];
     alignas(64) uint16_t weighted_popcounts[R];
     alignas(64) uint32_t neighbor_ids[R];
-    alignas(64) float cached_distances[R];
     uint32_t count;
 
     NbitFastScanNeighborBlock() : count(0) {
         std::memset(neighbor_ids, 0xFF, sizeof(neighbor_ids));
         std::memset(popcounts, 0, sizeof(popcounts));
         std::memset(weighted_popcounts, 0, sizeof(weighted_popcounts));
-        std::fill(cached_distances, cached_distances + R, FLT_MAX);
     }
 
     void set_neighbor(size_t slot, uint32_t id,
                       const NbitCodeStorage<D, BitWidth>& code,
-                      const VertexAuxData& aux_data,
-                      float distance = std::numeric_limits<float>::max()) {
+                      const VertexAuxData& aux_data) {
         size_t batch = slot / BatchSize;
         size_t idx_in_batch = slot % BatchSize;
         neighbor_ids[slot] = id;
@@ -177,7 +170,6 @@ struct NbitFastScanNeighborBlock {
         aux[slot] = aux_data;
         popcounts[slot] = static_cast<uint16_t>(code.msb_popcount());
         weighted_popcounts[slot] = static_cast<uint16_t>(code.weighted_popcount());
-        cached_distances[slot] = distance;
         if (slot >= count) count = static_cast<uint32_t>(slot + 1);
     }
 

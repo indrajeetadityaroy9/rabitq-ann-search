@@ -211,13 +211,82 @@ public:
         return query;
     }
 
+    // Compute per-edge auxiliary data for FastScan distance estimation.
+    //
+    // SymphonyQG (SIGMOD 2025): When out_code is non-null, computes parent-relative
+    // encoding for improved distance estimation during graph traversal.
+    //
+    // Standard RaBitQ estimates ||q-o||² using the global centroid c:
+    //   ||q-o||² = ||o-c||² + ||q-c||² - 2*||o-c||*||q-c||*cos(q-c, o-c)
+    // The estimation error is proportional to ||o-c||*||q-c||/sqrt(D).
+    //
+    // SymphonyQG decomposes via parent p (the node being expanded during search):
+    //   ||q-o||² = (||o-c||² - ||p-c||²) + ||q-p||² - 2*||q-c||*||o-p||*cos(q-c, o-p)
+    // Since ||o-p|| << ||o-c|| (neighbors are close to parent), the error is smaller.
+    // ||q-p||² is known exactly from the search expansion step.
+    //
+    // The parent-relative binary code sign(P*unit(o-p)) is stored per-edge in the
+    // FastScan block, replacing the global code. The LUT (built from unit(q-c))
+    // computes <unit(q-c), unit(o-p)> via the same SIMD pipeline.
     template <typename CodeType>
     VertexAuxData compute_neighbor_aux(
         const CodeType& neighbor_code,
-        const float* /*parent_vec*/,
-        const float* /*neighbor_vec*/) const
+        const float* parent_vec,
+        const float* neighbor_vec,
+        float parent_dist_centroid = 0.0f,
+        BinaryCodeStorage<D>* out_code = nullptr) const
     {
         VertexAuxData aux;
+
+        if (out_code) {
+            // SymphonyQG: parent-relative encoding
+            out_code->clear();
+
+            // Compute o - p
+            alignas(32) float diff_op[D];
+            float nop_sq = 0.0f;
+            for (size_t i = 0; i < dim_; ++i) {
+                diff_op[i] = neighbor_vec[i] - parent_vec[i];
+                nop_sq += diff_op[i] * diff_op[i];
+            }
+            for (size_t i = dim_; i < D; ++i) diff_op[i] = 0.0f;
+
+            float nop = std::sqrt(nop_sq);
+            aux.dist_to_centroid = nop;  // ||o - p||
+
+            if (nop < 1e-10f) {
+                aux.ip_quantized_original = 0.0f;
+                aux.ip_xbar_Pinv_c = 0.0f;
+                return aux;
+            }
+
+            // Normalize to unit(o - p)
+            float inv_nop = 1.0f / nop;
+            for (size_t i = 0; i < D; ++i) diff_op[i] *= inv_nop;
+
+            // Rotate and scale: P * unit(o-p) * norm_factor
+            alignas(32) float rotated[D];
+            rotation_.apply_copy(diff_op, rotated);
+            for (size_t i = 0; i < padded_dim_; ++i) rotated[i] *= norm_factor_;
+
+            // Binarize + compute L1 norm (same as standard RaBitQ encoding)
+            float l1_norm = 0.0f;
+            for (size_t i = 0; i < padded_dim_; ++i) {
+                out_code->set_bit(i, rotated[i] >= 0.0f);
+                l1_norm += std::abs(rotated[i]);
+            }
+
+            aux.ip_quantized_original = l1_norm * inv_sqrt_d_;  // ip_qo_p
+
+            // Correction term: no² - np²
+            float no = neighbor_code.dist_to_centroid;
+            float np = parent_dist_centroid;
+            aux.ip_xbar_Pinv_c = no * no - np * np;
+
+            return aux;
+        }
+
+        // Standard: copy global-centroid values (used for multi-bit paths)
         aux.dist_to_centroid = neighbor_code.dist_to_centroid;
         aux.ip_quantized_original = neighbor_code.ip_quantized_original;
         aux.ip_xbar_Pinv_c = 0.0f;
@@ -478,8 +547,9 @@ public:
                 }
             }
         } else {
-            // Grid search fallback for high bit widths
-            // Find max |x_bar[i]| to bound t range
+            // Grid search + golden-section refinement for high bit widths.
+            // Phase 1: 256-point coarse grid to find approximate optimum.
+            // Phase 2: Golden-section refinement for near-exact t*.
             float max_abs = 0.0f;
             for (size_t i = 0; i < pd; ++i) {
                 float a = std::abs(buf[i]);
@@ -487,11 +557,10 @@ public:
             }
 
             float t_max = (max_abs > 1e-12f) ? (K + 0.5f) / max_abs : 1.0f;
-            constexpr size_t NUM_GRID = 64;
+            constexpr size_t NUM_GRID = 256;
 
-            for (size_t g = 1; g <= NUM_GRID; ++g) {
-                float t = t_max * static_cast<float>(g) / static_cast<float>(NUM_GRID);
-                float dot = 0.0f;
+            auto evaluate_cosine_grid = [&](float t) -> float {
+                float dot_val = 0.0f;
                 float norm_c_sq = 0.0f;
                 for (size_t i = 0; i < pd; ++i) {
                     float val = t * buf[i] + midpoint;
@@ -499,15 +568,42 @@ public:
                     if (u < 0) u = 0;
                     if (u > K_INT) u = K_INT;
                     float c = (2.0f * u - K) / K;
-                    dot += c * buf[i];
+                    dot_val += c * buf[i];
                     norm_c_sq += c * c;
                 }
-                if (norm_c_sq < 1e-20f) continue;
-                float cosine = dot / std::sqrt(norm_c_sq);
+                if (norm_c_sq < 1e-20f) return -std::numeric_limits<float>::max();
+                return dot_val / std::sqrt(norm_c_sq);
+            };
+
+            // Phase 1: Coarse grid
+            for (size_t g = 1; g <= NUM_GRID; ++g) {
+                float t = t_max * static_cast<float>(g) / static_cast<float>(NUM_GRID);
+                float cosine = evaluate_cosine_grid(t);
                 if (cosine > best_cosine) {
                     best_cosine = cosine;
                     best_t = t;
                 }
+            }
+
+            // Phase 2: Golden-section refinement around best grid point
+            float step = t_max / static_cast<float>(NUM_GRID);
+            float lo = std::max(1e-8f, best_t - step);
+            float hi = std::min(t_max, best_t + step);
+            constexpr float phi = 0.6180339887f;
+
+            for (int iter = 0; iter < 20; ++iter) {
+                float m1 = hi - phi * (hi - lo);
+                float m2 = lo + phi * (hi - lo);
+                if (evaluate_cosine_grid(m1) < evaluate_cosine_grid(m2))
+                    lo = m1;
+                else
+                    hi = m2;
+            }
+            float refined_t = (lo + hi) * 0.5f;
+            float refined_cosine = evaluate_cosine_grid(refined_t);
+            if (refined_cosine > best_cosine) {
+                best_cosine = refined_cosine;
+                best_t = refined_t;
             }
         }
 

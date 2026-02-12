@@ -14,7 +14,7 @@ struct AdaptiveDefaults {
 
     static size_t ef_construction(size_t N, size_t R) {
         size_t ef = static_cast<size_t>(std::ceil(2.0 * std::sqrt(static_cast<double>(N))));
-        return std::clamp(ef, R, static_cast<size_t>(500));
+        return std::clamp(ef, R, static_cast<size_t>(200));
     }
 
     static float error_tolerance(size_t D) {
@@ -23,13 +23,15 @@ struct AdaptiveDefaults {
 
     // --- Search-time derivations ---
     static float error_epsilon_search(float recall_target) {
-        float p = std::clamp(0.6f * (1.0f - recall_target), 0.001f, 0.5f);
+        // Map recall target to failure probability, then to epsilon via Gaussian tail bound.
+        // Lower epsilon = tighter bounds = more candidates visited = better recall.
+        float p = std::clamp(0.5f * (1.0f - recall_target), 0.001f, 0.5f);
         return std::sqrt(-2.0f * std::log(p));
     }
 
     static size_t ef_search(size_t k, float recall_target) {
         float difficulty = -std::log(1.0f - std::clamp(recall_target, 0.5f, 0.9999f));
-        size_t ef = static_cast<size_t>(std::ceil(k * (difficulty + 2.0)));
+        size_t ef = static_cast<size_t>(std::ceil(k * (difficulty + 3.0)));
         return std::max(ef, k);
     }
 };

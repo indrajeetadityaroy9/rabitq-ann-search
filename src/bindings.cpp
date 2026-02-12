@@ -131,11 +131,12 @@ static std::unique_ptr<PyIndexBase> create_index_with_bits(
         case 256:  return std::make_unique<PyIndex<256, BitWidth>>(dim, ef_construction, seed);
         case 512:  return std::make_unique<PyIndex<512, BitWidth>>(dim, ef_construction, seed);
         case 1024: return std::make_unique<PyIndex<1024, BitWidth>>(dim, ef_construction, seed);
+        case 2048: return std::make_unique<PyIndex<2048, BitWidth>>(dim, ef_construction, seed);
         default:
             throw std::invalid_argument(
                 "Unsupported dimension " + std::to_string(dim) +
                 " (padded to " + std::to_string(pd) +
-                "). Supported padded dims: 128, 256, 512, 1024.");
+                "). Supported padded dims: 128, 256, 512, 1024, 2048.");
     }
 }
 
@@ -167,11 +168,12 @@ static std::unique_ptr<PyIndexBase> create_hnsw_with_bits(
         case 256:  return std::make_unique<PyHNSWIndex<256, BitWidth>>(dim, ef_construction, seed);
         case 512:  return std::make_unique<PyHNSWIndex<512, BitWidth>>(dim, ef_construction, seed);
         case 1024: return std::make_unique<PyHNSWIndex<1024, BitWidth>>(dim, ef_construction, seed);
+        case 2048: return std::make_unique<PyHNSWIndex<2048, BitWidth>>(dim, ef_construction, seed);
         default:
             throw std::invalid_argument(
                 "Unsupported dimension " + std::to_string(dim) +
                 " (padded to " + std::to_string(pd) +
-                "). Supported padded dims: 128, 256, 512, 1024.");
+                "). Supported padded dims: 128, 256, 512, 1024, 2048.");
     }
 }
 

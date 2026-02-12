@@ -204,7 +204,7 @@ public:
                 graph.prefetch_vertex(neighbor_id);
             }
 
-            if (beam.size() > ef * 2) {
+            if (beam.size() > ef * 4) {
                 std::priority_queue<BeamEntry, std::vector<BeamEntry>,
                                    std::greater<BeamEntry>> new_beam;
                 size_t kept = 0;
@@ -331,7 +331,7 @@ public:
                 beam.push({dist, neighbor_id});
             }
 
-            if (beam.size() > ef * 2) {
+            if (beam.size() > ef * 4) {
                 std::priority_queue<BeamEntry, std::vector<BeamEntry>,
                                    std::greater<BeamEntry>> new_beam;
                 size_t kept = 0;

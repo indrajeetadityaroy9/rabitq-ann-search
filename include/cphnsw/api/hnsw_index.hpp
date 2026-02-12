@@ -45,7 +45,7 @@ public:
         : params_(params)
         , encoder_(params.dim, params.seed)
         , graph_(params.dim)
-        , mL_(1.0 / std::log(static_cast<double>(R)))
+        , mL_(1.0 / std::log(static_cast<double>(M_UPPER)))
         , rng_(params.seed)
     {
         if (params.dim == 0) throw std::invalid_argument("dim must be > 0");

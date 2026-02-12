@@ -104,8 +104,7 @@ inline Dataset load_sift1m(const std::string& dir) {
     size_t k_gt, gt_count;
     ds.ground_truth = load_ivecs(dir + "/sift_groundtruth.ivecs", k_gt, gt_count);
     ds.k_gt = k_gt;
-    normalize_vectors(ds.base_vectors.data(), ds.num_base, ds.dim);
-    normalize_vectors(ds.query_vectors.data(), ds.num_queries, ds.dim);
+    // SIFT ground truth is computed under raw L2 — do NOT normalize
     return ds;
 }
 

@@ -57,42 +57,19 @@ TEST(NeighborSelection, RobustPruneStarGraph) {
     EXPECT_EQ(result[1].id, 2u);  // distance 2.0
 }
 
-// Isosceles triangle: alpha > 1 preserves a long edge that alpha=1 would prune.
-// Two candidates: A at distance 2 from query, B at distance 3 from query.
-// dist(A, B) = 2.5 (between them).
-// With alpha=1: dist(A,B)=2.5 < 1*3.0=3.0 → B pruned (only A selected).
-// With alpha=1.3: dist(A,B)=2.5 < 1.3*3.0=3.9 → B still pruned? No:
-//   Actually we need dist(A,B) >= alpha * dist(B, query) for B to survive.
-//   2.5 < 1.3*3.0=3.9 → B pruned. Let's pick values where alpha > 1 matters.
+// Alpha > 1 preserves long edges that alpha=1 would prune (Vamana §3.4).
+// Corrected formula: alpha * dist(candidate, existing) < dist(candidate, query) + margin
+// With alpha > 1, left side grows → harder to prune → more long-range edges.
 //
-// Better setup: A at dist 2, B at dist 3, dist(A,B) = 2.8.
-// alpha=1.0: 2.8 < 1.0*3.0=3.0 → B pruned.
-// alpha=0.9: 2.8 < 0.9*3.0=2.7 → 2.8 >= 2.7 → B survives!
+// Setup: A at dist 2, B at dist 3, dist(A,B) = 2.8.
+// alpha=1.0: 1.0*2.8=2.8 < 3.0 → B pruned.
+// alpha=1.1: 1.1*2.8=3.08 >= 3.0 → B survives!
 //
 // Use a custom distance fn that returns a fixed inter-neighbor distance.
 TEST(NeighborSelection, RobustPruneAlphaPreservesLongEdge) {
-    // Candidate A: id=10, dist to query = 2.0
-    // Candidate B: id=20, dist to query = 3.0
-    // dist(A, B) = 2.8 (controlled by custom distance fn)
-    std::vector<NeighborCandidate> candidates = {
-        {10, 2.0f}, {20, 3.0f}
-    };
-
-    // Custom distance: dist(10,20) = dist(20,10) = 2.8, everything else = |a-b|
-    auto custom_dist = [](NodeId a, NodeId b) -> float {
-        if ((a == 10 && b == 20) || (a == 20 && b == 10)) return 2.8f;
-        return std::abs(static_cast<float>(a) - static_cast<float>(b));
-    };
     auto zero_error = [](NodeId) -> float { return 0.0f; };
 
-    // alpha=1.0: dist(A,B)=2.8 < 1.0*3.0=3.0 → B pruned (only A survives)
-    auto result_alpha1 = select_neighbors_robust_prune(
-        candidates, 2, custom_dist, zero_error, 1.0f);
-    // Phase 1 selects A, prunes B. Phase 2 fills B back.
-    // But R=2 and we have 2 candidates, so all get returned.
-    // Use R=2 with 3 candidates to force actual pruning.
-
-    // Redo with 3 candidates so R < candidates.size() triggers real pruning:
+    // Use R=2 with 3 candidates so R < candidates.size() triggers real pruning:
     // C at dist 10 (far away, filler)
     std::vector<NeighborCandidate> candidates3 = {
         {10, 2.0f}, {20, 3.0f}, {30, 10.0f}
@@ -103,20 +80,17 @@ TEST(NeighborSelection, RobustPruneAlphaPreservesLongEdge) {
         return std::abs(static_cast<float>(a) - static_cast<float>(b));
     };
 
-    // alpha=1.0, R=2: A selected, B pruned (2.8 < 3.0), C pruned (farther).
-    // Phase 2 fills: B added. Result = {A, B}.
+    // alpha=1.0, R=2: A selected, B pruned by A (1.0*2.8=2.8 < 3.0).
+    // C survives diversity pruning (dist(C,A)=20 >= 10.0). Phase 1 fills R=2.
     auto r1 = select_neighbors_robust_prune(
         candidates3, 2, custom_dist3, zero_error, 1.0f);
     ASSERT_EQ(r1.size(), 2u);
-    EXPECT_EQ(r1[0].id, 10u);  // A always first (closest)
-    // Phase 1 only selects A; Phase 2 fills B (next closest unused)
-    EXPECT_EQ(r1[1].id, 20u);
+    EXPECT_EQ(r1[0].id, 10u);  // A first (closest)
+    EXPECT_EQ(r1[1].id, 30u);  // C kept by diversity (far from A)
 
-    // Now verify that Phase 1 with alpha=1.0 did NOT select B:
-    // B was pruned because dist(A,B)=2.8 < alpha*dist(B,query)=3.0.
-    // With alpha=0.9: check = 0.9*3.0 = 2.7. dist(A,B)=2.8 >= 2.7 → B survives Phase 1!
+    // With alpha=1.1: 1.1*2.8=3.08 >= 3.0 → B survives Phase 1 (alpha > 1 preserves long edges)
     auto r2 = select_neighbors_robust_prune(
-        candidates3, 2, custom_dist3, zero_error, 0.9f);
+        candidates3, 2, custom_dist3, zero_error, 1.1f);
     ASSERT_EQ(r2.size(), 2u);
     EXPECT_EQ(r2[0].id, 10u);  // A first
     EXPECT_EQ(r2[1].id, 20u);  // B selected in Phase 1 (not just filled)
@@ -144,22 +118,15 @@ TEST(NeighborSelection, RobustPruneDeduplicates) {
     EXPECT_EQ(count_5, 1u);
 }
 
-// Error tolerance: with error bounds, pruning becomes more conservative
+// Error tolerance: with error bounds, pruning becomes more aggressive.
+// Formula: alpha * dist(candidate, existing) < dist(candidate, query) + margin
+// Larger margin → right side grows → easier to prune → fewer Phase 1 selections.
+// This accounts for distance estimation uncertainty: when errors are high,
+// we prune more aggressively and rely on Phase 2 fill to recover neighbors.
 TEST(NeighborSelection, RobustPruneErrorTolerance) {
-    // A at dist 2.0, B at dist 3.0, dist(A,B) = 2.8
-    // Without error: 2.8 < 1.0*3.0 + 0 = 3.0 → B pruned in Phase 1
-    // With error_fn returning 0.2 for each: margin = 0.2 + 0.2 = 0.4
-    //   2.8 < 1.0*3.0 + 0.4 = 3.4 → B still pruned (margin makes it easier to prune)
-    // Wait — the margin ADDS to the threshold, making pruning MORE aggressive.
-    // Actually looking at the code: dist < alpha*dist_to_query + margin → prune.
-    // So larger margin = more likely to prune = more conservative (fewer neighbors).
-    //
-    // For error tolerance to HELP, we need it to prevent over-pruning.
-    // The error margin accounts for uncertainty: if the measured distance might be wrong,
-    // we should be more willing to keep a neighbor.
-    //
-    // Let's test that with error_fn > 0, a candidate that would barely survive
-    // without error gets pruned with error.
+    // A at dist 2.0, B at dist 3.0, dist(A,B) = 3.1
+    // Without error: 1.0*3.1=3.1 >= 3.0 → B survives Phase 1
+    // With error margin 0.3: 1.0*3.1=3.1 < 3.0+0.3=3.3 → B pruned in Phase 1
     std::vector<NeighborCandidate> candidates = {
         {10, 2.0f}, {20, 3.0f}, {30, 10.0f}
     };
@@ -172,21 +139,20 @@ TEST(NeighborSelection, RobustPruneErrorTolerance) {
     auto zero_error = [](NodeId) -> float { return 0.0f; };
     auto some_error = [](NodeId) -> float { return 0.15f; };
 
-    // Without error: dist(A,B)=3.1 < 1.0*3.0 + 0 = 3.0? No, 3.1 >= 3.0 → B survives Phase 1
+    // Without error: 1.0*3.1=3.1 >= 3.0+0=3.0 → B survives Phase 1
     auto r1 = select_neighbors_robust_prune(
         candidates, 2, custom_dist, zero_error, 1.0f);
     ASSERT_EQ(r1.size(), 2u);
     EXPECT_EQ(r1[0].id, 10u);
     EXPECT_EQ(r1[1].id, 20u);  // B survived Phase 1
 
-    // With error: dist(A,B)=3.1 < 1.0*3.0 + 0.3 = 3.3? Yes → B pruned in Phase 1
+    // With error: 1.0*3.1=3.1 < 3.0+0.3=3.3 → B pruned in Phase 1.
+    // C survives diversity (dist(C,A)=20 >= 10.0+0.3). Phase 1 fills R=2.
     auto r2 = select_neighbors_robust_prune(
         candidates, 2, custom_dist, some_error, 1.0f);
     ASSERT_EQ(r2.size(), 2u);
     EXPECT_EQ(r2[0].id, 10u);
-    // B was pruned in Phase 1, so Phase 2 fills it back — but the ORDER tells us
-    // Phase 1 only got A, Phase 2 filled B (next closest)
-    EXPECT_EQ(r2[1].id, 20u);  // filled from Phase 2
+    EXPECT_EQ(r2[1].id, 30u);  // C kept by diversity (B pruned by error margin)
 }
 
 // Edge case: fewer candidates than R returns all

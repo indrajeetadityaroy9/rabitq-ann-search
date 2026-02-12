@@ -16,6 +16,7 @@
 #include <cstring>
 #include <random>
 #include <atomic>
+#include <thread>
 
 #include "../core/omp_compat.hpp"
 
@@ -53,6 +54,8 @@ public:
     }
 
     // Write selected neighbors into a node's neighbor block, computing FastScan aux data.
+    // For BitWidth==1, uses SymphonyQG parent-relative encoding: the binary code stored
+    // in the FastScan block is sign(P*unit(o-p)), not sign(P*unit(o-c)).
     template <typename EncType>
     static void write_neighbors(Graph& graph, const EncType& encoder,
                                 NodeId node, const std::vector<NeighborCandidate>& selected) {
@@ -60,15 +63,24 @@ public:
         nb.count = 0;
         const float* vec_node = graph.get_vector(node);
 
-        for (size_t j = 0; j < selected.size(); ++j) {
-            NodeId v = selected[j].id;
-            const auto& code_v = graph.get_code(v);
-            const float* vec_v = graph.get_vector(v);
-            VertexAuxData aux = encoder.compute_neighbor_aux(code_v, vec_node, vec_v);
-
-            if constexpr (BitWidth == 1) {
-                nb.set_neighbor(j, v, code_v.signs, aux);
-            } else {
+        if constexpr (BitWidth == 1) {
+            float np = graph.get_code(node).dist_to_centroid;  // ||parent - centroid||
+            for (size_t j = 0; j < selected.size(); ++j) {
+                NodeId v = selected[j].id;
+                const auto& code_v = graph.get_code(v);
+                const float* vec_v = graph.get_vector(v);
+                BinaryCodeStorage<EncType::DIMS> pr_code;
+                VertexAuxData aux = encoder.compute_neighbor_aux(
+                    code_v, vec_node, vec_v, np, &pr_code);
+                nb.set_neighbor(j, v, pr_code, aux);
+            }
+        } else {
+            for (size_t j = 0; j < selected.size(); ++j) {
+                NodeId v = selected[j].id;
+                const auto& code_v = graph.get_code(v);
+                const float* vec_v = graph.get_vector(v);
+                VertexAuxData aux = encoder.compute_neighbor_aux(
+                    code_v, vec_node, vec_v);
                 nb.set_neighbor(j, v, code_v.codes, aux);
             }
         }
@@ -141,7 +153,16 @@ public:
 
     struct Spinlock {
         std::atomic_flag flag = ATOMIC_FLAG_INIT;
-        void lock() { while (flag.test_and_set(std::memory_order_acquire)); }
+        void lock() {
+            for (int spin = 0; flag.test_and_set(std::memory_order_acquire); ++spin) {
+                if (spin < 16) {
+                    __builtin_ia32_pause();
+                } else {
+                    std::this_thread::yield();
+                    spin = 0;
+                }
+            }
+        }
         void unlock() { flag.clear(std::memory_order_release); }
     };
 
@@ -232,7 +253,51 @@ public:
         }
     }
 
-    // ── Main entry point: adaptive two-pass construction pipeline ──
+    // ── Random neighbor initialization (fast parallel) ──
+    // Assigns R random neighbors to each node, providing base connectivity
+    // for the parallel refinement pass.
+
+    template <typename EncType>
+    static void init_random_neighbors(Graph& graph, const EncType& encoder,
+                                       size_t actual_threads) {
+        size_t n = graph.size();
+
+        #pragma omp parallel num_threads(actual_threads)
+        {
+            int tid = omp_get_thread_num();
+            std::mt19937 rng(42 + tid);
+
+            #pragma omp for schedule(static)
+            for (size_t i = 0; i < n; ++i) {
+                NodeId u = static_cast<NodeId>(i);
+                const float* vec_u = graph.get_vector(u);
+                std::vector<NeighborCandidate> candidates;
+                candidates.reserve(GraphR);
+
+                // Sample random neighbors
+                std::uniform_int_distribution<size_t> dist(0, n - 1);
+                for (size_t j = 0; j < GraphR * 2 && candidates.size() < GraphR; ++j) {
+                    NodeId v = static_cast<NodeId>(dist(rng));
+                    if (v == u) continue;
+                    float d = l2_distance_simd<D>(vec_u, graph.get_vector(v));
+                    candidates.push_back({v, d});
+                }
+
+                // Deduplicate and keep closest
+                std::sort(candidates.begin(), candidates.end());
+                candidates.erase(
+                    std::unique(candidates.begin(), candidates.end(),
+                                [](const auto& a, const auto& b) { return a.id == b.id; }),
+                    candidates.end());
+                if (candidates.size() > GraphR)
+                    candidates.resize(GraphR);
+
+                write_neighbors(graph, encoder, u, candidates);
+            }
+        }
+    }
+
+    // ── Main entry point: adaptive construction pipeline ──
 
     template <typename EncType>
     static void optimize_graph_adaptive(Graph& graph, const EncType& encoder,
@@ -248,42 +313,50 @@ public:
         NodeId entry_point = graph.find_medoid();
         graph.set_entry_point(entry_point);
 
-        // Random insertion order with medoid first
-        std::mt19937 rng(42);
-        std::vector<NodeId> order(n);
-        std::iota(order.begin(), order.end(), 0);
-        std::shuffle(order.begin(), order.end(), rng);
-        for (size_t i = 0; i < n; ++i) {
-            if (order[i] == entry_point) {
-                std::swap(order[0], order[i]);
-                break;
+        if (n <= 50000) {
+            // Small graphs: use Vamana two-pass insertion for best quality
+            std::mt19937 rng(42);
+            std::vector<NodeId> order(n);
+            std::iota(order.begin(), order.end(), 0);
+            std::shuffle(order.begin(), order.end(), rng);
+            for (size_t i = 0; i < n; ++i) {
+                if (order[i] == entry_point) {
+                    std::swap(order[0], order[i]);
+                    break;
+                }
             }
+
+            if (verbose) printf("[QRG] Phase 1: Insertion (alpha=%.2f, n=%zu, ef=%zu)\n",
+                               AdaptiveDefaults::ALPHA, n, ef_construction);
+            run_insertion_pass(graph, encoder, ef_construction, AdaptiveDefaults::ALPHA,
+                              error_tolerance, error_epsilon, verbose, order, entry_point);
+
+            if (verbose) printf("[QRG] Phase 1b: Re-insertion (alpha=%.2f)\n",
+                               AdaptiveDefaults::ALPHA_PASS2);
+            std::mt19937 rng2(137);
+            std::shuffle(order.begin(), order.end(), rng2);
+            for (size_t i = 0; i < n; ++i) {
+                if (order[i] == entry_point) {
+                    std::swap(order[0], order[i]);
+                    break;
+                }
+            }
+            run_insertion_pass(graph, encoder, ef_construction, AdaptiveDefaults::ALPHA_PASS2,
+                              error_tolerance, error_epsilon, verbose, order, entry_point);
+        } else {
+            // Large graphs: random init + parallel refinement (much faster)
+            if (verbose) printf("[QRG] Phase 1: Random init (n=%zu, R=%zu, %zu threads)...\n",
+                               n, static_cast<size_t>(GraphR), actual_threads);
+            init_random_neighbors(graph, encoder, actual_threads);
         }
 
-        // Phase 1: Sequential incremental insertion (alpha=1.0)
-        if (verbose) printf("[QRG] Phase 1: Insertion pass (alpha=%.2f, n=%zu, R=%zu, ef=%zu)\n",
-                           AdaptiveDefaults::ALPHA, n, static_cast<size_t>(GraphR), ef_construction);
-        run_insertion_pass(graph, encoder, ef_construction, AdaptiveDefaults::ALPHA,
-                          error_tolerance, error_epsilon, verbose, order, entry_point);
-
-        // Phase 1b: Re-insertion with different seed and alpha_pass2 (Vamana two-pass)
-        if (verbose) printf("[QRG] Phase 1b: Re-insertion pass (alpha=%.2f)\n",
-                           AdaptiveDefaults::ALPHA_PASS2);
-        std::mt19937 rng2(137);
-        std::shuffle(order.begin(), order.end(), rng2);
-        for (size_t i = 0; i < n; ++i) {
-            if (order[i] == entry_point) {
-                std::swap(order[0], order[i]);
-                break;
-            }
+        // Phase 2: Parallel refinement (2 rounds for convergence)
+        for (int round = 0; round < 2; ++round) {
+            if (verbose) printf("[QRG] Phase 2.%d: Refinement (ef=%zu, %zu threads)...\n",
+                               round + 1, ef_construction, actual_threads);
+            run_refinement_pass(graph, encoder, ef_construction, AdaptiveDefaults::ALPHA_PASS2,
+                               error_tolerance, error_epsilon, actual_threads);
         }
-        run_insertion_pass(graph, encoder, ef_construction, AdaptiveDefaults::ALPHA_PASS2,
-                          error_tolerance, error_epsilon, verbose, order, entry_point);
-
-        // Phase 2: Parallel refinement
-        if (verbose) printf("[QRG] Phase 2: Refinement pass...\n");
-        run_refinement_pass(graph, encoder, ef_construction, AdaptiveDefaults::ALPHA_PASS2,
-                           error_tolerance, error_epsilon, actual_threads);
 
         // Phase 3: Reverse edges
         if (verbose) printf("[QRG] Phase 3: Reverse edge pass...\n");

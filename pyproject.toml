@@ -16,6 +16,14 @@ dependencies = [
 bench = [
     "faiss-cpu>=1.7.0",
     "hnswlib>=0.7.0",
+    "h5py>=3.8",
+    "matplotlib>=3.7",
+    "psutil>=5.9",
+]
+eval = [
+    "h5py>=3.8",
+    "matplotlib>=3.7",
+    "psutil>=5.9",
 ]
 dev = [
     "pytest>=7.0",

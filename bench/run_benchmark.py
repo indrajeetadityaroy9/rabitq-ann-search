@@ -50,19 +50,10 @@ class AlgorithmResult:
     sweep: list  # List[SweepPoint] serialized
 
 # ---------------------------------------------------------------------------
-# Dataset loading
+# Dataset loading (uses cphnsw.datasets for fvecs/ivecs/hdf5 parsing)
 # ---------------------------------------------------------------------------
 
-def _load_fvecs(path: str) -> np.ndarray:
-    data = np.fromfile(path, dtype=np.float32)
-    dim = data[:1].view(np.int32)[0]
-    return data.reshape(-1, dim + 1)[:, 1:].copy()
-
-
-def _load_ivecs(path: str) -> np.ndarray:
-    data = np.fromfile(path, dtype=np.int32)
-    dim = int(data[0])
-    return data.reshape(-1, dim + 1)[:, 1:].copy()
+from cphnsw.datasets import load_fvecs, load_ivecs, load_hdf5_dataset
 
 
 def normalize(X: np.ndarray) -> np.ndarray:
@@ -75,9 +66,9 @@ def load_sift1m() -> dict:
     base_dir = REPO_DIR / "data" / "sift1m"
     if not base_dir.exists():
         base_dir = REPO_DIR / "data" / "sift"
-    base = _load_fvecs(str(base_dir / "sift_base.fvecs"))
-    queries = _load_fvecs(str(base_dir / "sift_query.fvecs"))
-    gt = _load_ivecs(str(base_dir / "sift_groundtruth.ivecs"))
+    base = load_fvecs(str(base_dir / "sift_base.fvecs"))
+    queries = load_fvecs(str(base_dir / "sift_query.fvecs"))
+    gt = load_ivecs(str(base_dir / "sift_groundtruth.ivecs"))
     # SIFT uses L2 on raw vectors — do NOT normalize (ground truth is L2-based)
     return {
         "name": "sift-1m", "dim": base.shape[1], "metric": "l2",
@@ -87,15 +78,16 @@ def load_sift1m() -> dict:
 
 
 def load_glove200() -> dict:
-    import h5py
-    path = REPO_DIR / "bench" / "vibe" / "data" / "glove-200-cosine.hdf5"
-    with h5py.File(str(path), "r") as f:
-        base = np.array(f["train"], dtype=np.float32)
-        queries = np.array(f["test"], dtype=np.float32)
-        gt = np.array(f["neighbors"], dtype=np.int64)
+    path = REPO_DIR / "data" / "glove200" / "glove-200-angular.hdf5"
+    if not path.exists():
+        # fallback to old location
+        path = REPO_DIR / "bench" / "vibe" / "data" / "glove-200-cosine.hdf5"
+    ds = load_hdf5_dataset(str(path))
     return {
-        "name": "glove-200", "dim": base.shape[1], "metric": "cosine",
-        "base": base, "queries": queries, "groundtruth": gt,
+        "name": "glove-200", "dim": ds["dim"], "metric": "cosine",
+        "base": ds["base"].astype(np.float32),
+        "queries": ds["queries"].astype(np.float32),
+        "groundtruth": ds["groundtruth"].astype(np.int64),
     }
 
 # ---------------------------------------------------------------------------
@@ -263,68 +255,6 @@ class FaissHNSWRunner(BaseRunner):
         return _search
 
 
-class FaissIVFFlatRunner(BaseRunner):
-    def __init__(self, nlist=1024):
-        self.nlist = nlist
-        self.name = f"faiss-ivfflat-{nlist}"
-
-    def build(self, base, dim, metric):
-        import faiss
-        faiss.omp_set_num_threads(1)
-        quantizer = faiss.IndexFlatL2(dim)
-        self.index = faiss.IndexIVFFlat(quantizer, dim, self.nlist)
-        self.index.train(base)
-        self.index.add(base)
-
-    def search_fn(self, k, param):
-        import faiss
-        idx = self.index
-        def _search(queries):
-            faiss.omp_set_num_threads(1)
-            idx.nprobe = param
-            _, I = idx.search(queries, k)
-            return I
-        return _search
-
-    def param_name(self):
-        return "nprobe"
-
-    def param_values(self):
-        return [1, 2, 4, 8, 16, 32, 64, 128, 256]
-
-
-class FaissIVFPQRunner(BaseRunner):
-    def __init__(self, nlist=1024, M_pq=16, nbits=8):
-        self.nlist = nlist
-        self.M_pq = M_pq
-        self.nbits = nbits
-        self.name = f"faiss-ivfpq-{nlist}"
-
-    def build(self, base, dim, metric):
-        import faiss
-        faiss.omp_set_num_threads(1)
-        quantizer = faiss.IndexFlatL2(dim)
-        self.index = faiss.IndexIVFPQ(quantizer, dim, self.nlist,
-                                       self.M_pq, self.nbits)
-        self.index.train(base)
-        self.index.add(base)
-
-    def search_fn(self, k, param):
-        import faiss
-        idx = self.index
-        def _search(queries):
-            faiss.omp_set_num_threads(1)
-            idx.nprobe = param
-            _, I = idx.search(queries, k)
-            return I
-        return _search
-
-    def param_name(self):
-        return "nprobe"
-
-    def param_values(self):
-        return [1, 2, 4, 8, 16, 32, 64, 128, 256]
-
 # ---------------------------------------------------------------------------
 # Algorithm list builder
 # ---------------------------------------------------------------------------
@@ -351,14 +281,10 @@ def build_algorithms(dataset_name: str, dim: int) -> list:
     except ImportError:
         print("WARNING: hnswlib not available")
 
-    # faiss
+    # faiss (graph-based only, for fair comparison)
     try:
         import faiss  # noqa: F401
         algos.append(FaissHNSWRunner(M=32))
-        algos.append(FaissIVFFlatRunner(nlist=1024))
-        # M_pq must divide dim
-        M_pq = 16 if dim % 16 == 0 else 8
-        algos.append(FaissIVFPQRunner(nlist=1024, M_pq=M_pq))
     except ImportError:
         print("WARNING: faiss not available")
 
@@ -377,8 +303,20 @@ def run_benchmark(dataset_name: str, k: int, n_runs: int, output_dir: str):
         ds = load_sift1m()
     elif dataset_name == "glove200":
         ds = load_glove200()
+    elif dataset_name.endswith(".hdf5") or dataset_name.endswith(".h5"):
+        # Load custom HDF5 dataset by path
+        raw = load_hdf5_dataset(dataset_name)
+        ds = {
+            "name": Path(dataset_name).stem,
+            "dim": raw["dim"],
+            "metric": "l2",
+            "base": raw["base"].astype(np.float32),
+            "queries": raw["queries"].astype(np.float32),
+            "groundtruth": raw["groundtruth"].astype(np.int64),
+        }
     else:
-        raise ValueError(f"Unknown dataset: {dataset_name}")
+        raise ValueError(f"Unknown dataset: {dataset_name}. "
+                         f"Use sift1m, glove200, or a path to an HDF5 file.")
 
     base = ds["base"]
     queries = ds["queries"]
@@ -492,8 +430,8 @@ def run_benchmark(dataset_name: str, k: int, n_runs: int, output_dir: str):
 
 def main():
     parser = argparse.ArgumentParser(description="ANN Benchmark Suite")
-    parser.add_argument("--dataset", choices=["sift1m", "glove200", "all"],
-                        default="sift1m")
+    parser.add_argument("--dataset", default="sift1m",
+                        help="Dataset name (sift1m, glove200, all) or path to HDF5 file")
     parser.add_argument("--k", type=int, default=10)
     parser.add_argument("--n-runs", type=int, default=3)
     parser.add_argument("--output-dir", default=str(SCRIPT_DIR / "results"))

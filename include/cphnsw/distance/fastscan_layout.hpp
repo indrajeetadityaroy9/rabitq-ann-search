@@ -173,6 +173,35 @@ struct NbitFastScanNeighborBlock {
         if (slot >= count) count = static_cast<uint32_t>(slot + 1);
     }
 
+    // SymphonyQG: store parent-relative MSB codes in planes[0],
+    // global codes for remaining planes (planes[1..B-1]).
+    // This gives parent-relative lower bounds from MSB while keeping
+    // full B-bit distance estimates using global code data.
+    void set_neighbor_with_pr_msb(size_t slot, uint32_t id,
+                                   const BinaryCodeStorage<D>& pr_msb_code,
+                                   const NbitCodeStorage<D, BitWidth>& global_code,
+                                   const VertexAuxData& aux_data) {
+        size_t batch = slot / BatchSize;
+        size_t idx_in_batch = slot % BatchSize;
+        neighbor_ids[slot] = id;
+
+        // planes[0] = parent-relative MSB (for lower bounds)
+        code_blocks[batch].planes[0].store(idx_in_batch, pr_msb_code);
+
+        // planes[1..B-1] = global codes (for weighted distance estimate)
+        for (size_t b = 1; b < BitWidth; ++b) {
+            BinaryCodeStorage<D> plane_binary;
+            std::memcpy(plane_binary.signs, global_code.planes[b],
+                        BinaryCodeStorage<D>::NUM_WORDS * sizeof(uint64_t));
+            code_blocks[batch].planes[b].store(idx_in_batch, plane_binary);
+        }
+
+        aux[slot] = aux_data;
+        popcounts[slot] = static_cast<uint16_t>(pr_msb_code.popcount());
+        weighted_popcounts[slot] = static_cast<uint16_t>(global_code.weighted_popcount());
+        if (slot >= count) count = static_cast<uint32_t>(slot + 1);
+    }
+
     size_t size() const { return count; }
     bool empty() const { return count == 0; }
 };

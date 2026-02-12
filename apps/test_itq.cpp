@@ -72,8 +72,7 @@ int main() {
     std::cout << "\n=== Dense+ITQ Index Test ===" << std::endl;
 
     // Build index with ITQ rotation
-    RaBitQIndex<128, 32, 1, DenseRotation> index(
-        IndexParams().set_dim(DIM).set_ef_construction(100));
+    RaBitQIndex<128, 32, 1, DenseRotation> index(IndexParams().set_dim(DIM));
     index.add_batch(data.data(), N_TOTAL);
     index.finalize();
 
@@ -82,7 +81,7 @@ int main() {
               << " avg_deg: " << stats.avg_degree << std::endl;
 
     // Search
-    auto results = index.search(data.data(), SearchParams().set_k(10).set_ef(50));
+    auto results = index.search(data.data(), SearchParams().set_k(10));
     std::cout << "Search results: " << results.size();
     if (!results.empty() && results[0].id == 0) {
         std::cout << " [self-found OK]";

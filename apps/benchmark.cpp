@@ -79,19 +79,6 @@ inline std::vector<std::vector<NodeId>> load_ivecs(const std::string& path, size
     return data;
 }
 
-inline void normalize_vectors(float* vecs, size_t count, size_t dim) {
-    for (size_t i = 0; i < count; ++i) {
-        float* v = vecs + i * dim;
-        float norm_sq = 0;
-        for (size_t d = 0; d < dim; ++d) norm_sq += v[d] * v[d];
-        float norm = std::sqrt(norm_sq);
-        if (norm > 1e-10f) {
-            float inv_norm = 1.0f / norm;
-            for (size_t d = 0; d < dim; ++d) v[d] *= inv_norm;
-        }
-    }
-}
-
 inline Dataset load_sift1m(const std::string& dir) {
     Dataset ds;
     size_t base_dim, base_count;
@@ -104,7 +91,6 @@ inline Dataset load_sift1m(const std::string& dir) {
     size_t k_gt, gt_count;
     ds.ground_truth = load_ivecs(dir + "/sift_groundtruth.ivecs", k_gt, gt_count);
     ds.k_gt = k_gt;
-    // SIFT ground truth is computed under raw L2 — do NOT normalize
     return ds;
 }
 
@@ -115,6 +101,20 @@ inline double compute_recall(const std::vector<SearchResult>& results, const std
         if (gt_set.count(results[i].id)) ++hits;
     }
     return static_cast<double>(hits) / static_cast<double>(gt_set.size());
+}
+
+inline size_t get_rss_kb() {
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.substr(0, 6) == "VmRSS:") {
+            std::istringstream iss(line.substr(6));
+            size_t val;
+            iss >> val;
+            return val;
+        }
+    }
+    return 0;
 }
 
 class Timer {
@@ -130,26 +130,43 @@ public:
 int main(int argc, char** argv) {
     std::string sift_dir = (argc > 1) ? argv[1] : "data/sift";
     Dataset sift = load_sift1m(sift_dir);
-    
-    RaBitQIndex<PADDED_DIM, 32> index(IndexParams().set_dim(sift.dim).set_ef_construction(200));
+
+    RaBitQIndex<PADDED_DIM, 32> index(IndexParams().set_dim(sift.dim));
     Timer timer;
+
+    // Build phase with timing and memory tracking
     timer.start();
     index.add_batch(sift.base_vectors.data(), sift.num_base);
     index.finalize(BuildParams().set_verbose(true));
-    std::cout << "Build time: " << index.size() / timer.elapsed_s() << " vec/s\n";
+    double build_time_s = timer.elapsed_s();
+    size_t rss_kb = get_rss_kb();
 
-    std::vector<size_t> ef_values = {10, 20, 40, 80, 100, 200, 400};
-    for (size_t ef : ef_values) {
+    printf("\n[Metrics] Indexing: %.2f min | Memory: %.2f GiB\n",
+           build_time_s / 60.0, static_cast<double>(rss_kb) / (1024.0 * 1024.0));
+    printf("[Metrics] Throughput: %.0f vec/s\n\n", index.size() / build_time_s);
+
+    // Search at different recall targets
+    std::vector<float> recall_targets = {0.80f, 0.90f, 0.95f, 0.97f, 0.99f};
+    for (float rt : recall_targets) {
         std::vector<double> latencies;
         double total_recall = 0.0;
         for (size_t q = 0; q < sift.num_queries; ++q) {
             timer.start();
-            auto results = index.search(sift.query_vectors.data() + q * sift.dim, SearchParams().set_k(10).set_ef(ef));
+            auto results = index.search(
+                sift.query_vectors.data() + q * sift.dim,
+                SearchParams().set_k(10).set_recall_target(rt));
             latencies.push_back(timer.elapsed_us());
             total_recall += compute_recall(results, sift.ground_truth[q], 10);
         }
         std::sort(latencies.begin(), latencies.end());
-        std::cout << "ef=" << ef << " Recall=" << total_recall / sift.num_queries << " QPS=" << 1e6 / (std::accumulate(latencies.begin(), latencies.end(), 0.0) / latencies.size()) << "\n";
+        double avg_latency = std::accumulate(latencies.begin(), latencies.end(), 0.0) / latencies.size();
+        float gamma = AdaptiveDefaults::gamma_from_recall(rt, PADDED_DIM);
+        float eps = AdaptiveDefaults::error_epsilon_search(rt);
+        printf("recall_target=%.2f  gamma=%.3f  eps=%.2f  Recall@10=%.4f  QPS=%.0f  p50=%.0fus  p99=%.0fus\n",
+               rt, gamma, eps, total_recall / sift.num_queries,
+               1e6 / avg_latency,
+               latencies[latencies.size() / 2],
+               latencies[static_cast<size_t>(latencies.size() * 0.99)]);
     }
     return 0;
 }

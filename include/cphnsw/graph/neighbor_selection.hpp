@@ -16,57 +16,28 @@ struct NeighborCandidate {
     }
 };
 
-// HNSW upper-layer neighbor selection: diversity-aware heuristic.
-// Prunes candidate if it's closer to an already-selected neighbor
-// than to the query node. Used for upper-layer construction only.
-template <typename DistanceFn>
-std::vector<NeighborCandidate> select_neighbors_heuristic(
-    std::vector<NeighborCandidate> candidates,
-    size_t M,
-    DistanceFn distance_fn)
-{
-    std::sort(candidates.begin(), candidates.end());
-
-    std::vector<NeighborCandidate> selected;
-    selected.reserve(M);
-
-    for (const auto& candidate : candidates) {
-        if (selected.size() >= M) break;
-
-        bool should_add = true;
-        for (const auto& existing : selected) {
-            float dist_to_existing = distance_fn(candidate.id, existing.id);
-            if (dist_to_existing < candidate.distance) {
-                should_add = false;
-                break;
-            }
-        }
-
-        if (should_add) {
-            selected.push_back(candidate);
-        }
-    }
-
-    return selected;
-}
-
-// QRG: Error-tolerant RobustPrune with per-vector error bounds.
-// Preserves O(n^{2/3+ε}) degree bounds under quantized distances.
+// α-Convergent Graph pruning (arXiv:2510.05975, Definition 3.1).
 //
-// Phase 1: Diversity pruning with alpha scaling and error margins.
-//   Prunes candidate if: alpha * dist(candidate, existing) < dist(candidate, query) + margin
-//   where margin = error_fn(candidate) + error_fn(existing) is the worst-case error on both sides.
-//   With alpha > 1, the pruning condition is harder to satisfy, keeping more long-range edges (Vamana §3.4).
-// Phase 2: Fill remaining slots with closest unused candidates.
+// Shifted-scaled triangle inequality: prunes candidate if a previously
+// selected neighbor is "close enough" relative to both the candidate's
+// distance to query and the existing neighbor's distance to query.
 //
-// When error_fn returns 0 for all nodes (exact distances), this reduces to standard Vamana RobustPrune.
+// Pruning condition (candidate is pruned if this holds for any existing):
+//   dist(candidate, existing) < alpha * dist(candidate, query) + (alpha-1) * dist(existing, query) + margin
+//
+// When error_fn returns 0 (exact distances), margin = 0 and this reduces
+// to the standard α-CG definition. When alpha = 1.0 and error_fn = 0,
+// this reduces to standard RNG diversity pruning.
+//
+// Phase 1: α-CG diversity pruning with error tolerance
+// Phase 2: Fill remaining slots with closest unused candidates
 template <typename DistanceFn, typename ErrorFn>
-std::vector<NeighborCandidate> select_neighbors_robust_prune(
+std::vector<NeighborCandidate> select_neighbors_alpha_cg(
     std::vector<NeighborCandidate> candidates,
     size_t R,
     DistanceFn distance_fn,
     ErrorFn error_fn,
-    float alpha = 1.0f)
+    float alpha = 1.2f)
 {
     // Deduplicate by id (keep closest distance)
     std::sort(candidates.begin(), candidates.end(),
@@ -87,17 +58,20 @@ std::vector<NeighborCandidate> select_neighbors_robust_prune(
     selected.reserve(R);
     std::vector<bool> used(candidates.size(), false);
 
-    // Phase 1: Diversity pruning with alpha and per-vector error tolerance
+    // Phase 1: α-CG diversity pruning
     for (size_t i = 0; i < candidates.size() && selected.size() < R; ++i) {
         bool should_add = true;
         float err_candidate = error_fn(candidates[i].id);
+        float dist_cq = candidates[i].distance;  // dist(candidate, query)
 
         for (const auto& existing : selected) {
-            float dist_to_existing = distance_fn(candidates[i].id, existing.id);
+            float dist_ce = distance_fn(candidates[i].id, existing.id);
+            float dist_eq = existing.distance;  // dist(existing, query)
             float err_existing = error_fn(existing.id);
             float margin = err_candidate + err_existing;
 
-            if (alpha * dist_to_existing < candidates[i].distance + margin) {
+            // α-CG condition: prune if existing is close enough
+            if (dist_ce < alpha * dist_cq + (alpha - 1.0f) * dist_eq + margin) {
                 should_add = false;
                 break;
             }

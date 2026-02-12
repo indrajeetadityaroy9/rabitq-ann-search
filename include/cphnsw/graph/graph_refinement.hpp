@@ -7,7 +7,6 @@
 #include "../encoder/rabitq_encoder.hpp"
 #include "rabitq_graph.hpp"
 #include "neighbor_selection.hpp"
-#include "../search/rabitq_search.hpp"
 #include "../api/params.hpp"
 #include <vector>
 #include <algorithm>
@@ -16,17 +15,40 @@
 #include <cstring>
 #include <random>
 #include <atomic>
-#include <thread>
 
 #include "../core/omp_compat.hpp"
 
 namespace cphnsw {
+
+// NN-Descent graph construction with α-CG pruning.
+//
+// Construction pipeline (no ef parameter, no beam search):
+//   Phase 1: Random neighbor initialization (parallel)
+//   Phase 2: NN-Descent local join iterations (δ-convergence)
+//   Phase 3: α-CG pruning + FastScan encoding
+//   Phase 4: Reverse edge pass (bidirectional connectivity)
+//   Phase 5: Hub entry point selection
+//
+// The key insight from NN-Descent (Wei Dong et al., 2011) is that
+// "neighbors of neighbors are likely neighbors". Instead of running
+// a beam search per node (which requires an ef parameter), we iteratively
+// introduce each node's neighbors to each other. Convergence is detected
+// by counting edge updates: when fewer than δ*n*R edges change (δ=0.001),
+// the graph is stable. This is dataset-agnostic.
 
 template <size_t D, size_t R = 32, size_t BitWidth = 1>
 class GraphRefinement {
 public:
     using Graph = RaBitQGraph<D, R, BitWidth>;
     static constexpr size_t GraphR = R;
+
+    // ── Working neighbor entry for NN-Descent iterations ──
+    // During NN-Descent, neighbors are stored as simple (id, distance) pairs.
+    // After convergence, they're converted to FastScan layout.
+    struct WorkingNeighbor {
+        NodeId id = INVALID_NODE;
+        float distance = std::numeric_limits<float>::max();
+    };
 
     // ── Shared helper: prune candidates and write to neighbor block ──
 
@@ -47,167 +69,307 @@ public:
             return error_tolerance * std::sqrt(variance) * code.dist_to_centroid;
         };
 
-        auto selected = select_neighbors_robust_prune(
+        auto selected = select_neighbors_alpha_cg(
             std::move(candidates), GraphR, dist_fn, error_fn, alpha);
 
         write_neighbors(graph, encoder, node, selected);
     }
 
-    // Write selected neighbors into a node's neighbor block, computing FastScan aux data.
-    // For BitWidth==1, uses SymphonyQG parent-relative encoding: the binary code stored
-    // in the FastScan block is sign(P*unit(o-p)), not sign(P*unit(o-c)).
+    // Write selected neighbors into a node's neighbor block.
+    // Uses SymphonyQG parent-relative encoding for all bit widths.
     template <typename EncType>
     static void write_neighbors(Graph& graph, const EncType& encoder,
                                 NodeId node, const std::vector<NeighborCandidate>& selected) {
         auto& nb = graph.get_neighbors(node);
         nb.count = 0;
         const float* vec_node = graph.get_vector(node);
+        float np = graph.get_code(node).dist_to_centroid;
 
-        if constexpr (BitWidth == 1) {
-            float np = graph.get_code(node).dist_to_centroid;  // ||parent - centroid||
-            for (size_t j = 0; j < selected.size(); ++j) {
-                NodeId v = selected[j].id;
-                const auto& code_v = graph.get_code(v);
-                const float* vec_v = graph.get_vector(v);
-                BinaryCodeStorage<EncType::DIMS> pr_code;
-                VertexAuxData aux = encoder.compute_neighbor_aux(
-                    code_v, vec_node, vec_v, np, &pr_code);
+        for (size_t j = 0; j < selected.size(); ++j) {
+            NodeId v = selected[j].id;
+            const auto& code_v = graph.get_code(v);
+            const float* vec_v = graph.get_vector(v);
+            BinaryCodeStorage<EncType::DIMS> pr_code;
+            VertexAuxData aux = encoder.compute_neighbor_aux(
+                code_v, vec_node, vec_v, np, &pr_code);
+
+            if constexpr (BitWidth == 1) {
                 nb.set_neighbor(j, v, pr_code, aux);
-            }
-        } else {
-            for (size_t j = 0; j < selected.size(); ++j) {
-                NodeId v = selected[j].id;
-                const auto& code_v = graph.get_code(v);
-                const float* vec_v = graph.get_vector(v);
-                VertexAuxData aux = encoder.compute_neighbor_aux(
-                    code_v, vec_node, vec_v);
-                nb.set_neighbor(j, v, code_v.codes, aux);
+            } else {
+                nb.set_neighbor_with_pr_msb(j, v, pr_code, code_v.codes, aux);
             }
         }
     }
 
-    // ── Phase 1: Sequential incremental insertion (always quantized) ──
+    // ── Phase 1: Random working list initialization ──
 
-    template <typename EncType>
-    static void run_insertion_pass(Graph& graph, const EncType& encoder,
-                                   size_t ef_construction, float alpha,
-                                   float error_tolerance, float error_epsilon,
-                                   bool verbose,
-                                   const std::vector<NodeId>& order,
-                                   NodeId entry_point) {
-        size_t n = order.size();
-        size_t search_ef = std::max<size_t>(GraphR, ef_construction);
-
-        auto insert_node = [&](NodeId u, const float* vec_u,
-                               std::vector<SearchResult> results) {
-            std::vector<NeighborCandidate> candidates;
-            candidates.reserve(results.size());
-            for (const auto& r : results) {
-                if (r.id != u) candidates.push_back({r.id, r.distance});
-            }
-
-            prune_and_write(graph, encoder, u, candidates, alpha, error_tolerance);
-
-            auto& nb_u = graph.get_neighbors(u);
-            for (size_t j = 0; j < nb_u.count; ++j) {
-                NodeId v = nb_u.neighbor_ids[j];
-                if (v == INVALID_NODE) continue;
-
-                auto& nb_v = graph.get_neighbors(v);
-                std::vector<NeighborCandidate> v_cands;
-                v_cands.reserve(nb_v.count + 1);
-                const float* vec_v = graph.get_vector(v);
-                for (size_t ki = 0; ki < nb_v.count; ++ki) {
-                    NodeId w = nb_v.neighbor_ids[ki];
-                    if (w == INVALID_NODE) continue;
-                    float d = l2_distance_simd<D>(vec_v, graph.get_vector(w));
-                    v_cands.push_back({w, d});
-                }
-                float d_uv = l2_distance_simd<D>(vec_u, vec_v);
-                v_cands.push_back({u, d_uv});
-
-                if (v_cands.size() <= GraphR) {
-                    write_neighbors(graph, encoder, v, v_cands);
-                } else {
-                    prune_and_write(graph, encoder, v, v_cands, alpha, error_tolerance);
-                }
-            }
-        };
-
-        TwoLevelVisitationTable visited(n + 1024);
-        for (size_t idx = 1; idx < n; ++idx) {
-            NodeId u = order[idx];
-            const float* vec_u = graph.get_vector(u);
-            auto results = QuantizedBuildSearchEngine<D, R, BitWidth>::search(
-                vec_u, graph, encoder, search_ef, search_ef, visited,
-                error_epsilon, entry_point);
-            insert_node(u, vec_u, std::move(results));
-
-            if (verbose && n >= 10 && idx % (n / 10) == 0) {
-                printf("[Build]   %zu/%zu (%.0f%%)\n", idx, n, 100.0 * idx / n);
-            }
-        }
-    }
-
-    // ── Phase 2: Parallel refinement pass (always quantized) ──
-
-    struct Spinlock {
-        std::atomic_flag flag = ATOMIC_FLAG_INIT;
-        void lock() {
-            for (int spin = 0; flag.test_and_set(std::memory_order_acquire); ++spin) {
-                if (spin < 16) {
-                    __builtin_ia32_pause();
-                } else {
-                    std::this_thread::yield();
-                    spin = 0;
-                }
-            }
-        }
-        void unlock() { flag.clear(std::memory_order_release); }
-    };
-
-    template <typename EncType>
-    static void run_refinement_pass(Graph& graph, const EncType& encoder,
-                                     size_t ef_construction, float alpha,
-                                     float error_tolerance, float error_epsilon,
-                                     size_t actual_threads) {
+    static void init_working_random(
+        const Graph& graph,
+        std::vector<std::vector<WorkingNeighbor>>& working,
+        size_t actual_threads)
+    {
         size_t n = graph.size();
-        size_t search_ef = std::max<size_t>(GraphR, ef_construction);
-
-        std::vector<Spinlock> node_locks(n);
 
         #pragma omp parallel num_threads(actual_threads)
         {
+            int tid = omp_get_thread_num();
+            std::mt19937 rng(42 + tid);
+
+            #pragma omp for schedule(static)
+            for (size_t i = 0; i < n; ++i) {
+                NodeId u = static_cast<NodeId>(i);
+                const float* vec_u = graph.get_vector(u);
+                working[i].clear();
+
+                std::uniform_int_distribution<size_t> dist(0, n - 1);
+
+                // Sample candidates, deduplicate, keep R closest
+                std::vector<WorkingNeighbor> candidates;
+                candidates.reserve(GraphR * 3);
+                for (size_t j = 0; j < GraphR * 4 && candidates.size() < GraphR * 3; ++j) {
+                    NodeId v = static_cast<NodeId>(dist(rng));
+                    if (v == u) continue;
+                    bool dup = false;
+                    for (const auto& c : candidates) {
+                        if (c.id == v) { dup = true; break; }
+                    }
+                    if (dup) continue;
+                    float d = l2_distance_simd<D>(vec_u, graph.get_vector(v));
+                    candidates.push_back({v, d});
+                }
+                std::sort(candidates.begin(), candidates.end(),
+                          [](const auto& a, const auto& b) { return a.distance < b.distance; });
+                size_t keep = std::min(candidates.size(), static_cast<size_t>(GraphR));
+                working[i].assign(candidates.begin(), candidates.begin() + keep);
+            }
+        }
+    }
+
+    // ── Phase 2: NN-Descent local join pass ──
+    //
+    // For each node u, gather candidates from neighbors-of-neighbors.
+    // Uses the "new/old" optimization: only traverses neighbors that were
+    // recently updated, dramatically reducing work in later iterations.
+    // Returns total edge updates across all nodes.
+
+    static size_t nndescent_join_pass(
+        const Graph& graph,
+        std::vector<std::vector<WorkingNeighbor>>& working,
+        std::vector<std::vector<uint8_t>>& new_flags,
+        size_t actual_threads)
+    {
+        size_t n = graph.size();
+
+        // Snapshot neighbor IDs and "new" flags for thread-safe reads.
+        // Each thread reads from snapshot (immutable) and writes only to its own node.
+        struct SnapshotEntry {
+            NodeId ids[R];
+            uint8_t is_new[R];
+            uint8_t count;
+        };
+        std::vector<SnapshotEntry> snapshot(n);
+
+        for (size_t i = 0; i < n; ++i) {
+            size_t sz = std::min(working[i].size(), static_cast<size_t>(R));
+            snapshot[i].count = static_cast<uint8_t>(sz);
+            for (size_t j = 0; j < sz; ++j) {
+                snapshot[i].ids[j] = working[i][j].id;
+                snapshot[i].is_new[j] = new_flags[i][j];
+            }
+            // Clear new flags (will be set for newly inserted entries)
+            std::fill(new_flags[i].begin(), new_flags[i].end(), 0);
+        }
+
+        // Build reverse adjacency: reverse[v] = {u : v in snapshot[u]}
+        std::vector<std::vector<NodeId>> reverse(n);
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = 0; j < snapshot[i].count; ++j) {
+                NodeId v = snapshot[i].ids[j];
+                if (v != INVALID_NODE && v < n) {
+                    reverse[v].push_back(static_cast<NodeId>(i));
+                }
+            }
+        }
+
+        std::atomic<size_t> total_updates{0};
+
+        #pragma omp parallel num_threads(actual_threads)
+        {
+            // Thread-local candidate buffer
+            std::vector<NodeId> candidates;
+            candidates.reserve(GraphR * GraphR);
+
             #pragma omp for schedule(dynamic, 256)
             for (size_t i = 0; i < n; ++i) {
                 NodeId u = static_cast<NodeId>(i);
                 const float* vec_u = graph.get_vector(u);
+                auto& wl = working[i];
 
-                auto results = QuantizedBuildSearchEngine<D, R, BitWidth>::search(
-                    vec_u, graph, encoder, search_ef, search_ef, error_epsilon);
-
-                std::vector<NeighborCandidate> candidates;
-                candidates.reserve(results.size() + GraphR);
-                for (const auto& r : results) {
-                    if (r.id != u) candidates.push_back({r.id, r.distance});
+                // Check if this node has any "new" forward neighbors
+                bool has_new_forward = false;
+                for (size_t j = 0; j < snapshot[i].count; ++j) {
+                    if (snapshot[i].is_new[j]) { has_new_forward = true; break; }
                 }
 
-                const auto& nb = graph.get_neighbors(u);
-                for (size_t j = 0; j < nb.count; ++j) {
-                    NodeId v = nb.neighbor_ids[j];
-                    if (v == INVALID_NODE || v == u) continue;
-                    float d = l2_distance_simd<D>(vec_u, graph.get_vector(v));
-                    candidates.push_back({v, d});
+                // Check if any reverse neighbor has "new" entries
+                bool has_new_reverse = false;
+                for (NodeId rv : reverse[i]) {
+                    for (size_t j = 0; j < snapshot[rv].count; ++j) {
+                        if (snapshot[rv].is_new[j]) { has_new_reverse = true; break; }
+                    }
+                    if (has_new_reverse) break;
                 }
 
-                node_locks[u].lock();
-                prune_and_write(graph, encoder, u, candidates, alpha, error_tolerance);
-                node_locks[u].unlock();
+                if (!has_new_forward && !has_new_reverse) continue;
+
+                candidates.clear();
+
+                // Current neighbor IDs for membership check (R=32 → linear scan is fine)
+                auto is_current_or_self = [&](NodeId w) -> bool {
+                    if (w == u) return true;
+                    for (const auto& nb : wl) {
+                        if (nb.id == w) return true;
+                    }
+                    return false;
+                };
+
+                // Forward: traverse neighbors-of-"new"-neighbors
+                if (has_new_forward) {
+                    for (size_t j = 0; j < snapshot[i].count; ++j) {
+                        if (!snapshot[i].is_new[j]) continue;
+                        NodeId v = snapshot[i].ids[j];
+                        if (v == INVALID_NODE || v >= n) continue;
+                        for (size_t k = 0; k < snapshot[v].count; ++k) {
+                            NodeId w = snapshot[v].ids[k];
+                            if (w != INVALID_NODE && w < n && !is_current_or_self(w)) {
+                                candidates.push_back(w);
+                            }
+                        }
+                    }
+                }
+
+                // Reverse: traverse neighbors-of-reverse-neighbors (if they have new entries)
+                for (NodeId rv : reverse[i]) {
+                    // Only traverse if rv has new entries (optimization)
+                    bool rv_has_new = false;
+                    for (size_t j = 0; j < snapshot[rv].count; ++j) {
+                        if (snapshot[rv].is_new[j]) { rv_has_new = true; break; }
+                    }
+                    if (!rv_has_new) continue;
+
+                    for (size_t k = 0; k < snapshot[rv].count; ++k) {
+                        NodeId w = snapshot[rv].ids[k];
+                        if (w != INVALID_NODE && w < n && !is_current_or_self(w)) {
+                            candidates.push_back(w);
+                        }
+                    }
+                }
+
+                if (candidates.empty()) continue;
+
+                // Dedup candidates
+                std::sort(candidates.begin(), candidates.end());
+                candidates.erase(
+                    std::unique(candidates.begin(), candidates.end()),
+                    candidates.end());
+
+                // Compute distances and try to insert
+                size_t local_updates = 0;
+                float worst = (wl.size() >= GraphR)
+                    ? wl.back().distance
+                    : std::numeric_limits<float>::max();
+
+                for (NodeId w : candidates) {
+                    float d = l2_distance_simd<D>(vec_u, graph.get_vector(w));
+                    if (d >= worst && wl.size() >= GraphR) continue;
+
+                    // Insert into sorted working list, maintaining size <= GraphR
+                    if (wl.size() < GraphR) {
+                        wl.push_back({w, d});
+                        new_flags[i].push_back(1);
+                        // Bubble into sorted position
+                        for (size_t p = wl.size() - 1; p > 0 && wl[p].distance < wl[p-1].distance; --p) {
+                            std::swap(wl[p], wl[p-1]);
+                            std::swap(new_flags[i][p], new_flags[i][p-1]);
+                        }
+                    } else {
+                        // Replace worst (last) entry
+                        wl.back() = {w, d};
+                        new_flags[i].back() = 1;
+                        // Bubble into sorted position
+                        for (size_t p = wl.size() - 1; p > 0 && wl[p].distance < wl[p-1].distance; --p) {
+                            std::swap(wl[p], wl[p-1]);
+                            std::swap(new_flags[i][p], new_flags[i][p-1]);
+                        }
+                    }
+
+                    worst = (wl.size() >= GraphR) ? wl.back().distance : std::numeric_limits<float>::max();
+                    local_updates++;
+                }
+
+                if (local_updates > 0) {
+                    total_updates.fetch_add(local_updates, std::memory_order_relaxed);
+                }
             }
         }
+
+        return total_updates.load();
     }
 
-    // ── Phase 3: Add reverse edges ──
+    // ── Derive α from converged graph statistics (OPT-SNG inspired) ──
+
+    static float derive_alpha_from_working(
+        const Graph& graph,
+        const std::vector<std::vector<WorkingNeighbor>>& working,
+        size_t sample_size = 1000)
+    {
+        size_t n = working.size();
+        if (n == 0) return 1.2f;
+
+        size_t actual_sample = std::min(sample_size, n);
+        std::mt19937 rng(42);
+        std::vector<size_t> sample_indices(n);
+        std::iota(sample_indices.begin(), sample_indices.end(), 0);
+        std::shuffle(sample_indices.begin(), sample_indices.end(), rng);
+        sample_indices.resize(actual_sample);
+
+        std::vector<float> neighbor_dists;
+        std::vector<float> inter_neighbor_dists;
+        neighbor_dists.reserve(actual_sample * GraphR);
+        inter_neighbor_dists.reserve(actual_sample * GraphR);
+
+        for (size_t idx : sample_indices) {
+            const auto& wl = working[idx];
+            for (const auto& nb : wl) {
+                if (nb.id != INVALID_NODE) {
+                    neighbor_dists.push_back(nb.distance);
+                }
+            }
+            for (size_t j = 0; j < wl.size() && j < 4; ++j) {
+                for (size_t k = j + 1; k < wl.size() && k < 4; ++k) {
+                    if (wl[j].id == INVALID_NODE || wl[k].id == INVALID_NODE) continue;
+                    float d = l2_distance_simd<D>(
+                        graph.get_vector(wl[j].id), graph.get_vector(wl[k].id));
+                    inter_neighbor_dists.push_back(d);
+                }
+            }
+        }
+
+        if (neighbor_dists.empty() || inter_neighbor_dists.empty()) return 1.2f;
+
+        std::sort(neighbor_dists.begin(), neighbor_dists.end());
+        std::sort(inter_neighbor_dists.begin(), inter_neighbor_dists.end());
+
+        float d_med = neighbor_dists[neighbor_dists.size() / 2];
+        float d_inter = inter_neighbor_dists[inter_neighbor_dists.size() / 2];
+
+        if (d_inter < 1e-10f) return 1.2f;
+
+        float alpha = std::max(1.0f, d_med / d_inter);
+        return std::min(alpha, 2.0f);
+    }
+
+    // ── Phase 4: Reverse edge pass ──
 
     template <typename EncType>
     static void run_reverse_edge_pass(Graph& graph, const EncType& encoder,
@@ -253,117 +415,101 @@ public:
         }
     }
 
-    // ── Random neighbor initialization (fast parallel) ──
-    // Assigns R random neighbors to each node, providing base connectivity
-    // for the parallel refinement pass.
-
-    template <typename EncType>
-    static void init_random_neighbors(Graph& graph, const EncType& encoder,
-                                       size_t actual_threads) {
-        size_t n = graph.size();
-
-        #pragma omp parallel num_threads(actual_threads)
-        {
-            int tid = omp_get_thread_num();
-            std::mt19937 rng(42 + tid);
-
-            #pragma omp for schedule(static)
-            for (size_t i = 0; i < n; ++i) {
-                NodeId u = static_cast<NodeId>(i);
-                const float* vec_u = graph.get_vector(u);
-                std::vector<NeighborCandidate> candidates;
-                candidates.reserve(GraphR);
-
-                // Sample random neighbors
-                std::uniform_int_distribution<size_t> dist(0, n - 1);
-                for (size_t j = 0; j < GraphR * 2 && candidates.size() < GraphR; ++j) {
-                    NodeId v = static_cast<NodeId>(dist(rng));
-                    if (v == u) continue;
-                    float d = l2_distance_simd<D>(vec_u, graph.get_vector(v));
-                    candidates.push_back({v, d});
-                }
-
-                // Deduplicate and keep closest
-                std::sort(candidates.begin(), candidates.end());
-                candidates.erase(
-                    std::unique(candidates.begin(), candidates.end(),
-                                [](const auto& a, const auto& b) { return a.id == b.id; }),
-                    candidates.end());
-                if (candidates.size() > GraphR)
-                    candidates.resize(GraphR);
-
-                write_neighbors(graph, encoder, u, candidates);
-            }
-        }
-    }
-
-    // ── Main entry point: adaptive construction pipeline ──
+    // ── Main entry point: NN-Descent pipeline ──
+    //
+    // No ef_construction parameter. No beam search. No dataset-dependent caps.
+    // Convergence is controlled solely by δ (update rate threshold), which is
+    // the gold-standard dataset-agnostic stopping criterion from NN-Descent.
 
     template <typename EncType>
     static void optimize_graph_adaptive(Graph& graph, const EncType& encoder,
-                                        size_t ef_construction, float error_tolerance,
-                                        float error_epsilon, size_t num_threads,
-                                        bool verbose) {
+                                        size_t num_threads, bool verbose) {
         size_t n = graph.size();
         if (n == 0) return;
 
         size_t actual_threads = num_threads ? num_threads : omp_get_max_threads();
+        float error_tolerance = AdaptiveDefaults::error_tolerance(D);
 
-        // Find medoid for entry point
+        // δ-convergence: stop when update rate drops below 0.1% of total edges.
+        // This is the standard NN-Descent threshold (Wei Dong et al., 2011).
+        constexpr float DELTA = 0.001f;
+        size_t delta_threshold = std::max<size_t>(1,
+            static_cast<size_t>(DELTA * static_cast<float>(n) * static_cast<float>(GraphR)));
+
+        // Temporary entry point
         NodeId entry_point = graph.find_medoid();
         graph.set_entry_point(entry_point);
 
-        if (n <= 50000) {
-            // Small graphs: use Vamana two-pass insertion for best quality
-            std::mt19937 rng(42);
-            std::vector<NodeId> order(n);
-            std::iota(order.begin(), order.end(), 0);
-            std::shuffle(order.begin(), order.end(), rng);
-            for (size_t i = 0; i < n; ++i) {
-                if (order[i] == entry_point) {
-                    std::swap(order[0], order[i]);
-                    break;
-                }
-            }
+        // Working neighbor lists (separate from FastScan layout)
+        std::vector<std::vector<WorkingNeighbor>> working(n);
+        std::vector<std::vector<uint8_t>> new_flags(n);
 
-            if (verbose) printf("[QRG] Phase 1: Insertion (alpha=%.2f, n=%zu, ef=%zu)\n",
-                               AdaptiveDefaults::ALPHA, n, ef_construction);
-            run_insertion_pass(graph, encoder, ef_construction, AdaptiveDefaults::ALPHA,
-                              error_tolerance, error_epsilon, verbose, order, entry_point);
+        // Phase 1: Random initialization into working lists
+        if (verbose) printf("[Build] Phase 1: Random init (n=%zu, R=%zu, %zu threads)...\n",
+                           n, GraphR, actual_threads);
+        init_working_random(graph, working, actual_threads);
 
-            if (verbose) printf("[QRG] Phase 1b: Re-insertion (alpha=%.2f)\n",
-                               AdaptiveDefaults::ALPHA_PASS2);
-            std::mt19937 rng2(137);
-            std::shuffle(order.begin(), order.end(), rng2);
-            for (size_t i = 0; i < n; ++i) {
-                if (order[i] == entry_point) {
-                    std::swap(order[0], order[i]);
-                    break;
-                }
-            }
-            run_insertion_pass(graph, encoder, ef_construction, AdaptiveDefaults::ALPHA_PASS2,
-                              error_tolerance, error_epsilon, verbose, order, entry_point);
-        } else {
-            // Large graphs: random init + parallel refinement (much faster)
-            if (verbose) printf("[QRG] Phase 1: Random init (n=%zu, R=%zu, %zu threads)...\n",
-                               n, static_cast<size_t>(GraphR), actual_threads);
-            init_random_neighbors(graph, encoder, actual_threads);
+        // All initial entries are "new"
+        for (size_t i = 0; i < n; ++i) {
+            new_flags[i].assign(working[i].size(), 1);
         }
 
-        // Phase 2: Parallel refinement (2 rounds for convergence)
-        for (int round = 0; round < 2; ++round) {
-            if (verbose) printf("[QRG] Phase 2.%d: Refinement (ef=%zu, %zu threads)...\n",
-                               round + 1, ef_construction, actual_threads);
-            run_refinement_pass(graph, encoder, ef_construction, AdaptiveDefaults::ALPHA_PASS2,
-                               error_tolerance, error_epsilon, actual_threads);
+        // Phase 2: NN-Descent local join iterations
+        if (verbose) printf("[Build] Phase 2: NN-Descent (delta=%.4f, threshold=%zu)...\n",
+                           DELTA, delta_threshold);
+
+        for (size_t round = 0; round < 20; ++round) {
+            size_t updates = nndescent_join_pass(graph, working, new_flags, actual_threads);
+
+            float update_rate = static_cast<float>(updates)
+                / (static_cast<float>(n) * static_cast<float>(GraphR));
+
+            if (verbose) printf("[Build]   Round %zu: %zu updates (%.3f%%)\n",
+                               round + 1, updates, 100.0f * update_rate);
+
+            if (updates <= delta_threshold) {
+                if (verbose) printf("[Build]   Converged at round %zu\n", round + 1);
+                break;
+            }
         }
 
-        // Phase 3: Reverse edges
-        if (verbose) printf("[QRG] Phase 3: Reverse edge pass...\n");
-        run_reverse_edge_pass(graph, encoder, AdaptiveDefaults::ALPHA, error_tolerance,
-                             actual_threads);
+        // Derive alpha from converged graph statistics
+        float alpha = derive_alpha_from_working(graph, working);
+        if (verbose) printf("[Build] Derived alpha=%.3f\n", alpha);
 
-        if (verbose) printf("[QRG] Done.\n");
+        // Phase 3: alpha-CG pruning + FastScan encoding
+        if (verbose) printf("[Build] Phase 3: alpha-CG pruning + FastScan encoding...\n");
+
+        #pragma omp parallel for schedule(dynamic, 256) num_threads(actual_threads)
+        for (size_t i = 0; i < n; ++i) {
+            NodeId u = static_cast<NodeId>(i);
+            std::vector<NeighborCandidate> candidates;
+            candidates.reserve(working[i].size());
+            for (const auto& nb : working[i]) {
+                if (nb.id != INVALID_NODE) {
+                    candidates.push_back({nb.id, nb.distance});
+                }
+            }
+            prune_and_write(graph, encoder, u, candidates, alpha, error_tolerance);
+        }
+
+        // Free working memory
+        { std::vector<std::vector<WorkingNeighbor>>().swap(working); }
+        { std::vector<std::vector<uint8_t>>().swap(new_flags); }
+
+        // Phase 4: Reverse edges
+        if (verbose) printf("[Build] Phase 4: Reverse edge pass...\n");
+        run_reverse_edge_pass(graph, encoder, alpha, error_tolerance, actual_threads);
+
+        // Phase 5: Hub entry point
+        NodeId hub = graph.find_hub_entry();
+        graph.set_entry_point(hub);
+        if (verbose) {
+            printf("[Build] Phase 5: Hub entry=%u (degree=%zu)\n",
+                   hub, graph.neighbor_count(hub));
+            printf("[Build] Done. avg_degree=%.1f, max_degree=%zu\n",
+                   graph.average_degree(), graph.max_degree());
+        }
     }
 };
 

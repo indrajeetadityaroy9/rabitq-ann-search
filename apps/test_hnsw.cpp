@@ -29,8 +29,7 @@ int main() {
 
     std::cout << "=== HNSW Index Test (N=" << N << ", D=" << DIM << ") ===" << std::endl;
 
-    HNSWIndex<128, 32, 1> index(
-        IndexParams().set_dim(DIM).set_ef_construction(100));
+    HNSWIndex<128, 32, 1> index(IndexParams().set_dim(DIM));
 
     auto t0 = std::chrono::high_resolution_clock::now();
     index.add_batch(data.data(), N);
@@ -52,7 +51,7 @@ int main() {
     auto t2 = std::chrono::high_resolution_clock::now();
     for (size_t i = 0; i < queries; ++i) {
         auto results = index.search(data.data() + i * DIM,
-                                    SearchParams().set_k(10).set_ef(50));
+                                    SearchParams().set_k(10));
         if (!results.empty() && results[0].id == static_cast<uint32_t>(i)
             && results[0].distance < 1e-4f) {
             ++self_found;
@@ -68,8 +67,7 @@ int main() {
     // Compare with RaBitQIndex (flat single-layer) as baseline
     std::cout << "\n=== RaBitQIndex (flat) Comparison ===" << std::endl;
 
-    RaBitQIndex<128, 32, 1> flat_index(
-        IndexParams().set_dim(DIM).set_ef_construction(100));
+    RaBitQIndex<128, 32, 1> flat_index(IndexParams().set_dim(DIM));
 
     auto t4 = std::chrono::high_resolution_clock::now();
     flat_index.add_batch(data.data(), N);
@@ -81,7 +79,7 @@ int main() {
     auto t6 = std::chrono::high_resolution_clock::now();
     for (size_t i = 0; i < queries; ++i) {
         auto results = flat_index.search(data.data() + i * DIM,
-                                         SearchParams().set_k(10).set_ef(50));
+                                         SearchParams().set_k(10));
         if (!results.empty() && results[0].id == static_cast<uint32_t>(i)
             && results[0].distance < 1e-4f) {
             ++flat_self_found;

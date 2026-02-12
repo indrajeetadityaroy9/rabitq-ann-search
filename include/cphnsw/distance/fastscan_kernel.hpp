@@ -207,6 +207,9 @@ inline void compute_nbit_inner_products(
 // Uses full B-bit weighted sums for distance estimates, MSB (1-bit) sums
 // for conservative lower bounds.
 
+// Multi-bit distance conversion with bounds using SymphonyQG parent-relative formula.
+// aux.dist_to_centroid = ||o-p|| (parent-relative), aux.ip_xbar_Pinv_c = no² - np²
+// This uses the same decomposition as the 1-bit path for uniform treatment.
 template <size_t D, size_t BitWidth>
 inline void convert_nbit_to_distances_with_bounds(
     const RaBitQQuery<D>& query,
@@ -219,7 +222,7 @@ inline void convert_nbit_to_distances_with_bounds(
     float* out_dist,
     float* out_lower,
     float /*parent_norm*/,
-    float /*dist_qp_sq*/)
+    float dist_qp_sq)
 {
     constexpr float K = static_cast<float>((1u << BitWidth) - 1);
     constexpr float inv_K = 1.0f / K;
@@ -228,45 +231,48 @@ inline void convert_nbit_to_distances_with_bounds(
     float B_nbit = query.coeff_popcount * inv_K;
     float C = query.coeff_constant;
     float query_norm = query.query_norm;
-    float query_norm_sq = query.query_norm_sq;
     float epsilon = query.error_epsilon;
 
     float A_msb = query.coeff_fastscan;
     float B_msb = query.coeff_popcount;
 
     for (size_t i = 0; i < count; ++i) {
-        // Full B-bit distance estimate (standard RaBitQ formula)
-        float ip_approx = A_nbit * static_cast<float>(nbit_fastscan_sums[i])
-                        + B_nbit * static_cast<float>(weighted_popcounts[i])
-                        + C;
+        // Full B-bit inner product estimate (weighted sum of bit planes)
+        float ip_approx_nbit = A_nbit * static_cast<float>(nbit_fastscan_sums[i])
+                             + B_nbit * static_cast<float>(weighted_popcounts[i])
+                             + C;
 
-        float ip_qo = aux[i].ip_quantized_original;
-        float ip_est = (ip_qo > 1e-10f) ? ip_approx / ip_qo : 0.0f;
+        float ip_qo_p = aux[i].ip_quantized_original;
+        float ip_est_nbit = (ip_qo_p > 1e-10f) ? ip_approx_nbit / ip_qo_p : 0.0f;
 
-        float dist_o = aux[i].dist_to_centroid;
-        out_dist[i] = dist_o * dist_o + query_norm_sq
-                    - 2.0f * dist_o * query_norm * ip_est;
+        // SymphonyQG parent-relative distance estimate:
+        //   ||q-o||² = (no² - np²) + ||q-p||² - 2*||q-c||*||o-p||*cos(q-c, o-p)
+        float nop = aux[i].dist_to_centroid;    // ||o-p||
+        float correction = aux[i].ip_xbar_Pinv_c;  // no² - np²
 
-        // Lower bound using MSB (1-bit) estimate + error bound
+        out_dist[i] = correction + dist_qp_sq
+                    - 2.0f * query_norm * nop * ip_est_nbit;
+
+        // Lower bound using MSB (1-bit) parent-relative ip + error bound
         float ip_approx_msb = A_msb * static_cast<float>(msb_fastscan_sums[i])
                             + B_msb * static_cast<float>(msb_popcounts[i])
                             + C;
 
-        float ip_qo_sq = ip_qo * ip_qo;
-        if (ip_qo_sq < 1e-10f) {
+        float ip_qo_p_sq = ip_qo_p * ip_qo_p;
+        if (ip_qo_p_sq < 1e-10f) {
             out_dist[i] = std::max(out_dist[i], 0.0f);
             out_lower[i] = std::max(out_dist[i], 0.0f);
             continue;
         }
-        float bound_on_ip = epsilon * std::sqrt(
-            (1.0f - ip_qo_sq) / (ip_qo_sq * static_cast<float>(D)));
+        float bound_on_cos = epsilon * std::sqrt(
+            (1.0f - ip_qo_p_sq) / (ip_qo_p_sq * static_cast<float>(D)));
 
-        float ip_est_msb = ip_approx_msb / ip_qo;
-        float ip_est_upper = std::min(ip_est_msb + bound_on_ip, 1.0f);
+        float ip_est_msb = ip_approx_msb / ip_qo_p;
+        float cos_upper = std::min(ip_est_msb + bound_on_cos, 1.0f);
 
         out_dist[i] = std::max(out_dist[i], 0.0f);
-        out_lower[i] = dist_o * dist_o + query_norm_sq
-                     - 2.0f * dist_o * query_norm * ip_est_upper;
+        out_lower[i] = correction + dist_qp_sq
+                      - 2.0f * query_norm * nop * cos_upper;
         if (out_lower[i] < 0.0f) out_lower[i] = 0.0f;
     }
 }

@@ -38,10 +38,9 @@ public:
 template <size_t D, size_t BitWidth = 1>
 class PyIndex : public PyIndexBase {
 public:
-    PyIndex(size_t dim, size_t ef_construction, uint64_t seed) {
+    PyIndex(size_t dim, uint64_t seed) {
         IndexParams params;
         params.dim = dim;
-        params.ef_construction = ef_construction;
         params.seed = seed;
         index_ = std::make_unique<RaBitQIndex<D, 32, BitWidth>>(params);
     }
@@ -78,10 +77,9 @@ private:
 template <size_t D, size_t BitWidth = 1>
 class PyHNSWIndex : public PyIndexBase {
 public:
-    PyHNSWIndex(size_t dim, size_t ef_construction, uint64_t seed) {
+    PyHNSWIndex(size_t dim, uint64_t seed) {
         IndexParams params;
         params.dim = dim;
-        params.ef_construction = ef_construction;
         params.seed = seed;
         index_ = std::make_unique<HNSWIndex<D, 32, BitWidth>>(params);
     }
@@ -123,15 +121,15 @@ static size_t padded_dim(size_t dim) {
 
 template <size_t BitWidth>
 static std::unique_ptr<PyIndexBase> create_index_with_bits(
-    size_t dim, size_t ef_construction, uint64_t seed)
+    size_t dim, uint64_t seed)
 {
     size_t pd = padded_dim(dim);
     switch (pd) {
-        case 128:  return std::make_unique<PyIndex<128, BitWidth>>(dim, ef_construction, seed);
-        case 256:  return std::make_unique<PyIndex<256, BitWidth>>(dim, ef_construction, seed);
-        case 512:  return std::make_unique<PyIndex<512, BitWidth>>(dim, ef_construction, seed);
-        case 1024: return std::make_unique<PyIndex<1024, BitWidth>>(dim, ef_construction, seed);
-        case 2048: return std::make_unique<PyIndex<2048, BitWidth>>(dim, ef_construction, seed);
+        case 128:  return std::make_unique<PyIndex<128, BitWidth>>(dim, seed);
+        case 256:  return std::make_unique<PyIndex<256, BitWidth>>(dim, seed);
+        case 512:  return std::make_unique<PyIndex<512, BitWidth>>(dim, seed);
+        case 1024: return std::make_unique<PyIndex<1024, BitWidth>>(dim, seed);
+        case 2048: return std::make_unique<PyIndex<2048, BitWidth>>(dim, seed);
         default:
             throw std::invalid_argument(
                 "Unsupported dimension " + std::to_string(dim) +
@@ -141,12 +139,12 @@ static std::unique_ptr<PyIndexBase> create_index_with_bits(
 }
 
 static std::unique_ptr<PyIndexBase> create_index(
-    size_t dim, size_t ef_construction, uint64_t seed, size_t bits)
+    size_t dim, uint64_t seed, size_t bits)
 {
     switch (bits) {
-        case 1: return create_index_with_bits<1>(dim, ef_construction, seed);
-        case 2: return create_index_with_bits<2>(dim, ef_construction, seed);
-        case 4: return create_index_with_bits<4>(dim, ef_construction, seed);
+        case 1: return create_index_with_bits<1>(dim, seed);
+        case 2: return create_index_with_bits<2>(dim, seed);
+        case 4: return create_index_with_bits<4>(dim, seed);
         default:
             throw std::invalid_argument(
                 "Unsupported bits=" + std::to_string(bits) +
@@ -160,15 +158,15 @@ static std::unique_ptr<PyIndexBase> create_index(
 
 template <size_t BitWidth>
 static std::unique_ptr<PyIndexBase> create_hnsw_with_bits(
-    size_t dim, size_t ef_construction, uint64_t seed)
+    size_t dim, uint64_t seed)
 {
     size_t pd = padded_dim(dim);
     switch (pd) {
-        case 128:  return std::make_unique<PyHNSWIndex<128, BitWidth>>(dim, ef_construction, seed);
-        case 256:  return std::make_unique<PyHNSWIndex<256, BitWidth>>(dim, ef_construction, seed);
-        case 512:  return std::make_unique<PyHNSWIndex<512, BitWidth>>(dim, ef_construction, seed);
-        case 1024: return std::make_unique<PyHNSWIndex<1024, BitWidth>>(dim, ef_construction, seed);
-        case 2048: return std::make_unique<PyHNSWIndex<2048, BitWidth>>(dim, ef_construction, seed);
+        case 128:  return std::make_unique<PyHNSWIndex<128, BitWidth>>(dim, seed);
+        case 256:  return std::make_unique<PyHNSWIndex<256, BitWidth>>(dim, seed);
+        case 512:  return std::make_unique<PyHNSWIndex<512, BitWidth>>(dim, seed);
+        case 1024: return std::make_unique<PyHNSWIndex<1024, BitWidth>>(dim, seed);
+        case 2048: return std::make_unique<PyHNSWIndex<2048, BitWidth>>(dim, seed);
         default:
             throw std::invalid_argument(
                 "Unsupported dimension " + std::to_string(dim) +
@@ -178,12 +176,12 @@ static std::unique_ptr<PyIndexBase> create_hnsw_with_bits(
 }
 
 static std::unique_ptr<PyIndexBase> create_hnsw(
-    size_t dim, size_t ef_construction, uint64_t seed, size_t bits)
+    size_t dim, uint64_t seed, size_t bits)
 {
     switch (bits) {
-        case 1: return create_hnsw_with_bits<1>(dim, ef_construction, seed);
-        case 2: return create_hnsw_with_bits<2>(dim, ef_construction, seed);
-        case 4: return create_hnsw_with_bits<4>(dim, ef_construction, seed);
+        case 1: return create_hnsw_with_bits<1>(dim, seed);
+        case 2: return create_hnsw_with_bits<2>(dim, seed);
+        case 4: return create_hnsw_with_bits<4>(dim, seed);
         default:
             throw std::invalid_argument(
                 "Unsupported bits=" + std::to_string(bits) +
@@ -199,17 +197,10 @@ PYBIND11_MODULE(_core, m) {
     m.doc() = "CP-HNSW: Zero-tuning RaBitQ approximate nearest neighbor search";
 
     py::class_<PyIndexBase>(m, "Index")
-        .def(py::init([](size_t dim, size_t M, size_t ef_construction, uint64_t seed, size_t bits) {
-            if (M != 32) {
-                throw std::invalid_argument(
-                    "M=" + std::to_string(M) +
-                    " not supported. Graph degree is compiled with R=32; only M=32 is valid.");
-            }
-            return create_index(dim, ef_construction, seed, bits);
+        .def(py::init([](size_t dim, uint64_t seed, size_t bits) {
+            return create_index(dim, seed, bits);
         }),
             py::arg("dim"),
-            py::arg("M") = 32,
-            py::arg("ef_construction") = 200,
             py::arg("seed") = 42,
             py::arg("bits") = 1)
 
@@ -235,31 +226,19 @@ PYBIND11_MODULE(_core, m) {
         }, py::arg("vectors"),
            "Add vector(s) to the index. Accepts (dim,) or (n, dim) arrays.")
 
-        .def("finalize", [](PyIndexBase& self, bool verbose,
-                            size_t ef_construction, size_t num_threads,
-                            float error_tolerance, float error_epsilon) {
+        .def("finalize", [](PyIndexBase& self, bool verbose, size_t num_threads) {
             BuildParams params;
             params.verbose = verbose;
-            params.ef_construction = ef_construction;
             params.num_threads = num_threads;
-            params.error_tolerance = error_tolerance;
-            params.error_epsilon = error_epsilon;
             py::gil_scoped_release release;
             self.finalize(params);
         }, py::arg("verbose") = false,
-           py::arg("ef_construction") = 0,
            py::arg("num_threads") = 0,
-           py::arg("error_tolerance") = -1.0f,
-           py::arg("error_epsilon") = 0.0f,
-           "Finalize the index (adaptive two-pass graph construction).\n"
-           "All parameters auto-derive from data statistics by default.\n"
-           "Set ef_construction>0 to override beam width.\n"
-           "Set error_tolerance>=0 to override quantization error margin.\n"
-           "Set error_epsilon>0 to override bound looseness.")
+           "Finalize the index. All construction parameters are derived automatically.")
 
         .def("search", [](const PyIndexBase& self,
                           py::array_t<float, py::array::c_style | py::array::forcecast> query,
-                          size_t k, size_t ef, float error_epsilon, float recall_target) {
+                          size_t k, float recall_target) {
             auto buf = query.request();
             if (buf.ndim != 1 || static_cast<size_t>(buf.shape[0]) != self.dim())
                 throw std::invalid_argument("Query must be 1D array matching index dimension");
@@ -267,8 +246,6 @@ PYBIND11_MODULE(_core, m) {
 
             SearchParams params;
             params.k = k;
-            params.ef = ef;
-            params.error_epsilon = error_epsilon;
             params.recall_target = recall_target;
 
             std::vector<SearchResult> results;
@@ -287,16 +264,13 @@ PYBIND11_MODULE(_core, m) {
                 dist_ptr[i] = results[i].distance;
             }
             return std::make_pair(ids, distances);
-        }, py::arg("query"), py::arg("k") = 10, py::arg("ef") = 0,
-           py::arg("error_epsilon") = 0.0f, py::arg("recall_target") = 0.95f,
+        }, py::arg("query"), py::arg("k") = 10, py::arg("recall_target") = 0.95f,
            "Search for k nearest neighbors. Returns (ids, distances) arrays.\n"
-           "By default, ef and error_epsilon auto-derive from recall_target.\n"
-           "Set ef>0 or error_epsilon>0 to override.")
+           "recall_target controls the quality/speed tradeoff (default 0.95).")
 
         .def("search_batch", [](const PyIndexBase& self,
                                py::array_t<float, py::array::c_style | py::array::forcecast> queries,
-                               size_t k, size_t ef, int n_threads,
-                               float error_epsilon, float recall_target) {
+                               size_t k, int n_threads, float recall_target) {
             auto buf = queries.request();
             if (buf.ndim != 2 || static_cast<size_t>(buf.shape[1]) != self.dim())
                 throw std::invalid_argument("queries must be (n, dim) array");
@@ -307,8 +281,6 @@ PYBIND11_MODULE(_core, m) {
 
             SearchParams params;
             params.k = k;
-            params.ef = ef;
-            params.error_epsilon = error_epsilon;
             params.recall_target = recall_target;
 
             py::array_t<int64_t> ids({n, k});
@@ -333,11 +305,9 @@ PYBIND11_MODULE(_core, m) {
                 }
             }
             return std::make_pair(ids, distances);
-        }, py::arg("queries"), py::arg("k") = 10, py::arg("ef") = 0,
-           py::arg("n_threads") = 0, py::arg("error_epsilon") = 0.0f,
-           py::arg("recall_target") = 0.95f,
-           "Batch search for k nearest neighbors (OpenMP parallel). Returns (ids, distances) as (n,k) arrays.\n"
-           "By default, ef and error_epsilon auto-derive from recall_target.")
+        }, py::arg("queries"), py::arg("k") = 10,
+           py::arg("n_threads") = 0, py::arg("recall_target") = 0.95f,
+           "Batch search for k nearest neighbors (OpenMP parallel). Returns (ids, distances) as (n,k) arrays.")
 
         .def_property_readonly("size", &PyIndexBase::size,
                                "Number of vectors in the index.")
@@ -352,17 +322,10 @@ PYBIND11_MODULE(_core, m) {
            "Save the index graph to a binary file.");
 
     // HNSW multi-layer index — factory function returning same PyIndexBase interface
-    m.def("HNSWIndex", [](size_t dim, size_t M, size_t ef_construction, uint64_t seed, size_t bits) {
-        if (M != 32) {
-            throw std::invalid_argument(
-                "M=" + std::to_string(M) +
-                " not supported. Graph degree is compiled with R=32; only M=32 is valid.");
-        }
-        return create_hnsw(dim, ef_construction, seed, bits);
+    m.def("HNSWIndex", [](size_t dim, uint64_t seed, size_t bits) {
+        return create_hnsw(dim, seed, bits);
     },
         py::arg("dim"),
-        py::arg("M") = 32,
-        py::arg("ef_construction") = 200,
         py::arg("seed") = 42,
         py::arg("bits") = 1,
         "Create an HNSW multi-layer index. Same interface as Index but uses "

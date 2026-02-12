@@ -84,24 +84,8 @@ public:
 
     void finalize(const BuildParams& params) {
         if (needs_build_) {
-            // Resolve adaptive defaults from sentinels
-            size_t ef_c = params.ef_construction > 0
-                ? params.ef_construction
-                : AdaptiveDefaults::ef_construction(graph_.size(), R);
-            float err_tol = params.error_tolerance >= 0.0f
-                ? params.error_tolerance
-                : AdaptiveDefaults::error_tolerance(D);
-            float err_eps = params.error_epsilon > 0.0f
-                ? params.error_epsilon
-                : AdaptiveDefaults::ERROR_EPSILON_BUILD;
-
-            if (params.verbose)
-                printf("[RaBitQIndex] Running graph optimization (ef_c=%zu, err_tol=%.4f, err_eps=%.3f)...\n",
-                       ef_c, err_tol, err_eps);
-
-            Refinement::optimize_graph_adaptive(graph_, encoder_,
-                ef_c, err_tol, err_eps, params.num_threads, params.verbose);
-
+            Refinement::optimize_graph_adaptive(
+                graph_, encoder_, params.num_threads, params.verbose);
             needs_build_ = false;
         }
         finalized_ = true;
@@ -117,18 +101,13 @@ public:
     {
         if (graph_.empty()) return {};
 
-        // Resolve adaptive defaults from sentinels
-        size_t ef = params.ef > 0
-            ? params.ef
-            : AdaptiveDefaults::ef_search(params.k, params.recall_target);
-        float eps = params.error_epsilon > 0.0f
-            ? params.error_epsilon
-            : AdaptiveDefaults::error_epsilon_search(params.recall_target);
+        float gamma = AdaptiveDefaults::gamma_from_recall(params.recall_target, D);
+        float eps = AdaptiveDefaults::error_epsilon_search(params.recall_target);
 
         QueryType encoded = encoder_.encode_query(query);
         encoded.error_epsilon = eps;
 
-        return Engine::search(encoded, query, graph_, ef, params.k);
+        return Engine::search(encoded, query, graph_, params.k, gamma);
     }
 
     std::vector<SearchResult> search(const float* query, size_t k) const {

@@ -12,8 +12,7 @@ void test_nbit_index(size_t actual_dim, size_t num_vecs) {
     std::cout << "Testing D=" << D << " BitWidth=" << BitWidth
               << " n=" << num_vecs << "..." << std::flush;
 
-    RaBitQIndex<D, 32, BitWidth> index(
-        IndexParams().set_dim(actual_dim).set_ef_construction(100));
+    RaBitQIndex<D, 32, BitWidth> index(IndexParams().set_dim(actual_dim));
 
     std::mt19937 rng(42);
     std::normal_distribution<float> dist(0.0f, 1.0f);
@@ -39,7 +38,7 @@ void test_nbit_index(size_t actual_dim, size_t num_vecs) {
               << " max_deg=" << stats.max_degree;
 
     // Search
-    auto results = index.search(vecs.data(), SearchParams().set_k(5).set_ef(50));
+    auto results = index.search(vecs.data(), SearchParams().set_k(5));
     std::cout << " search_results=" << results.size();
 
     // Verify first result is the query itself (should be nearest)

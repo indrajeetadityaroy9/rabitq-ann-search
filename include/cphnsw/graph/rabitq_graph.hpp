@@ -181,6 +181,66 @@ public:
         return best;
     }
 
+    // Hub entry point selection (inspired by GATE, arXiv:2506.15986).
+    // Selects the highest-degree node among the top-sqrt(n) closest to centroid.
+    // Called after graph construction when degree information is available.
+    // Falls back to medoid if graph has no edges.
+    NodeId find_hub_entry() const {
+        if (empty()) return INVALID_NODE;
+
+        size_t n = vertices_.size();
+
+        // Compute centroid
+        std::vector<double> centroid(dim_, 0.0);
+        for (size_t i = 0; i < n; ++i) {
+            const float* v = vertices_[i].vector;
+            for (size_t j = 0; j < dim_; ++j) {
+                centroid[j] += v[j];
+            }
+        }
+        double inv_n = 1.0 / n;
+        for (size_t j = 0; j < dim_; ++j) centroid[j] *= inv_n;
+
+        // Compute distances to centroid
+        struct CentroidDist {
+            NodeId id;
+            double dist;
+            bool operator<(const CentroidDist& o) const { return dist < o.dist; }
+        };
+
+        size_t top_k = std::max<size_t>(1, static_cast<size_t>(std::sqrt(static_cast<double>(n))));
+        std::vector<CentroidDist> dists(n);
+        for (size_t i = 0; i < n; ++i) {
+            const float* v = vertices_[i].vector;
+            double dist = 0.0;
+            for (size_t j = 0; j < dim_; ++j) {
+                double d = v[j] - centroid[j];
+                dist += d * d;
+            }
+            dists[i] = {static_cast<NodeId>(i), dist};
+        }
+
+        // Partial sort to get top-sqrt(n) closest
+        if (top_k < n) {
+            std::partial_sort(dists.begin(), dists.begin() + top_k, dists.end());
+        }
+
+        // Among top_k closest, select highest degree
+        NodeId best = dists[0].id;
+        size_t best_degree = vertices_[best].neighbors.size();
+
+        for (size_t i = 1; i < top_k && i < n; ++i) {
+            NodeId cand = dists[i].id;
+            size_t deg = vertices_[cand].neighbors.size();
+            if (deg > best_degree) {
+                best_degree = deg;
+                best = cand;
+            }
+        }
+
+        return best;
+    }
+
 private:
     size_t dim_;
     std::vector<VertexDataType, AlignedAllocator<VertexDataType>> vertices_;

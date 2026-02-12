@@ -69,19 +69,34 @@ public:
         bool operator>(const BeamEntry& o) const { return est_distance > o.est_distance; }
     };
 
-    // Core search with explicit entry point and visitation table.
-    // If entry == INVALID_NODE, uses graph.entry_point().
+    // Core search with two principled termination mechanisms:
+    //
+    // 1. Lower-bound pruning (RaBitQ Theorem 3.2):
+    //    Candidates whose guaranteed lower bound on true distance exceeds
+    //    the k-th best exact distance are skipped. The error_epsilon in the
+    //    query controls tightness: epsilon = sqrt(-2*ln(1-recall_target)),
+    //    giving a false-prune rate of exactly (1-recall_target).
+    //
+    // 2. DABS termination with exact distances:
+    //    After computing a candidate's exact distance, terminate if
+    //    exact_dist > (1+gamma) * nn.worst_distance(). Both sides are exact
+    //    L2 distances — no noisy-vs-exact mismatch. The k-th best distance
+    //    is the natural threshold for k-NN search.
+    //    gamma = epsilon/sqrt(D) from Theorem 3.2 error scaling.
+    //
+    // ef_cap is a hard safety cap on beam size (default 4096).
     static std::vector<SearchResult> search(
         const QueryType& query,
         const float* raw_query,
         const Graph& graph,
-        size_t ef,
         size_t k,
+        float gamma,
         TwoLevelVisitationTable& visited,
+        size_t ef_cap = 4096,
         NodeId entry = INVALID_NODE)
     {
         if (graph.empty()) return {};
-        if (k == 0) k = ef;
+        if (k == 0) k = 10;
 
         NodeId ep = (entry != INVALID_NODE) ? entry : graph.entry_point();
         if (ep == INVALID_NODE) return {};
@@ -92,18 +107,33 @@ public:
                            std::greater<BeamEntry>> beam;
         BoundedMaxHeap<SearchResult> nn(k);
 
-        // Entry-point distance estimation
+        // Unified entry-point distance estimation for all bit widths
         float ep_est;
         if constexpr (BitWidth == 1) {
             ep_est = Policy::compute_distance(query, graph.get_code(ep));
         } else {
             const auto& nbit_code = graph.get_code(ep);
-            RaBitQCode<D> compat;
-            compat.signs = nbit_code.codes.msb_as_binary();
-            compat.dist_to_centroid = nbit_code.dist_to_centroid;
-            compat.ip_quantized_original = nbit_code.ip_quantized_original;
-            compat.code_popcount = nbit_code.msb_popcount;
-            ep_est = Policy::compute_distance(query, compat);
+            float dist_o = nbit_code.dist_to_centroid;
+            float ip_qo = nbit_code.ip_quantized_original;
+            constexpr size_t NUM_SUB_SEGMENTS = (D + 3) / 4;
+            uint32_t fastscan_sum = 0;
+            auto msb_signs = nbit_code.codes.msb_as_binary();
+            for (size_t j = 0; j < NUM_SUB_SEGMENTS; ++j) {
+                size_t bit_base = j * 4;
+                uint8_t pattern = 0;
+                for (size_t b = 0; b < 4 && (bit_base + b) < D; ++b) {
+                    if (msb_signs.get_bit(bit_base + b)) {
+                        pattern |= (1 << b);
+                    }
+                }
+                fastscan_sum += query.lut[j][pattern];
+            }
+            float ip_approx = query.coeff_fastscan * static_cast<float>(fastscan_sum)
+                            + query.coeff_popcount * static_cast<float>(nbit_code.msb_popcount)
+                            + query.coeff_constant;
+            float ip_est = (ip_qo > 1e-10f) ? ip_approx / ip_qo : 0.0f;
+            ep_est = dist_o * dist_o + query.query_norm_sq
+                   - 2.0f * dist_o * query.query_norm * ip_est;
         }
         beam.push({ep_est, 0.0f, ep});
         visited.check_and_mark_estimated(ep, query_id);
@@ -126,13 +156,19 @@ public:
             }
             if (!found) break;
 
-            // Early termination: best estimated candidate is worse than k-th exact
-            if (nn.size() >= k && current.est_distance > nn.top().distance) break;
+            // Estimate-based pre-filter: the beam is ordered by est_distance,
+            // so all remaining entries have est_distance >= current. If the
+            // best remaining estimate already exceeds the distance-adaptive
+            // threshold, terminate without computing exact L2.
+            if (nn.size() >= k && current.est_distance > (1.0f + gamma) * nn.worst_distance()) break;
 
-            // Prefetch top 2 beam candidates' vertex data for reduced cache misses
+            // Lower-bound pruning (Theorem 3.2): skip candidates whose
+            // guaranteed lower bound exceeds the k-th best exact distance.
+            if (nn.size() >= k && current.lower_bound > nn.worst_distance()) continue;
+
+            // Prefetch top 2 beam candidates
             if (!beam.empty()) {
                 graph.prefetch_vertex(beam.top().id);
-                // Peek at second-best candidate by temporarily popping
                 BeamEntry first_beam = beam.top();
                 beam.pop();
                 if (!beam.empty()) {
@@ -141,9 +177,6 @@ public:
                 beam.push(first_beam);
             }
 
-            // Two-stage check: skip exact distance if lower bound exceeds k-th best
-            if (nn.size() >= k && current.lower_bound > nn.top().distance) continue;
-
             visited.check_and_mark_visited(current.id, query_id);
             prefetch_t<0>(graph.get_vector(current.id));
 
@@ -151,6 +184,11 @@ public:
             float exact_dist = l2_distance_simd<D>(raw_query, vertex_vec);
 
             nn.push({current.id, exact_dist});
+
+            // Exact-distance termination: catches cases where the RaBitQ
+            // estimate undershot the threshold (passed pre-filter) but the
+            // true L2 distance exceeds it. Avoids expanding bad neighborhoods.
+            if (nn.size() >= k && exact_dist > (1.0f + gamma) * nn.worst_distance()) break;
 
             const auto& nb = graph.get_neighbors(current.id);
             size_t n_neighbors = nb.size();
@@ -193,22 +231,22 @@ public:
             for (size_t i = 0; i < n_neighbors; ++i) {
                 NodeId neighbor_id = nb.neighbor_ids[i];
                 if (neighbor_id == INVALID_NODE) continue;
-                if (visited.is_visited(neighbor_id, query_id)) continue;
+                if (visited.check_and_mark_estimated(neighbor_id, query_id)) continue;
 
                 float est_dist = est_distances[i];
                 float lower = lower_bounds[i];
-                if (nn.size() >= k && lower >= nn.top().distance) continue;
+                if (nn.size() >= k && lower >= nn.worst_distance()) continue;
 
-                visited.check_and_mark_estimated(neighbor_id, query_id);
                 beam.push({est_dist, lower, neighbor_id});
                 graph.prefetch_vertex(neighbor_id);
             }
 
-            if (beam.size() > ef * 4) {
+            // Hard beam size cap
+            if (beam.size() > ef_cap * 2) {
                 std::priority_queue<BeamEntry, std::vector<BeamEntry>,
                                    std::greater<BeamEntry>> new_beam;
                 size_t kept = 0;
-                while (!beam.empty() && kept < ef) {
+                while (!beam.empty() && kept < ef_cap) {
                     new_beam.push(beam.top());
                     beam.pop();
                     kept++;
@@ -220,19 +258,19 @@ public:
         return nn.extract_sorted();
     }
 
-    // Convenience: thread-local visitation, default entry point
+    // Convenience: thread-local visitation, default parameters
     static std::vector<SearchResult> search(
         const QueryType& query,
         const float* raw_query,
         const Graph& graph,
-        size_t ef,
-        size_t k = 10)
+        size_t k,
+        float gamma)
     {
         thread_local TwoLevelVisitationTable visited(0);
         if (visited.capacity() < graph.size()) {
             visited.resize(graph.size() + 1024);
         }
-        return search(query, raw_query, graph, ef, k, visited, INVALID_NODE);
+        return search(query, raw_query, graph, k, gamma, visited);
     }
 
     // Search from a custom entry node (for HNSW upper-layer routing)
@@ -241,14 +279,14 @@ public:
         const float* raw_query,
         const Graph& graph,
         NodeId entry,
-        size_t ef,
-        size_t k = 10)
+        size_t k,
+        float gamma)
     {
         thread_local TwoLevelVisitationTable visited(0);
         if (visited.capacity() < graph.size()) {
             visited.resize(graph.size() + 1024);
         }
-        return search(query, raw_query, graph, ef, k, visited, entry);
+        return search(query, raw_query, graph, k, gamma, visited, 4096, entry);
     }
 };
 
@@ -261,14 +299,13 @@ struct ExactL2Policy {
 };
 
 // Policy-parameterized beam search engine for graph construction.
-// DistancePolicy must provide: template<size_t D> static float compute(const float* a, const float* b)
 template <size_t D, size_t R = 32, size_t BitWidth = 1, typename DistancePolicy = ExactL2Policy>
 class GraphSearchEngine {
 public:
     using Graph = RaBitQGraph<D, R, BitWidth>;
 
     struct BeamEntry {
-        float distance;  // from policy
+        float distance;
         NodeId id;
         bool operator>(const BeamEntry& o) const { return distance > o.distance; }
     };
@@ -348,21 +385,14 @@ public:
     }
 };
 
-// Backward-compatible alias: ExactL2SearchEngine is GraphSearchEngine with ExactL2Policy
-template <size_t D, size_t R = 32, size_t BitWidth = 1>
-using ExactL2SearchEngine = GraphSearchEngine<D, R, BitWidth, ExactL2Policy>;
-
 // Quantized construction search engine.
-// Wraps RaBitQSearchEngine to provide FastScan-guided beam search for graph
-// construction. Each inserted vector is encoded as a query, then the existing
-// SIMD FastScan + lower-bound machinery guides candidate exploration.
-// Results always contain exact L2 distances (computed per beam expansion).
+// Wraps RaBitQSearchEngine for graph construction.
 template <size_t D, size_t R = 32, size_t BitWidth = 1>
 class QuantizedBuildSearchEngine {
 public:
     using Graph = RaBitQGraph<D, R, BitWidth>;
 
-    // Core overload: explicit visitation table and entry point (for insertion pass)
+    // Core overload: explicit visitation table and entry point
     template <typename EncoderType>
     static std::vector<SearchResult> search(
         const float* raw_query,
@@ -376,11 +406,13 @@ public:
         if (graph.empty()) return {};
         auto query = encoder.encode_query(raw_query);
         query.error_epsilon = error_epsilon;
+        // Use a generous gamma for construction (explore more broadly)
+        float gamma = 0.5f;
         return RaBitQSearchEngine<D, R, BitWidth>::search(
-            query, raw_query, graph, ef, k, visited, entry);
+            query, raw_query, graph, k, gamma, visited, ef, entry);
     }
 
-    // Convenience overload: thread-local visitation (for refinement pass)
+    // Convenience overload: thread-local visitation
     template <typename EncoderType>
     static std::vector<SearchResult> search(
         const float* raw_query,
@@ -392,8 +424,13 @@ public:
         if (graph.empty()) return {};
         auto query = encoder.encode_query(raw_query);
         query.error_epsilon = error_epsilon;
+        float gamma = 0.5f;
+        thread_local TwoLevelVisitationTable visited(0);
+        if (visited.capacity() < graph.size()) {
+            visited.resize(graph.size() + 1024);
+        }
         return RaBitQSearchEngine<D, R, BitWidth>::search(
-            query, raw_query, graph, ef, k);
+            query, raw_query, graph, k, gamma, visited, ef);
     }
 };
 

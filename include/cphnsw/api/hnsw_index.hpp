@@ -79,27 +79,15 @@ public:
         size_t n = graph_.size();
         if (n == 0 || !needs_build_) { finalized_ = true; return; }
 
-        // Resolve adaptive defaults from sentinels
-        size_t ef_c = params.ef_construction > 0
-            ? params.ef_construction
-            : AdaptiveDefaults::ef_construction(n, R);
-        float err_tol = params.error_tolerance >= 0.0f
-            ? params.error_tolerance
-            : AdaptiveDefaults::error_tolerance(D);
-        float err_eps = params.error_epsilon > 0.0f
-            ? params.error_epsilon
-            : AdaptiveDefaults::ERROR_EPSILON_BUILD;
-
         if (params.verbose) printf("[HNSW] Assigning layers to %zu nodes...\n", n);
         assign_layers(n);
 
         if (params.verbose) printf("[HNSW] Building %d upper layers...\n", max_level_);
         build_upper_layers(params.verbose);
 
-        if (params.verbose) printf("[HNSW] Optimizing layer 0 (ef_c=%zu, err_tol=%.4f, err_eps=%.3f)...\n",
-                                   ef_c, err_tol, err_eps);
-        Refinement::optimize_graph_adaptive(graph_, encoder_,
-            ef_c, err_tol, err_eps, params.num_threads, params.verbose);
+        if (params.verbose) printf("[HNSW] Optimizing layer 0...\n");
+        Refinement::optimize_graph_adaptive(
+            graph_, encoder_, params.num_threads, params.verbose);
 
         needs_build_ = false;
         finalized_ = true;
@@ -117,19 +105,14 @@ public:
     {
         if (graph_.empty()) return {};
 
-        // Resolve adaptive defaults from sentinels
-        size_t ef = params.ef > 0
-            ? params.ef
-            : AdaptiveDefaults::ef_search(params.k, params.recall_target);
-        float eps = params.error_epsilon > 0.0f
-            ? params.error_epsilon
-            : AdaptiveDefaults::error_epsilon_search(params.recall_target);
+        float gamma = AdaptiveDefaults::gamma_from_recall(params.recall_target);
+        float eps = AdaptiveDefaults::error_epsilon_search(params.recall_target);
 
         QueryType encoded = encoder_.encode_query(query);
         encoded.error_epsilon = eps;
 
         if (max_level_ <= 0 || entry_point_ == INVALID_NODE) {
-            return Engine::search(encoded, query, graph_, ef, params.k);
+            return Engine::search(encoded, query, graph_, params.k, gamma);
         }
 
         NodeId ep = entry_point_;
@@ -137,7 +120,7 @@ public:
             ep = greedy_search_layer(query, ep, level);
         }
 
-        return Engine::search_from(encoded, query, graph_, ep, ef, params.k);
+        return Engine::search_from(encoded, query, graph_, ep, params.k, gamma);
     }
 
     std::vector<SearchResult> search(const float* query, size_t k) const {
@@ -246,6 +229,8 @@ private:
 
     void build_upper_layers(bool verbose) {
         size_t n = graph_.size();
+        // Upper layers have O(log n) nodes; beam width = R is more than sufficient.
+        size_t upper_ef = R;
 
         std::vector<NodeId> insertion_order(n);
         for (size_t i = 0; i < n; ++i) insertion_order[i] = static_cast<NodeId>(i);
@@ -264,13 +249,14 @@ private:
 
             for (int level = std::min(node_level, max_level_); level >= 1; --level) {
                 auto candidates = search_upper_layer(
-                    graph_.get_vector(node), ep, level,
-                    std::min<size_t>(params_.ef_construction, 64));
+                    graph_.get_vector(node), ep, level, upper_ef);
 
                 auto dist_fn = [this](NodeId a, NodeId b) {
                     return exact_distance(graph_.get_vector(a), graph_.get_vector(b));
                 };
-                auto selected = select_neighbors_heuristic(std::move(candidates), M_UPPER, dist_fn);
+                auto zero_error_fn = [](NodeId) -> float { return 0.0f; };
+                auto selected = select_neighbors_alpha_cg(
+                    std::move(candidates), M_UPPER, dist_fn, zero_error_fn);
 
                 auto& node_neighbors = get_or_create_edge(level, node).neighbors;
                 node_neighbors.clear();
@@ -402,7 +388,9 @@ private:
         auto dist_fn = [this](NodeId a, NodeId b) {
             return exact_distance(graph_.get_vector(a), graph_.get_vector(b));
         };
-        auto selected = select_neighbors_heuristic(std::move(candidates), M_UPPER, dist_fn);
+        auto zero_error_fn = [](NodeId) -> float { return 0.0f; };
+        auto selected = select_neighbors_alpha_cg(
+            std::move(candidates), M_UPPER, dist_fn, zero_error_fn);
         nb.clear();
         nb.reserve(selected.size());
         for (const auto& s : selected) {

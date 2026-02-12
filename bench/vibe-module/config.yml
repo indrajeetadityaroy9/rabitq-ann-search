@@ -1,6 +1,5 @@
 float:
   any:
-  # --- CP-HNSW Flat (Vamana) variants ---
   - base_args: ['@metric']
     constructor: CPHNSW
     disabled: false
@@ -8,17 +7,16 @@ float:
     module: vibe.algorithms.cphnsw
     name: cphnsw
     run_groups:
-      M-32-1bit:
-        args: [[32], [200], [1]]
-        query_args: [[10, 20, 40, 80, 100, 200, 400, 600, 800]]
-      M-32-2bit:
-        args: [[32], [200], [2]]
-        query_args: [[10, 20, 40, 80, 100, 200, 400, 600, 800]]
-      M-32-4bit:
-        args: [[32], [200], [4]]
-        query_args: [[10, 20, 40, 80, 100, 200, 400, 600, 800]]
+      bits-1:
+        args: [[1]]
+        query_args: [[0.80, 0.90, 0.95, 0.97, 0.99]]
+      bits-2:
+        args: [[2]]
+        query_args: [[0.80, 0.90, 0.95, 0.97, 0.99]]
+      bits-4:
+        args: [[4]]
+        query_args: [[0.80, 0.90, 0.95, 0.97, 0.99]]
 
-  # --- CP-HNSW HNSW (multi-layer) variants ---
   - base_args: ['@metric']
     constructor: CPHNSWHnsw
     disabled: false
@@ -26,17 +24,16 @@ float:
     module: vibe.algorithms.cphnsw
     name: cphnsw-hnsw
     run_groups:
-      M-32-1bit:
-        args: [[32], [200], [1]]
-        query_args: [[10, 20, 40, 80, 100, 200, 400, 600, 800]]
-      M-32-2bit:
-        args: [[32], [200], [2]]
-        query_args: [[10, 20, 40, 80, 100, 200, 400, 600, 800]]
-      M-32-4bit:
-        args: [[32], [200], [4]]
-        query_args: [[10, 20, 40, 80, 100, 200, 400, 600, 800]]
+      bits-1:
+        args: [[1]]
+        query_args: [[0.80, 0.90, 0.95, 0.97, 0.99]]
+      bits-2:
+        args: [[2]]
+        query_args: [[0.80, 0.90, 0.95, 0.97, 0.99]]
+      bits-4:
+        args: [[4]]
+        query_args: [[0.80, 0.90, 0.95, 0.97, 0.99]]
 
-  # --- CP-HNSW GPU batch variant ---
   - base_args: ['@metric']
     constructor: CPHNSWGpu
     disabled: false
@@ -45,6 +42,6 @@ float:
     module: vibe.algorithms.cphnsw
     name: cphnsw-gpu
     run_groups:
-      M-32-1bit:
-        args: [[32], [200], [1]]
-        query_args: [[10, 20, 40, 80, 100, 200, 400, 600, 800]]
+      bits-1:
+        args: [[1]]
+        query_args: [[0.80, 0.90, 0.95, 0.97, 0.99]]

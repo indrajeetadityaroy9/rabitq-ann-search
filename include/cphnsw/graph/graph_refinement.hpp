@@ -20,21 +20,6 @@
 
 namespace cphnsw {
 
-// NN-Descent graph construction with α-CG pruning.
-//
-// Construction pipeline (no ef parameter, no beam search):
-//   Phase 1: Random neighbor initialization (parallel)
-//   Phase 2: NN-Descent local join iterations (δ-convergence)
-//   Phase 3: α-CG pruning + FastScan encoding
-//   Phase 4: Reverse edge pass (bidirectional connectivity)
-//   Phase 5: Hub entry point selection
-//
-// The key insight from NN-Descent (Wei Dong et al., 2011) is that
-// "neighbors of neighbors are likely neighbors". Instead of running
-// a beam search per node (which requires an ef parameter), we iteratively
-// introduce each node's neighbors to each other. Convergence is detected
-// by counting edge updates: when fewer than δ*n*R edges change (δ=0.001),
-// the graph is stable. This is dataset-agnostic.
 
 template <size_t D, size_t R = 32, size_t BitWidth = 1>
 class GraphRefinement {
@@ -42,15 +27,11 @@ public:
     using Graph = RaBitQGraph<D, R, BitWidth>;
     static constexpr size_t GraphR = R;
 
-    // ── Working neighbor entry for NN-Descent iterations ──
-    // During NN-Descent, neighbors are stored as simple (id, distance) pairs.
-    // After convergence, they're converted to FastScan layout.
     struct WorkingNeighbor {
         NodeId id = INVALID_NODE;
         float distance = std::numeric_limits<float>::max();
     };
 
-    // ── Shared helper: prune candidates and write to neighbor block ──
 
     template <typename EncType>
     static void prune_and_write(Graph& graph, const EncType& encoder,
@@ -75,8 +56,6 @@ public:
         write_neighbors(graph, encoder, node, selected);
     }
 
-    // Write selected neighbors into a node's neighbor block.
-    // Uses SymphonyQG parent-relative encoding for all bit widths.
     template <typename EncType>
     static void write_neighbors(Graph& graph, const EncType& encoder,
                                 NodeId node, const std::vector<NeighborCandidate>& selected) {
@@ -101,7 +80,6 @@ public:
         }
     }
 
-    // ── Phase 1: Random working list initialization ──
 
     static void init_working_random(
         const Graph& graph,
@@ -123,7 +101,6 @@ public:
 
                 std::uniform_int_distribution<size_t> dist(0, n - 1);
 
-                // Sample candidates, deduplicate, keep R closest
                 std::vector<WorkingNeighbor> candidates;
                 candidates.reserve(GraphR * 3);
                 for (size_t j = 0; j < GraphR * 4 && candidates.size() < GraphR * 3; ++j) {
@@ -145,12 +122,6 @@ public:
         }
     }
 
-    // ── Phase 2: NN-Descent local join pass ──
-    //
-    // For each node u, gather candidates from neighbors-of-neighbors.
-    // Uses the "new/old" optimization: only traverses neighbors that were
-    // recently updated, dramatically reducing work in later iterations.
-    // Returns total edge updates across all nodes.
 
     static size_t nndescent_join_pass(
         const Graph& graph,
@@ -160,8 +131,6 @@ public:
     {
         size_t n = graph.size();
 
-        // Snapshot neighbor IDs and "new" flags for thread-safe reads.
-        // Each thread reads from snapshot (immutable) and writes only to its own node.
         struct SnapshotEntry {
             NodeId ids[R];
             uint8_t is_new[R];
@@ -176,11 +145,9 @@ public:
                 snapshot[i].ids[j] = working[i][j].id;
                 snapshot[i].is_new[j] = new_flags[i][j];
             }
-            // Clear new flags (will be set for newly inserted entries)
             std::fill(new_flags[i].begin(), new_flags[i].end(), 0);
         }
 
-        // Build reverse adjacency: reverse[v] = {u : v in snapshot[u]}
         std::vector<std::vector<NodeId>> reverse(n);
         for (size_t i = 0; i < n; ++i) {
             for (size_t j = 0; j < snapshot[i].count; ++j) {
@@ -195,7 +162,6 @@ public:
 
         #pragma omp parallel num_threads(actual_threads)
         {
-            // Thread-local candidate buffer
             std::vector<NodeId> candidates;
             candidates.reserve(GraphR * GraphR);
 
@@ -205,13 +171,11 @@ public:
                 const float* vec_u = graph.get_vector(u);
                 auto& wl = working[i];
 
-                // Check if this node has any "new" forward neighbors
                 bool has_new_forward = false;
                 for (size_t j = 0; j < snapshot[i].count; ++j) {
                     if (snapshot[i].is_new[j]) { has_new_forward = true; break; }
                 }
 
-                // Check if any reverse neighbor has "new" entries
                 bool has_new_reverse = false;
                 for (NodeId rv : reverse[i]) {
                     for (size_t j = 0; j < snapshot[rv].count; ++j) {
@@ -224,7 +188,6 @@ public:
 
                 candidates.clear();
 
-                // Current neighbor IDs for membership check (R=32 → linear scan is fine)
                 auto is_current_or_self = [&](NodeId w) -> bool {
                     if (w == u) return true;
                     for (const auto& nb : wl) {
@@ -233,7 +196,6 @@ public:
                     return false;
                 };
 
-                // Forward: traverse neighbors-of-"new"-neighbors
                 if (has_new_forward) {
                     for (size_t j = 0; j < snapshot[i].count; ++j) {
                         if (!snapshot[i].is_new[j]) continue;
@@ -248,9 +210,7 @@ public:
                     }
                 }
 
-                // Reverse: traverse neighbors-of-reverse-neighbors (if they have new entries)
                 for (NodeId rv : reverse[i]) {
-                    // Only traverse if rv has new entries (optimization)
                     bool rv_has_new = false;
                     for (size_t j = 0; j < snapshot[rv].count; ++j) {
                         if (snapshot[rv].is_new[j]) { rv_has_new = true; break; }
@@ -267,13 +227,11 @@ public:
 
                 if (candidates.empty()) continue;
 
-                // Dedup candidates
                 std::sort(candidates.begin(), candidates.end());
                 candidates.erase(
                     std::unique(candidates.begin(), candidates.end()),
                     candidates.end());
 
-                // Compute distances and try to insert
                 size_t local_updates = 0;
                 float worst = (wl.size() >= GraphR)
                     ? wl.back().distance
@@ -283,20 +241,16 @@ public:
                     float d = l2_distance_simd<D>(vec_u, graph.get_vector(w));
                     if (d >= worst && wl.size() >= GraphR) continue;
 
-                    // Insert into sorted working list, maintaining size <= GraphR
                     if (wl.size() < GraphR) {
                         wl.push_back({w, d});
                         new_flags[i].push_back(1);
-                        // Bubble into sorted position
                         for (size_t p = wl.size() - 1; p > 0 && wl[p].distance < wl[p-1].distance; --p) {
                             std::swap(wl[p], wl[p-1]);
                             std::swap(new_flags[i][p], new_flags[i][p-1]);
                         }
                     } else {
-                        // Replace worst (last) entry
                         wl.back() = {w, d};
                         new_flags[i].back() = 1;
-                        // Bubble into sorted position
                         for (size_t p = wl.size() - 1; p > 0 && wl[p].distance < wl[p-1].distance; --p) {
                             std::swap(wl[p], wl[p-1]);
                             std::swap(new_flags[i][p], new_flags[i][p-1]);
@@ -316,7 +270,6 @@ public:
         return total_updates.load();
     }
 
-    // ── Derive α from converged graph statistics (OPT-SNG inspired) ──
 
     static float derive_alpha_from_working(
         const Graph& graph,
@@ -369,7 +322,6 @@ public:
         return std::min(alpha, 2.0f);
     }
 
-    // ── Phase 4: Reverse edge pass ──
 
     template <typename EncType>
     static void run_reverse_edge_pass(Graph& graph, const EncType& encoder,
@@ -415,11 +367,6 @@ public:
         }
     }
 
-    // ── Main entry point: NN-Descent pipeline ──
-    //
-    // No ef_construction parameter. No beam search. No dataset-dependent caps.
-    // Convergence is controlled solely by δ (update rate threshold), which is
-    // the gold-standard dataset-agnostic stopping criterion from NN-Descent.
 
     template <typename EncType>
     static void optimize_graph_adaptive(Graph& graph, const EncType& encoder,
@@ -430,55 +377,37 @@ public:
         size_t actual_threads = num_threads ? num_threads : omp_get_max_threads();
         float error_tolerance = AdaptiveDefaults::error_tolerance(D);
 
-        // δ-convergence: stop when update rate drops below 0.1% of total edges.
-        // This is the standard NN-Descent threshold (Wei Dong et al., 2011).
         constexpr float DELTA = 0.001f;
         size_t delta_threshold = std::max<size_t>(1,
             static_cast<size_t>(DELTA * static_cast<float>(n) * static_cast<float>(GraphR)));
 
-        // Temporary entry point
         NodeId entry_point = graph.find_medoid();
         graph.set_entry_point(entry_point);
 
-        // Working neighbor lists (separate from FastScan layout)
         std::vector<std::vector<WorkingNeighbor>> working(n);
         std::vector<std::vector<uint8_t>> new_flags(n);
 
-        // Phase 1: Random initialization into working lists
-        if (verbose) printf("[Build] Phase 1: Random init (n=%zu, R=%zu, %zu threads)...\n",
-                           n, GraphR, actual_threads);
+        if (verbose) {
+            printf("event=graph_opt_start nodes=%zu degree=%zu threads=%zu delta=%.4f threshold=%zu\n",
+                   n, GraphR, actual_threads, DELTA, delta_threshold);
+        }
         init_working_random(graph, working, actual_threads);
 
-        // All initial entries are "new"
         for (size_t i = 0; i < n; ++i) {
             new_flags[i].assign(working[i].size(), 1);
         }
 
-        // Phase 2: NN-Descent local join iterations
-        if (verbose) printf("[Build] Phase 2: NN-Descent (delta=%.4f, threshold=%zu)...\n",
-                           DELTA, delta_threshold);
-
+        size_t converged_round = 20;
         for (size_t round = 0; round < 20; ++round) {
             size_t updates = nndescent_join_pass(graph, working, new_flags, actual_threads);
 
-            float update_rate = static_cast<float>(updates)
-                / (static_cast<float>(n) * static_cast<float>(GraphR));
-
-            if (verbose) printf("[Build]   Round %zu: %zu updates (%.3f%%)\n",
-                               round + 1, updates, 100.0f * update_rate);
-
             if (updates <= delta_threshold) {
-                if (verbose) printf("[Build]   Converged at round %zu\n", round + 1);
+                converged_round = round + 1;
                 break;
             }
         }
 
-        // Derive alpha from converged graph statistics
         float alpha = derive_alpha_from_working(graph, working);
-        if (verbose) printf("[Build] Derived alpha=%.3f\n", alpha);
-
-        // Phase 3: alpha-CG pruning + FastScan encoding
-        if (verbose) printf("[Build] Phase 3: alpha-CG pruning + FastScan encoding...\n");
 
         #pragma omp parallel for schedule(dynamic, 256) num_threads(actual_threads)
         for (size_t i = 0; i < n; ++i) {
@@ -493,21 +422,16 @@ public:
             prune_and_write(graph, encoder, u, candidates, alpha, error_tolerance);
         }
 
-        // Free working memory
         { std::vector<std::vector<WorkingNeighbor>>().swap(working); }
         { std::vector<std::vector<uint8_t>>().swap(new_flags); }
 
-        // Phase 4: Reverse edges
-        if (verbose) printf("[Build] Phase 4: Reverse edge pass...\n");
         run_reverse_edge_pass(graph, encoder, alpha, error_tolerance, actual_threads);
 
-        // Phase 5: Hub entry point
         NodeId hub = graph.find_hub_entry();
         graph.set_entry_point(hub);
         if (verbose) {
-            printf("[Build] Phase 5: Hub entry=%u (degree=%zu)\n",
-                   hub, graph.neighbor_count(hub));
-            printf("[Build] Done. avg_degree=%.1f, max_degree=%zu\n",
+            printf("event=graph_opt_done converged_round=%zu alpha=%.3f hub=%u hub_degree=%zu avg_degree=%.3f max_degree=%zu\n",
+                   converged_round, alpha, hub, graph.neighbor_count(hub),
                    graph.average_degree(), graph.max_degree());
         }
     }

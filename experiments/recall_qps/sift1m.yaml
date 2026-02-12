@@ -1,11 +1,10 @@
 index:
-  M: 32
-  ef_construction: 200
+  bits: 1
   seed: 42
 
 search:
   k: 10
-  ef_values: [10, 20, 40, 80, 100, 200, 400, 800]
+  recall_targets: [0.80, 0.90, 0.95, 0.97, 0.99]
 
 data:
   base_dir: data/

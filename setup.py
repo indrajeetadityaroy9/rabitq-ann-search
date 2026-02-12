@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from setuptools import Extension, setup
+from setuptools import Extension, find_packages, setup
 from setuptools.command.build_ext import build_ext
 
 
@@ -44,6 +44,5 @@ class CMakeBuild(build_ext):
 setup(
     ext_modules=[CMakeExtension("cphnsw._core")],
     cmdclass={"build_ext": CMakeBuild},
-    package_dir={"": "python"},
-    packages=["cphnsw"],
+    packages=find_packages(include=["cphnsw", "cphnsw.*"]),
 )

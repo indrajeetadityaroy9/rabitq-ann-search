@@ -1,4 +1,3 @@
-// Test HNSW hierarchical multi-layer index.
 #include <cphnsw/api/hnsw_index.hpp>
 #include <cphnsw/api/rabitq_index.hpp>
 #include <iostream>
@@ -16,7 +15,6 @@ int main() {
     std::mt19937 rng(42);
     std::normal_distribution<float> dist(0.0f, 1.0f);
 
-    // Generate random unit vectors
     std::vector<float> data(N * DIM);
     for (auto& v : data) v = dist(rng);
     for (size_t i = 0; i < N; ++i) {
@@ -27,8 +25,6 @@ int main() {
         for (size_t j = 0; j < DIM; ++j) vec[j] /= norm;
     }
 
-    std::cout << "=== HNSW Index Test (N=" << N << ", D=" << DIM << ") ===" << std::endl;
-
     HNSWIndex<128, 32, 1> index(IndexParams().set_dim(DIM));
 
     auto t0 = std::chrono::high_resolution_clock::now();
@@ -38,13 +34,13 @@ int main() {
     double build_time = std::chrono::duration<double>(t1 - t0).count();
 
     auto stats = index.get_stats();
-    std::cout << "Build time: " << build_time << "s" << std::endl;
-    std::cout << "Nodes: " << stats.num_nodes
-              << " avg_deg: " << stats.avg_degree
-              << " max_level: " << stats.max_level
-              << " above_layer0: " << stats.nodes_above_layer0 << std::endl;
+    std::cout << "event=hnsw_test_build"
+              << " build_time_s=" << build_time
+              << " nodes=" << stats.num_nodes
+              << " avg_degree=" << stats.avg_degree
+              << " max_level=" << stats.max_level
+              << " above_layer0=" << stats.nodes_above_layer0 << std::endl;
 
-    // Self-search: query each of the first 100 vectors, check if self is top-1
     size_t self_found = 0;
     size_t queries = std::min<size_t>(100, N);
 
@@ -60,12 +56,11 @@ int main() {
     auto t3 = std::chrono::high_resolution_clock::now();
     double search_time = std::chrono::duration<double>(t3 - t2).count();
 
-    std::cout << "Self-found: " << self_found << "/" << queries << std::endl;
-    std::cout << "Search time (" << queries << " queries): " << search_time << "s"
-              << " (" << queries / search_time << " QPS)" << std::endl;
-
-    // Compare with RaBitQIndex (flat single-layer) as baseline
-    std::cout << "\n=== RaBitQIndex (flat) Comparison ===" << std::endl;
+    std::cout << "event=hnsw_test_search"
+              << " self_found=" << self_found
+              << " queries=" << queries
+              << " search_time_s=" << search_time
+              << " qps=" << (queries / search_time) << std::endl;
 
     RaBitQIndex<128, 32, 1> flat_index(IndexParams().set_dim(DIM));
 
@@ -88,17 +83,16 @@ int main() {
     auto t7 = std::chrono::high_resolution_clock::now();
     double flat_search_time = std::chrono::duration<double>(t7 - t6).count();
 
-    std::cout << "Flat build time: " << flat_build_time << "s" << std::endl;
-    std::cout << "Flat self-found: " << flat_self_found << "/" << queries << std::endl;
-    std::cout << "Flat search time: " << flat_search_time << "s"
-              << " (" << queries / flat_search_time << " QPS)" << std::endl;
+    std::cout << "event=hnsw_test_flat"
+              << " build_time_s=" << flat_build_time
+              << " self_found=" << flat_self_found
+              << " queries=" << queries
+              << " search_time_s=" << flat_search_time
+              << " qps=" << (queries / flat_search_time) << std::endl;
 
-    if (self_found >= queries * 0.9) {
-        std::cout << "\n[PASS] HNSW index self-found >= 90%" << std::endl;
-    } else {
-        std::cout << "\n[WARN] HNSW index self-found < 90% (" << self_found << "/" << queries << ")" << std::endl;
-    }
-
-    std::cout << "\nHNSW test complete." << std::endl;
+    const bool pass = self_found >= queries * 0.9;
+    std::cout << "event=hnsw_test_result pass=" << (pass ? 1 : 0)
+              << " threshold=0.9 self_found=" << self_found
+              << " queries=" << queries << std::endl;
     return 0;
 }

@@ -1,35 +1,17 @@
-"""Evaluation metrics for approximate nearest neighbor search."""
+"""ANN evaluation metrics."""
 
 import numpy as np
 
 
 def recall_at_k(results: np.ndarray, ground_truth: np.ndarray, k: int) -> float:
-    """Compute recall@k.
-
-    Args:
-        results: (k,) array of returned neighbor IDs.
-        ground_truth: (k_gt,) array of true neighbor IDs.
-        k: Number of neighbors to evaluate.
-
-    Returns:
-        Fraction of true top-k neighbors found in results.
-    """
+    """Compute recall@k for one query."""
     gt_set = set(ground_truth[:k].tolist())
     hits = sum(1 for r in results[:k] if int(r) in gt_set)
     return hits / len(gt_set) if gt_set else 0.0
 
 
 def recall_at_k_batch(results: np.ndarray, ground_truth: np.ndarray, k: int) -> float:
-    """Compute mean recall@k over a batch of queries (vectorized).
-
-    Args:
-        results: (n_queries, >=k) array of returned neighbor IDs.
-        ground_truth: (n_queries, >=k) array of true neighbor IDs.
-        k: Number of neighbors to evaluate.
-
-    Returns:
-        Mean recall@k across all queries.
-    """
+    """Compute mean recall@k for batched queries."""
     if len(results) == 0:
         return 0.0
     res = results[:, :k]
@@ -39,18 +21,9 @@ def recall_at_k_batch(results: np.ndarray, ground_truth: np.ndarray, k: int) -> 
 
 
 def memory_usage(index) -> dict:
-    """Estimate memory usage of an index.
-
-    Args:
-        index: A cphnsw.Index instance.
-
-    Returns:
-        Dict with keys: n_vectors, dim, estimated_bytes, per_vector_bytes.
-    """
+    """Estimate index memory footprint."""
     n = index.size
     dim = index.dim
-    # Each vector: D/8 bytes binary code + 32 neighbor IDs (4B each)
-    #   + 32 packed code blocks + aux data + raw vector
     code_bytes = dim  # padded dim / 8 bits per byte (conservative)
     neighbor_bytes = 32 * 4  # 32 neighbor IDs
     aux_bytes = 32 * 12  # 32 * (3 floats)
@@ -67,13 +40,6 @@ def memory_usage(index) -> dict:
 
 
 def qps(latencies: np.ndarray) -> float:
-    """Compute queries per second from latency array.
-
-    Args:
-        latencies: Array of per-query latencies in seconds.
-
-    Returns:
-        Queries per second.
-    """
+    """Compute queries-per-second from latency samples."""
     mean_latency = np.mean(latencies)
     return 1.0 / mean_latency if mean_latency > 0 else 0.0

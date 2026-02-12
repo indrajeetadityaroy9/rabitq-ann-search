@@ -10,8 +10,6 @@
 
 namespace cphnsw {
 
-// Implements: Ψ(x) = H D3 H D2 H D1 x
-// H: Walsh-Hadamard matrix, D: Random diagonal matrices (±1)
 class RandomHadamardRotation {
 public:
     static constexpr size_t NUM_LAYERS = 3;

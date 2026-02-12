@@ -1,6 +1,4 @@
-/**
- * Master Evaluation Protocol for CP-HNSW PhD Portfolio
- */
+
 
 #include <cphnsw/api/rabitq_index.hpp>
 #include <iostream>
@@ -134,18 +132,17 @@ int main(int argc, char** argv) {
     RaBitQIndex<PADDED_DIM, 32> index(IndexParams().set_dim(sift.dim));
     Timer timer;
 
-    // Build phase with timing and memory tracking
     timer.start();
     index.add_batch(sift.base_vectors.data(), sift.num_base);
     index.finalize(BuildParams().set_verbose(true));
     double build_time_s = timer.elapsed_s();
     size_t rss_kb = get_rss_kb();
 
-    printf("\n[Metrics] Indexing: %.2f min | Memory: %.2f GiB\n",
-           build_time_s / 60.0, static_cast<double>(rss_kb) / (1024.0 * 1024.0));
-    printf("[Metrics] Throughput: %.0f vec/s\n\n", index.size() / build_time_s);
+    printf("event=benchmark_build build_time_min=%.3f memory_gib=%.3f throughput_vec_s=%.0f\n",
+           build_time_s / 60.0,
+           static_cast<double>(rss_kb) / (1024.0 * 1024.0),
+           index.size() / build_time_s);
 
-    // Search at different recall targets
     std::vector<float> recall_targets = {0.80f, 0.90f, 0.95f, 0.97f, 0.99f};
     for (float rt : recall_targets) {
         std::vector<double> latencies;
@@ -162,7 +159,7 @@ int main(int argc, char** argv) {
         double avg_latency = std::accumulate(latencies.begin(), latencies.end(), 0.0) / latencies.size();
         float gamma = AdaptiveDefaults::gamma_from_recall(rt, PADDED_DIM);
         float eps = AdaptiveDefaults::error_epsilon_search(rt);
-        printf("recall_target=%.2f  gamma=%.3f  eps=%.2f  Recall@10=%.4f  QPS=%.0f  p50=%.0fus  p99=%.0fus\n",
+        printf("event=benchmark_point recall_target=%.2f gamma=%.3f eps=%.2f recall_at_10=%.4f qps=%.0f p50_us=%.0f p99_us=%.0f\n",
                rt, gamma, eps, total_recall / sift.num_queries,
                1e6 / avg_latency,
                latencies[latencies.size() / 2],

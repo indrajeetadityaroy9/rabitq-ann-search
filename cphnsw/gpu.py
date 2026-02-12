@@ -1,4 +1,4 @@
-"""GPU-accelerated helpers for CP-HNSW using PyTorch CUDA."""
+"""GPU helpers for ANN evaluation."""
 
 import numpy as np
 
@@ -10,14 +10,7 @@ def _check_cuda():
 
 
 def gpu_normalize(X: np.ndarray) -> np.ndarray:
-    """Batch L2-normalize vectors on GPU.
-
-    Args:
-        X: (n, d) float32 array.
-
-    Returns:
-        (n, d) float32 array with unit L2 norms.
-    """
+    """L2-normalize vectors on GPU."""
     import torch
     _check_cuda()
     t = torch.from_numpy(X).cuda()
@@ -27,19 +20,7 @@ def gpu_normalize(X: np.ndarray) -> np.ndarray:
 
 def gpu_ground_truth(base: np.ndarray, queries: np.ndarray, k: int,
                      chunk_size: int = 512) -> np.ndarray:
-    """Brute-force kNN on GPU via PyTorch.
-
-    Computes exact L2 nearest neighbors. Handles 1M+ vectors on H100 (80 GB).
-
-    Args:
-        base: (n, d) float32 base vectors.
-        queries: (nq, d) float32 query vectors.
-        k: Number of neighbors.
-        chunk_size: Query batch size to avoid OOM.
-
-    Returns:
-        (nq, k) int64 array of neighbor IDs.
-    """
+    """Compute exact L2 kNN IDs on GPU."""
     import torch
     _check_cuda()
     base_t = torch.from_numpy(base).cuda()
@@ -57,16 +38,7 @@ def gpu_ground_truth(base: np.ndarray, queries: np.ndarray, k: int,
 
 def gpu_pairwise_distances(X: np.ndarray, Y: np.ndarray,
                            chunk_size: int = 1024) -> np.ndarray:
-    """Compute pairwise L2 distances on GPU.
-
-    Args:
-        X: (n, d) float32 array.
-        Y: (m, d) float32 array.
-        chunk_size: Row batch size for X to avoid OOM.
-
-    Returns:
-        (n, m) float32 distance matrix.
-    """
+    """Compute pairwise L2 distances on GPU."""
     import torch
     _check_cuda()
     Y_t = torch.from_numpy(Y).cuda()

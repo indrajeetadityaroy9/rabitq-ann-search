@@ -117,8 +117,6 @@ using FastScanNeighbors128_32 = FastScanNeighborBlock<128, 32, 32>;
 using FastScanNeighbors256_32 = FastScanNeighborBlock<256, 32, 32>;
 using FastScanNeighbors1024_32 = FastScanNeighborBlock<1024, 32, 32>;
 
-// === Multi-bit FastScan Layout (Extended RaBitQ) ===
-// One standard 1-bit FastScan code block per bit plane.
 
 template <size_t D, size_t BitWidth, size_t BatchSize = 32>
 struct NbitFastScanCodeBlock {
@@ -173,10 +171,6 @@ struct NbitFastScanNeighborBlock {
         if (slot >= count) count = static_cast<uint32_t>(slot + 1);
     }
 
-    // SymphonyQG: store parent-relative MSB codes in planes[0],
-    // global codes for remaining planes (planes[1..B-1]).
-    // This gives parent-relative lower bounds from MSB while keeping
-    // full B-bit distance estimates using global code data.
     void set_neighbor_with_pr_msb(size_t slot, uint32_t id,
                                    const BinaryCodeStorage<D>& pr_msb_code,
                                    const NbitCodeStorage<D, BitWidth>& global_code,
@@ -185,10 +179,8 @@ struct NbitFastScanNeighborBlock {
         size_t idx_in_batch = slot % BatchSize;
         neighbor_ids[slot] = id;
 
-        // planes[0] = parent-relative MSB (for lower bounds)
         code_blocks[batch].planes[0].store(idx_in_batch, pr_msb_code);
 
-        // planes[1..B-1] = global codes (for weighted distance estimate)
         for (size_t b = 1; b < BitWidth; ++b) {
             BinaryCodeStorage<D> plane_binary;
             std::memcpy(plane_binary.signs, global_code.planes[b],

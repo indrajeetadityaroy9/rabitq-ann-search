@@ -9,11 +9,6 @@
 
 namespace cphnsw {
 
-// Binary format:
-// Header: [magic(8)][version(4)][D(4)][R(4)][BitWidth(4)][n_nodes(8)][entry_point(4)][dim(4)]
-// Centroid: [dim * float]
-// Body: For each node: [code][neighbor_block][vector]
-//   - Written as raw bytes of VertexData<D,R,BitWidth>
 
 struct SerializationHeader {
     char magic[8] = {'R','B','Q','G','R','P','H', '\0'};
@@ -45,7 +40,6 @@ public:
 
         std::fwrite(&header, sizeof(header), 1, f);
 
-        // Write each vertex's data (code + neighbors + vector)
         for (size_t i = 0; i < graph.size(); ++i) {
             NodeId id = static_cast<NodeId>(i);
             const auto& code = graph.get_code(id);
@@ -86,7 +80,6 @@ public:
         using CodeType = typename VertexDataType::CodeType;
         using NeighborBlockType = typename VertexDataType::NeighborBlockType;
 
-        // First pass: add all nodes with codes and vectors
         for (uint64_t i = 0; i < header.num_nodes; ++i) {
             CodeType code;
             if (std::fread(&code, sizeof(code), 1, f) != 1) {
@@ -107,7 +100,6 @@ public:
             }
 
             NodeId id = graph.add_node(code, vec);
-            // Restore neighbor block
             graph.get_neighbors(id) = nb;
         }
 

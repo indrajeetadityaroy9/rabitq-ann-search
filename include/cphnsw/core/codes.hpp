@@ -92,8 +92,6 @@ struct RaBitQQuery {
     float inv_sqrt_d;
 };
 
-// === Extended RaBitQ: Multi-bit Code Storage (SIGMOD'25) ===
-// Bit-plane layout enables reuse of 1-bit FastScan kernel per plane.
 
 template <size_t D, size_t BitWidth>
 struct alignas(64) NbitCodeStorage {
@@ -102,7 +100,6 @@ struct alignas(64) NbitCodeStorage {
     static constexpr size_t BIT_WIDTH = BitWidth;
     static constexpr size_t NUM_WORDS = (D + 63) / 64;
 
-    // planes[0] = MSB, planes[BitWidth-1] = LSB
     uint64_t planes[BitWidth][NUM_WORDS];
 
     void clear() { std::memset(planes, 0, sizeof(planes)); }
@@ -142,7 +139,6 @@ struct alignas(64) NbitCodeStorage {
         return result;
     }
 
-    // sum_b 2^(B-1-b) * popcount(plane_b)
     uint32_t weighted_popcount() const {
         uint32_t total = 0;
         for (size_t b = 0; b < BitWidth; ++b) {

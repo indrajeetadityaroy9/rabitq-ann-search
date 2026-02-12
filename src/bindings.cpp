@@ -15,9 +15,6 @@
 namespace py = pybind11;
 using namespace cphnsw;
 
-// ============================================================================
-// Type-erased index wrapper (RaBitQIndex is templated on D, R, BitWidth)
-// ============================================================================
 
 class PyIndexBase {
 public:
@@ -70,9 +67,6 @@ private:
     std::unique_ptr<RaBitQIndex<D, 32, BitWidth>> index_;
 };
 
-// ============================================================================
-// Type-erased HNSW index wrapper
-// ============================================================================
 
 template <size_t D, size_t BitWidth = 1>
 class PyHNSWIndex : public PyIndexBase {
@@ -109,9 +103,6 @@ private:
     std::unique_ptr<HNSWIndex<D, 32, BitWidth>> index_;
 };
 
-// ============================================================================
-// Factory: select template instantiation based on dimension and bits
-// ============================================================================
 
 static size_t padded_dim(size_t dim) {
     size_t p = 1;
@@ -121,15 +112,30 @@ static size_t padded_dim(size_t dim) {
 
 template <size_t BitWidth>
 static std::unique_ptr<PyIndexBase> create_index_with_bits(
-    size_t dim, uint64_t seed)
+    size_t dim, uint64_t seed, bool hierarchical)
 {
     size_t pd = padded_dim(dim);
     switch (pd) {
-        case 128:  return std::make_unique<PyIndex<128, BitWidth>>(dim, seed);
-        case 256:  return std::make_unique<PyIndex<256, BitWidth>>(dim, seed);
-        case 512:  return std::make_unique<PyIndex<512, BitWidth>>(dim, seed);
-        case 1024: return std::make_unique<PyIndex<1024, BitWidth>>(dim, seed);
-        case 2048: return std::make_unique<PyIndex<2048, BitWidth>>(dim, seed);
+        case 128:
+            return hierarchical
+                ? std::make_unique<PyHNSWIndex<128, BitWidth>>(dim, seed)
+                : std::make_unique<PyIndex<128, BitWidth>>(dim, seed);
+        case 256:
+            return hierarchical
+                ? std::make_unique<PyHNSWIndex<256, BitWidth>>(dim, seed)
+                : std::make_unique<PyIndex<256, BitWidth>>(dim, seed);
+        case 512:
+            return hierarchical
+                ? std::make_unique<PyHNSWIndex<512, BitWidth>>(dim, seed)
+                : std::make_unique<PyIndex<512, BitWidth>>(dim, seed);
+        case 1024:
+            return hierarchical
+                ? std::make_unique<PyHNSWIndex<1024, BitWidth>>(dim, seed)
+                : std::make_unique<PyIndex<1024, BitWidth>>(dim, seed);
+        case 2048:
+            return hierarchical
+                ? std::make_unique<PyHNSWIndex<2048, BitWidth>>(dim, seed)
+                : std::make_unique<PyIndex<2048, BitWidth>>(dim, seed);
         default:
             throw std::invalid_argument(
                 "Unsupported dimension " + std::to_string(dim) +
@@ -139,12 +145,12 @@ static std::unique_ptr<PyIndexBase> create_index_with_bits(
 }
 
 static std::unique_ptr<PyIndexBase> create_index(
-    size_t dim, uint64_t seed, size_t bits)
+    size_t dim, uint64_t seed, size_t bits, bool hierarchical = false)
 {
     switch (bits) {
-        case 1: return create_index_with_bits<1>(dim, seed);
-        case 2: return create_index_with_bits<2>(dim, seed);
-        case 4: return create_index_with_bits<4>(dim, seed);
+        case 1: return create_index_with_bits<1>(dim, seed, hierarchical);
+        case 2: return create_index_with_bits<2>(dim, seed, hierarchical);
+        case 4: return create_index_with_bits<4>(dim, seed, hierarchical);
         default:
             throw std::invalid_argument(
                 "Unsupported bits=" + std::to_string(bits) +
@@ -152,49 +158,9 @@ static std::unique_ptr<PyIndexBase> create_index(
     }
 }
 
-// ============================================================================
-// HNSW factory
-// ============================================================================
-
-template <size_t BitWidth>
-static std::unique_ptr<PyIndexBase> create_hnsw_with_bits(
-    size_t dim, uint64_t seed)
-{
-    size_t pd = padded_dim(dim);
-    switch (pd) {
-        case 128:  return std::make_unique<PyHNSWIndex<128, BitWidth>>(dim, seed);
-        case 256:  return std::make_unique<PyHNSWIndex<256, BitWidth>>(dim, seed);
-        case 512:  return std::make_unique<PyHNSWIndex<512, BitWidth>>(dim, seed);
-        case 1024: return std::make_unique<PyHNSWIndex<1024, BitWidth>>(dim, seed);
-        case 2048: return std::make_unique<PyHNSWIndex<2048, BitWidth>>(dim, seed);
-        default:
-            throw std::invalid_argument(
-                "Unsupported dimension " + std::to_string(dim) +
-                " (padded to " + std::to_string(pd) +
-                "). Supported padded dims: 128, 256, 512, 1024, 2048.");
-    }
-}
-
-static std::unique_ptr<PyIndexBase> create_hnsw(
-    size_t dim, uint64_t seed, size_t bits)
-{
-    switch (bits) {
-        case 1: return create_hnsw_with_bits<1>(dim, seed);
-        case 2: return create_hnsw_with_bits<2>(dim, seed);
-        case 4: return create_hnsw_with_bits<4>(dim, seed);
-        default:
-            throw std::invalid_argument(
-                "Unsupported bits=" + std::to_string(bits) +
-                ". Supported: 1, 2, 4.");
-    }
-}
-
-// ============================================================================
-// Python module
-// ============================================================================
 
 PYBIND11_MODULE(_core, m) {
-    m.doc() = "CP-HNSW: Zero-tuning RaBitQ approximate nearest neighbor search";
+    m.doc() = "Configuration-Parameterless HNSW (CP-HNSW): Zero-tuning RaBitQ approximate nearest neighbor search";
 
     py::class_<PyIndexBase>(m, "Index")
         .def(py::init([](size_t dim, uint64_t seed, size_t bits) {
@@ -321,9 +287,8 @@ PYBIND11_MODULE(_core, m) {
         }, py::arg("path"),
            "Save the index graph to a binary file.");
 
-    // HNSW multi-layer index — factory function returning same PyIndexBase interface
     m.def("HNSWIndex", [](size_t dim, uint64_t seed, size_t bits) {
-        return create_hnsw(dim, seed, bits);
+        return create_index(dim, seed, bits, true);
     },
         py::arg("dim"),
         py::arg("seed") = 42,

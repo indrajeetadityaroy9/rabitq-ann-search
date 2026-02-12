@@ -16,10 +16,6 @@
 
 namespace cphnsw {
 
-// Colocated per-vertex data for cache-friendly access during search.
-// All data needed to visit a vertex (code, neighbors, raw vector) is stored
-// contiguously, reducing cache misses from 3 (separate vectors) to 1.
-// BitWidth=1 uses original 1-bit types; BitWidth>1 uses Extended RaBitQ types.
 template <size_t D, size_t R, size_t BitWidth = 1>
 struct alignas(64) VertexData {
     using CodeType = std::conditional_t<BitWidth == 1,
@@ -59,7 +55,6 @@ public:
         auto& vd = vertices_.back();
         vd.code = code;
         std::memcpy(vd.vector, vec, dim_ * sizeof(float));
-        // Zero-pad remaining dimensions if dim_ < D
         if (dim_ < D) {
             std::memset(vd.vector + dim_, 0, (D - dim_) * sizeof(float));
         }
@@ -112,8 +107,6 @@ public:
         return (id < vertices_.size()) ? vertices_[id].neighbors.size() : 0;
     }
 
-    // Prefetch a vertex's data into cache. Call this 1-2 iterations ahead of access.
-    // Dynamically prefetches cache lines based on actual VertexData size.
     static constexpr size_t PREFETCH_LINES =
         (sizeof(VertexDataType) / CACHE_LINE_SIZE < 12)
             ? (sizeof(VertexDataType) / CACHE_LINE_SIZE) : 12;
@@ -181,16 +174,11 @@ public:
         return best;
     }
 
-    // Hub entry point selection (inspired by GATE, arXiv:2506.15986).
-    // Selects the highest-degree node among the top-sqrt(n) closest to centroid.
-    // Called after graph construction when degree information is available.
-    // Falls back to medoid if graph has no edges.
     NodeId find_hub_entry() const {
         if (empty()) return INVALID_NODE;
 
         size_t n = vertices_.size();
 
-        // Compute centroid
         std::vector<double> centroid(dim_, 0.0);
         for (size_t i = 0; i < n; ++i) {
             const float* v = vertices_[i].vector;
@@ -201,7 +189,6 @@ public:
         double inv_n = 1.0 / n;
         for (size_t j = 0; j < dim_; ++j) centroid[j] *= inv_n;
 
-        // Compute distances to centroid
         struct CentroidDist {
             NodeId id;
             double dist;
@@ -220,12 +207,10 @@ public:
             dists[i] = {static_cast<NodeId>(i), dist};
         }
 
-        // Partial sort to get top-sqrt(n) closest
         if (top_k < n) {
             std::partial_sort(dists.begin(), dists.begin() + top_k, dists.end());
         }
 
-        // Among top_k closest, select highest degree
         NodeId best = dists[0].id;
         size_t best_degree = vertices_[best].neighbors.size();
 
@@ -248,7 +233,6 @@ private:
     mutable std::mutex graph_mutex_;
 };
 
-// Multi-bit graph aliases
 template <size_t D, size_t R = 32, size_t BitWidth = 2>
 using NbitRaBitQGraph = RaBitQGraph<D, R, BitWidth>;
 

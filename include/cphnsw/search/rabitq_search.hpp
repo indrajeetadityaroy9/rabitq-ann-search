@@ -69,22 +69,6 @@ public:
         bool operator>(const BeamEntry& o) const { return est_distance > o.est_distance; }
     };
 
-    // Core search with two principled termination mechanisms:
-    //
-    // 1. Lower-bound pruning (RaBitQ Theorem 3.2):
-    //    Candidates whose guaranteed lower bound on true distance exceeds
-    //    the k-th best exact distance are skipped. The error_epsilon in the
-    //    query controls tightness: epsilon = sqrt(-2*ln(1-recall_target)),
-    //    giving a false-prune rate of exactly (1-recall_target).
-    //
-    // 2. DABS termination with exact distances:
-    //    After computing a candidate's exact distance, terminate if
-    //    exact_dist > (1+gamma) * nn.worst_distance(). Both sides are exact
-    //    L2 distances — no noisy-vs-exact mismatch. The k-th best distance
-    //    is the natural threshold for k-NN search.
-    //    gamma = epsilon/sqrt(D) from Theorem 3.2 error scaling.
-    //
-    // ef_cap is a hard safety cap on beam size (default 4096).
     static std::vector<SearchResult> search(
         const QueryType& query,
         const float* raw_query,
@@ -107,7 +91,6 @@ public:
                            std::greater<BeamEntry>> beam;
         BoundedMaxHeap<SearchResult> nn(k);
 
-        // Unified entry-point distance estimation for all bit widths
         float ep_est;
         if constexpr (BitWidth == 1) {
             ep_est = Policy::compute_distance(query, graph.get_code(ep));
@@ -156,17 +139,10 @@ public:
             }
             if (!found) break;
 
-            // Estimate-based pre-filter: the beam is ordered by est_distance,
-            // so all remaining entries have est_distance >= current. If the
-            // best remaining estimate already exceeds the distance-adaptive
-            // threshold, terminate without computing exact L2.
             if (nn.size() >= k && current.est_distance > (1.0f + gamma) * nn.worst_distance()) break;
 
-            // Lower-bound pruning (Theorem 3.2): skip candidates whose
-            // guaranteed lower bound exceeds the k-th best exact distance.
             if (nn.size() >= k && current.lower_bound > nn.worst_distance()) continue;
 
-            // Prefetch top 2 beam candidates
             if (!beam.empty()) {
                 graph.prefetch_vertex(beam.top().id);
                 BeamEntry first_beam = beam.top();
@@ -185,9 +161,6 @@ public:
 
             nn.push({current.id, exact_dist});
 
-            // Exact-distance termination: catches cases where the RaBitQ
-            // estimate undershot the threshold (passed pre-filter) but the
-            // true L2 distance exceeds it. Avoids expanding bad neighborhoods.
             if (nn.size() >= k && exact_dist > (1.0f + gamma) * nn.worst_distance()) break;
 
             const auto& nb = graph.get_neighbors(current.id);
@@ -241,7 +214,6 @@ public:
                 graph.prefetch_vertex(neighbor_id);
             }
 
-            // Hard beam size cap
             if (beam.size() > ef_cap * 2) {
                 std::priority_queue<BeamEntry, std::vector<BeamEntry>,
                                    std::greater<BeamEntry>> new_beam;
@@ -258,7 +230,6 @@ public:
         return nn.extract_sorted();
     }
 
-    // Convenience: thread-local visitation, default parameters
     static std::vector<SearchResult> search(
         const QueryType& query,
         const float* raw_query,
@@ -273,7 +244,6 @@ public:
         return search(query, raw_query, graph, k, gamma, visited);
     }
 
-    // Search from a custom entry node (for HNSW upper-layer routing)
     static std::vector<SearchResult> search_from(
         const QueryType& query,
         const float* raw_query,
@@ -290,7 +260,6 @@ public:
     }
 };
 
-// Distance policy for exact L2 computation during graph construction
 struct ExactL2Policy {
     template <size_t D>
     static float compute(const float* a, const float* b) {
@@ -298,7 +267,6 @@ struct ExactL2Policy {
     }
 };
 
-// Policy-parameterized beam search engine for graph construction.
 template <size_t D, size_t R = 32, size_t BitWidth = 1, typename DistancePolicy = ExactL2Policy>
 class GraphSearchEngine {
 public:
@@ -385,14 +353,11 @@ public:
     }
 };
 
-// Quantized construction search engine.
-// Wraps RaBitQSearchEngine for graph construction.
 template <size_t D, size_t R = 32, size_t BitWidth = 1>
 class QuantizedBuildSearchEngine {
 public:
     using Graph = RaBitQGraph<D, R, BitWidth>;
 
-    // Core overload: explicit visitation table and entry point
     template <typename EncoderType>
     static std::vector<SearchResult> search(
         const float* raw_query,
@@ -406,13 +371,11 @@ public:
         if (graph.empty()) return {};
         auto query = encoder.encode_query(raw_query);
         query.error_epsilon = error_epsilon;
-        // Use a generous gamma for construction (explore more broadly)
         float gamma = 0.5f;
         return RaBitQSearchEngine<D, R, BitWidth>::search(
             query, raw_query, graph, k, gamma, visited, ef, entry);
     }
 
-    // Convenience overload: thread-local visitation
     template <typename EncoderType>
     static std::vector<SearchResult> search(
         const float* raw_query,

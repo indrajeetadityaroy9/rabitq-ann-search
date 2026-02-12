@@ -96,7 +96,6 @@ struct alignas(CACHE_LINE_SIZE) CacheLinePad {
 template <typename T>
 struct alignas(CACHE_LINE_SIZE) CacheLineIsolated {
     T value;
-    // Pad to fill cache line. When T already fills a cache line, use 1 byte (alignas handles alignment).
     static constexpr size_t REMAINDER = sizeof(T) % CACHE_LINE_SIZE;
     static constexpr size_t PAD_SIZE = (REMAINDER == 0) ? 1 : (CACHE_LINE_SIZE - REMAINDER);
     char padding[PAD_SIZE];
@@ -128,7 +127,6 @@ AlignedUniquePtr<T> make_aligned(size_t count = 1) {
     return AlignedUniquePtr<T>(static_cast<T*>(ptr));
 }
 
-// AVX2-accelerated L2 squared distance (compile-time dimension).
 template <size_t D>
 inline float l2_distance_simd(const float* a, const float* b) {
     static_assert(D % 8 == 0, "D must be a multiple of 8 for AVX2");
@@ -145,7 +143,6 @@ inline float l2_distance_simd(const float* a, const float* b) {
     return _mm_cvtss_f32(s);
 }
 
-// AVX2-accelerated L2 squared distance (runtime dimension, must be multiple of 8).
 inline float l2_distance_simd_runtime(const float* a, const float* b, size_t dim) {
     __m256 sum = _mm256_setzero_ps();
     size_t i = 0;
@@ -159,7 +156,6 @@ inline float l2_distance_simd_runtime(const float* a, const float* b, size_t dim
     s = _mm_hadd_ps(s, s);
     s = _mm_hadd_ps(s, s);
     float result = _mm_cvtss_f32(s);
-    // Handle remaining elements (if dim is not multiple of 8)
     for (; i < dim; ++i) {
         float d = a[i] - b[i];
         result += d * d;
@@ -167,7 +163,6 @@ inline float l2_distance_simd_runtime(const float* a, const float* b, size_t dim
     return result;
 }
 
-// AVX-512 accelerated L2 squared distance (compile-time dimension).
 #ifdef __AVX512F__
 template <size_t D>
 inline float l2_distance_avx512(const float* a, const float* b) {
@@ -181,7 +176,6 @@ inline float l2_distance_avx512(const float* a, const float* b) {
 }
 #endif
 
-// Runtime dispatcher: picks AVX-512 if available, else AVX2.
 template <size_t D>
 inline float l2_distance_best(const float* a, const float* b) {
 #ifdef __AVX512F__

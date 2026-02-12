@@ -69,30 +69,29 @@ public:
 
         needs_build_ = true;
 
-        if (build_params.verbose) {
-            printf("[HNSWIndex] Added %zu vectors (B=%zu). Call finalize() to build.\n",
-                   num_vecs, BitWidth);
-        }
+        (void)build_params;
     }
 
     void finalize(const BuildParams& params) {
         size_t n = graph_.size();
         if (n == 0 || !needs_build_) { finalized_ = true; return; }
 
-        if (params.verbose) printf("[HNSW] Assigning layers to %zu nodes...\n", n);
+        if (params.verbose) {
+            printf("event=hnsw_build_start nodes=%zu bit_width=%zu\n", n, BitWidth);
+        }
         assign_layers(n);
 
-        if (params.verbose) printf("[HNSW] Building %d upper layers...\n", max_level_);
         build_upper_layers(params.verbose);
 
-        if (params.verbose) printf("[HNSW] Optimizing layer 0...\n");
         Refinement::optimize_graph_adaptive(
             graph_, encoder_, params.num_threads, params.verbose);
 
         needs_build_ = false;
         finalized_ = true;
-        if (params.verbose) printf("[HNSW] Build complete. max_level=%d, entry=%u\n",
-                                      max_level_, entry_point_);
+        if (params.verbose) {
+            printf("event=hnsw_build_done nodes=%zu max_level=%d entry=%u avg_degree=%.3f max_degree=%zu\n",
+                   graph_.size(), max_level_, entry_point_, graph_.average_degree(), graph_.max_degree());
+        }
     }
 
     void finalize() {
@@ -229,7 +228,6 @@ private:
 
     void build_upper_layers(bool verbose) {
         size_t n = graph_.size();
-        // Upper layers have O(log n) nodes; beam width = R is more than sufficient.
         size_t upper_ef = R;
 
         std::vector<NodeId> insertion_order(n);
@@ -279,18 +277,7 @@ private:
             }
         }
 
-        if (verbose) {
-            for (int l = max_level_; l >= 1; --l) {
-                const auto& layer = upper_layers_[l - 1];
-                size_t count = layer.size();
-                size_t edges = 0;
-                for (const auto& edge : layer) {
-                    edges += edge.neighbors.size();
-                }
-                printf("[HNSW] Layer %d: %zu nodes, %.1f avg degree\n",
-                       l, count, count > 0 ? static_cast<float>(edges) / count : 0.0f);
-            }
-        }
+        (void)verbose;
     }
 
     NodeId greedy_search_layer(const float* query, NodeId ep, int level) const {

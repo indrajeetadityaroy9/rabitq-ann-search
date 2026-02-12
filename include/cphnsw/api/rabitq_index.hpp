@@ -76,10 +76,7 @@ public:
 
         needs_build_ = true;
 
-        if (build_params.verbose) {
-            printf("[RaBitQIndex] Added %zu vectors (B=%zu). Edges will be built in finalize().\n",
-                   num_vecs, BitWidth);
-        }
+        (void)build_params;
     }
 
     void finalize(const BuildParams& params) {

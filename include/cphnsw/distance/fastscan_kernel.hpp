@@ -57,7 +57,6 @@ inline void compute_inner_products(
 
         pairs_since_flush++;
 
-        // Flush uint8 accumulator to uint16 every 2 pairs (max 4*60=240 < 255)
         if (pairs_since_flush >= 2 || sp == NUM_SUB_PAIRS - 1) {
             __m256i widened_lo = _mm256_cvtepu8_epi16(
                 _mm256_castsi256_si128(tmp_acc));
@@ -93,9 +92,10 @@ inline void convert_to_distances(
     const uint16_t* popcounts,
     size_t count,
     float* out,
-    float /*parent_norm*/,
+    float parent_norm_unused,
     float dist_qp_sq)
 {
+    (void)parent_norm_unused;
     float A = query.coeff_fastscan;
     float B = query.coeff_popcount;
     float C = query.coeff_constant;
@@ -108,10 +108,6 @@ inline void convert_to_distances(
 
         float ip_qo_p = aux[i].ip_quantized_original;
 
-        // SymphonyQG distance estimate (parent-relative decomposition):
-        //   ||q-o||² = (||o-c||² - ||p-c||²) + ||q-p||² - 2*||q-c||*||o-p||*cos(q-c, o-p)
-        // where cos(q-c, o-p) ≈ ip_approx / ip_qo_p
-        // aux.dist_to_centroid = ||o-p||, aux.ip_xbar_Pinv_c = ||o-c||² - ||p-c||²
         float ip_est = (ip_qo_p > 1e-10f) ? ip_approx / ip_qo_p : 0.0f;
 
         float nop = aux[i].dist_to_centroid;
@@ -130,9 +126,10 @@ inline void convert_to_distances_with_bounds(
     size_t count,
     float* out_dist,
     float* out_lower,
-    float /*parent_norm*/,
+    float parent_norm_unused,
     float dist_qp_sq)
 {
+    (void)parent_norm_unused;
     float A = query.coeff_fastscan;
     float B = query.coeff_popcount;
     float C = query.coeff_constant;
@@ -146,7 +143,6 @@ inline void convert_to_distances_with_bounds(
 
         float ip_qo_p = aux[i].ip_quantized_original;
 
-        // SymphonyQG distance estimate (parent-relative decomposition)
         float ip_est = (ip_qo_p > 1e-10f) ? ip_approx / ip_qo_p : 0.0f;
 
         float nop = aux[i].dist_to_centroid;
@@ -155,11 +151,8 @@ inline void convert_to_distances_with_bounds(
         out_dist[i] = correction + dist_qp_sq
                     - 2.0f * query_norm * nop * ip_est;
 
-        // Error bound on cosine estimate (Theorem 3.2, using parent-relative ip_qo_p)
         float ip_qo_p_sq = ip_qo_p * ip_qo_p;
         if (ip_qo_p_sq < 1e-10f) {
-            // Can't compute error bound; use estimated distance as lower bound
-            // (avoids discarding potentially good candidates with max float)
             out_dist[i] = std::max(out_dist[i], 0.0f);
             out_lower[i] = std::max(out_dist[i], 0.0f);
             continue;
@@ -167,7 +160,6 @@ inline void convert_to_distances_with_bounds(
         float bound_on_cos = epsilon * std::sqrt(
             (1.0f - ip_qo_p_sq) / (ip_qo_p_sq * static_cast<float>(D)));
 
-        // Upper bound on cosine → lower bound on distance
         float cos_upper = std::min(ip_est + bound_on_cos, 1.0f);
 
         out_dist[i] = std::max(out_dist[i], 0.0f);
@@ -177,9 +169,6 @@ inline void convert_to_distances_with_bounds(
     }
 }
 
-// === Multi-bit FastScan (Extended RaBitQ) ===
-// Weighted sum of per-plane inner products. Also outputs MSB-only sums
-// for coarse lower bounds.
 
 template <size_t D, size_t BitWidth>
 inline void compute_nbit_inner_products(
@@ -203,13 +192,7 @@ inline void compute_nbit_inner_products(
     }
 }
 
-// Multi-bit distance conversion with bounds.
-// Uses full B-bit weighted sums for distance estimates, MSB (1-bit) sums
-// for conservative lower bounds.
 
-// Multi-bit distance conversion with bounds using SymphonyQG parent-relative formula.
-// aux.dist_to_centroid = ||o-p|| (parent-relative), aux.ip_xbar_Pinv_c = no² - np²
-// This uses the same decomposition as the 1-bit path for uniform treatment.
 template <size_t D, size_t BitWidth>
 inline void convert_nbit_to_distances_with_bounds(
     const RaBitQQuery<D>& query,
@@ -221,9 +204,10 @@ inline void convert_nbit_to_distances_with_bounds(
     size_t count,
     float* out_dist,
     float* out_lower,
-    float /*parent_norm*/,
+    float parent_norm_unused,
     float dist_qp_sq)
 {
+    (void)parent_norm_unused;
     constexpr float K = static_cast<float>((1u << BitWidth) - 1);
     constexpr float inv_K = 1.0f / K;
 
@@ -237,7 +221,6 @@ inline void convert_nbit_to_distances_with_bounds(
     float B_msb = query.coeff_popcount;
 
     for (size_t i = 0; i < count; ++i) {
-        // Full B-bit inner product estimate (weighted sum of bit planes)
         float ip_approx_nbit = A_nbit * static_cast<float>(nbit_fastscan_sums[i])
                              + B_nbit * static_cast<float>(weighted_popcounts[i])
                              + C;
@@ -245,15 +228,12 @@ inline void convert_nbit_to_distances_with_bounds(
         float ip_qo_p = aux[i].ip_quantized_original;
         float ip_est_nbit = (ip_qo_p > 1e-10f) ? ip_approx_nbit / ip_qo_p : 0.0f;
 
-        // SymphonyQG parent-relative distance estimate:
-        //   ||q-o||² = (no² - np²) + ||q-p||² - 2*||q-c||*||o-p||*cos(q-c, o-p)
         float nop = aux[i].dist_to_centroid;    // ||o-p||
         float correction = aux[i].ip_xbar_Pinv_c;  // no² - np²
 
         out_dist[i] = correction + dist_qp_sq
                     - 2.0f * query_norm * nop * ip_est_nbit;
 
-        // Lower bound using MSB (1-bit) parent-relative ip + error bound
         float ip_approx_msb = A_msb * static_cast<float>(msb_fastscan_sums[i])
                             + B_msb * static_cast<float>(msb_popcounts[i])
                             + C;
@@ -286,13 +266,6 @@ struct RaBitQMetricPolicy {
 
     static constexpr size_t DIMS = D;
 
-    // Entry-point distance estimation using global-centroid RaBitQ formula.
-    //
-    // This method uses per-vector metadata (code.dist_to_centroid = ||o_r - centroid||,
-    // code.ip_quantized_original = <o_bar, o>) which are relative to the dataset centroid.
-    //
-    // For neighbor distance estimation during graph traversal, use the SIMD batch path
-    // (fastscan::convert_to_distances / convert_to_distances_with_bounds).
     static inline float compute_distance(
         const QueryType& query, const CodeType& code)
     {
@@ -323,13 +296,12 @@ struct RaBitQMetricPolicy {
              - 2.0f * dist_o * query.query_norm * ip_est;
     }
 
-    // Scalar distance estimation using per-edge VertexAuxData.
-    // Uses the SymphonyQG parent-relative formula (same as SIMD batch path).
     static inline float compute_distance_with_aux(
         const QueryType& query, const CodeType& code,
         const VertexAuxData& aux,
-        float /*parent_norm*/, float dist_qp_sq)
+        float parent_norm_unused, float dist_qp_sq)
     {
+        (void)parent_norm_unused;
         constexpr size_t NUM_SUB_SEGMENTS = (D + 3) / 4;
         uint32_t fastscan_sum = 0;
 

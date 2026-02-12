@@ -18,7 +18,6 @@
 
 namespace cphnsw {
 
-// Phase 2.5: Explicit EncoderWorkspace — thread-local buffers for encode operations
 template <size_t D>
 struct EncoderWorkspace {
     AlignedVector<float> buf;
@@ -29,7 +28,6 @@ struct EncoderWorkspace {
         : buf(padded_dim), centered(dim), q_bar_u(padded_dim) {}
 };
 
-// Phase 2.4: CRTP Base Class — shared logic for all RaBitQ encoder variants
 template <typename Derived, size_t D, typename RotationPolicy>
 class RaBitQEncoderBase {
 public:
@@ -203,7 +201,6 @@ public:
             }
         }
 
-        // From RaBitQ Equation (19)
         query.coeff_fastscan = 2.0f * delta * inv_sqrt_d_;
         query.coeff_popcount = 2.0f * vl * inv_sqrt_d_;
         query.coeff_constant = -(delta * inv_sqrt_d_) * sum_qu - vl * sqrt_d_;
@@ -211,23 +208,6 @@ public:
         return query;
     }
 
-    // Compute per-edge auxiliary data for FastScan distance estimation.
-    //
-    // SymphonyQG (SIGMOD 2025): When out_code is non-null, computes parent-relative
-    // encoding for improved distance estimation during graph traversal.
-    //
-    // Standard RaBitQ estimates ||q-o||² using the global centroid c:
-    //   ||q-o||² = ||o-c||² + ||q-c||² - 2*||o-c||*||q-c||*cos(q-c, o-c)
-    // The estimation error is proportional to ||o-c||*||q-c||/sqrt(D).
-    //
-    // SymphonyQG decomposes via parent p (the node being expanded during search):
-    //   ||q-o||² = (||o-c||² - ||p-c||²) + ||q-p||² - 2*||q-c||*||o-p||*cos(q-c, o-p)
-    // Since ||o-p|| << ||o-c|| (neighbors are close to parent), the error is smaller.
-    // ||q-p||² is known exactly from the search expansion step.
-    //
-    // The parent-relative binary code sign(P*unit(o-p)) is stored per-edge in the
-    // FastScan block, replacing the global code. The LUT (built from unit(q-c))
-    // computes <unit(q-c), unit(o-p)> via the same SIMD pipeline.
     template <typename CodeType>
     VertexAuxData compute_neighbor_aux(
         const CodeType& neighbor_code,
@@ -239,10 +219,8 @@ public:
         VertexAuxData aux;
 
         if (out_code) {
-            // SymphonyQG: parent-relative encoding
             out_code->clear();
 
-            // Compute o - p
             alignas(32) float diff_op[D];
             float nop_sq = 0.0f;
             for (size_t i = 0; i < dim_; ++i) {
@@ -260,16 +238,13 @@ public:
                 return aux;
             }
 
-            // Normalize to unit(o - p)
             float inv_nop = 1.0f / nop;
             for (size_t i = 0; i < D; ++i) diff_op[i] *= inv_nop;
 
-            // Rotate and scale: P * unit(o-p) * norm_factor
             alignas(32) float rotated[D];
             rotation_.apply_copy(diff_op, rotated);
             for (size_t i = 0; i < padded_dim_; ++i) rotated[i] *= norm_factor_;
 
-            // Binarize + compute L1 norm (same as standard RaBitQ encoding)
             float l1_norm = 0.0f;
             for (size_t i = 0; i < padded_dim_; ++i) {
                 out_code->set_bit(i, rotated[i] >= 0.0f);
@@ -278,7 +253,6 @@ public:
 
             aux.ip_quantized_original = l1_norm * inv_sqrt_d_;  // ip_qo_p
 
-            // Correction term: no² - np²
             float no = neighbor_code.dist_to_centroid;
             float np = parent_dist_centroid;
             aux.ip_xbar_Pinv_c = no * no - np * np;
@@ -286,7 +260,6 @@ public:
             return aux;
         }
 
-        // Standard: copy global-centroid values (used for multi-bit paths)
         aux.dist_to_centroid = neighbor_code.dist_to_centroid;
         aux.ip_quantized_original = neighbor_code.ip_quantized_original;
         aux.ip_xbar_Pinv_c = 0.0f;
@@ -307,7 +280,6 @@ protected:
     bool has_centroid_;
 };
 
-// === 1-bit RaBitQ Encoder ===
 
 template <size_t D, typename RotationPolicy = RandomHadamardRotation>
 class RaBitQEncoder : public RaBitQEncoderBase<RaBitQEncoder<D, RotationPolicy>, D, RotationPolicy> {
@@ -410,7 +382,6 @@ public:
     }
 };
 
-// === Extended RaBitQ: Multi-bit Encoder (SIGMOD'25) ===
 
 template <size_t D, size_t BitWidth, typename RotationPolicy = RandomHadamardRotation>
 class NbitRaBitQEncoder : public RaBitQEncoderBase<NbitRaBitQEncoder<D, BitWidth, RotationPolicy>, D, RotationPolicy> {
@@ -432,7 +403,6 @@ public:
         CodeType code;
         code.clear();
 
-        // Step 0: Center the vector and compute norm
         float norm_sq = 0.0f;
         for (size_t i = 0; i < this->dim_; ++i) {
             float v = vec[i] - this->centroid_[i];
@@ -448,37 +418,22 @@ public:
             return code;
         }
 
-        // Step 1: Normalize x_bar = x / ||x||, then rotate
         float inv_norm = 1.0f / norm;
         for (size_t i = 0; i < this->dim_; ++i) centered_buf[i] *= inv_norm;
 
         this->rotation_.apply_copy(centered_buf, buf);
         for (size_t i = 0; i < this->padded_dim_; ++i) buf[i] *= this->norm_factor_;
 
-        // buf now contains x_bar (the normalized, rotated vector)
-        // We quantize: q[i] = clamp(round(t * x_bar[i] + midpoint), 0, K)
-        // where midpoint = K / 2.0 and levels are {0, 1, ..., K}
-        // The signed codebook value is c[i] = (2*q[i] - K) / K
-        // We want to find t* that maximizes cosine(q_signed, x_bar)
-        //   = sum_i c[i]*x_bar[i] / ||c||
 
         constexpr float midpoint = K * 0.5f;
         constexpr size_t NUM_LEVELS = static_cast<size_t>(1) << BitWidth;  // 2^B
         const size_t pd = this->padded_dim_;
 
-        // Extended RaBitQ Algorithm 1: optimal critical-value enumeration
-        // Critical values of t: for each dim i and each boundary b in {0.5, 1.5, ..., K-0.5},
-        // t_crit = (b - midpoint) / x_bar[i]  (only positive t values matter)
-        // At these critical values, the quantization of dimension i changes.
 
         float best_t = 0.0f;
         float best_cosine = -std::numeric_limits<float>::max();
 
-        // For BitWidth <= 3 (up to 8 levels, so 7 boundaries per dim),
-        // enumerate all critical values exactly. Otherwise grid search.
         if constexpr (BitWidth <= 3) {
-            // Collect all positive critical t values
-            // Number of boundaries = K = 2^B - 1, boundaries at 0.5, 1.5, ..., K-0.5
             thread_local std::vector<float> crits;
             crits.clear();
             crits.reserve(pd * NUM_LEVELS);
@@ -497,8 +452,6 @@ public:
 
             std::sort(crits.begin(), crits.end());
 
-            // Evaluate at midpoints of consecutive intervals and at a small epsilon
-            // Also evaluate at t just above 0
             auto evaluate_cosine = [&](float t) -> float {
                 float dot = 0.0f;
                 float norm_c_sq = 0.0f;
@@ -515,7 +468,6 @@ public:
                 return dot / std::sqrt(norm_c_sq);
             };
 
-            // Evaluate at a small t
             {
                 float cosine = evaluate_cosine(1e-6f);
                 if (cosine > best_cosine) {
@@ -524,7 +476,6 @@ public:
                 }
             }
 
-            // Evaluate at midpoint of each interval between consecutive critical values
             float prev = 0.0f;
             for (size_t k = 0; k < crits.size(); ++k) {
                 float cur = crits[k];
@@ -537,7 +488,6 @@ public:
                 }
                 prev = cur;
             }
-            // Evaluate past the last critical value
             if (!crits.empty()) {
                 float t_last = crits.back() * 1.1f + 0.1f;
                 float cosine = evaluate_cosine(t_last);
@@ -547,9 +497,6 @@ public:
                 }
             }
         } else {
-            // Grid search + golden-section refinement for high bit widths.
-            // Phase 1: 256-point coarse grid to find approximate optimum.
-            // Phase 2: Golden-section refinement for near-exact t*.
             float max_abs = 0.0f;
             for (size_t i = 0; i < pd; ++i) {
                 float a = std::abs(buf[i]);
@@ -575,7 +522,6 @@ public:
                 return dot_val / std::sqrt(norm_c_sq);
             };
 
-            // Phase 1: Coarse grid
             for (size_t g = 1; g <= NUM_GRID; ++g) {
                 float t = t_max * static_cast<float>(g) / static_cast<float>(NUM_GRID);
                 float cosine = evaluate_cosine_grid(t);
@@ -585,7 +531,6 @@ public:
                 }
             }
 
-            // Phase 2: Golden-section refinement around best grid point
             float step = t_max / static_cast<float>(NUM_GRID);
             float lo = std::max(1e-8f, best_t - step);
             float hi = std::min(t_max, best_t + step);
@@ -607,7 +552,6 @@ public:
             }
         }
 
-        // Step 7: Quantize with optimal t*
         float ip_qo = 0.0f;
         for (size_t i = 0; i < pd; ++i) {
             float val = best_t * buf[i] + midpoint;

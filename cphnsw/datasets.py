@@ -1,6 +1,6 @@
-"""Dataset loading utilities for standard ANN benchmark formats."""
+"""Dataset loaders and download helpers."""
 
-import struct
+import json
 import tarfile
 import urllib.request
 from pathlib import Path
@@ -8,40 +8,26 @@ from pathlib import Path
 import numpy as np
 
 
+def _emit(event: str, **fields) -> None:
+    print(json.dumps({"event": event, **fields}, sort_keys=True), flush=True)
+
+
 def load_fvecs(path: str) -> np.ndarray:
-    """Load vectors from .fvecs format.
-
-    Format: each record is [int32 dim][dim x float32 values].
-
-    Returns:
-        (n, dim) float32 array.
-    """
+    """Load a `.fvecs` matrix."""
     data = np.fromfile(path, dtype=np.float32)
     d = data[:1].view(np.int32)[0]
     return data.reshape(-1, d + 1)[:, 1:].copy()
 
 
 def load_ivecs(path: str) -> np.ndarray:
-    """Load integer vectors from .ivecs format.
-
-    Format: each record is [int32 k][k x int32 values].
-
-    Returns:
-        (n, k) int32 array.
-    """
+    """Load an `.ivecs` matrix."""
     data = np.fromfile(path, dtype=np.int32)
     k = int(data[0])
     return data.reshape(-1, k + 1)[:, 1:].copy()
 
 
 def load_hdf5_dataset(path: str) -> dict:
-    """Load ANN-benchmarks HDF5 format dataset.
-
-    Expected keys in file: 'train', 'test', 'neighbors', 'distances'.
-
-    Returns:
-        dict with keys: base, queries, groundtruth, dim.
-    """
+    """Load a dataset from ANN-benchmarks HDF5 format."""
     import h5py
     with h5py.File(path, 'r') as f:
         base = np.array(f['train'])
@@ -60,55 +46,48 @@ GLOVE200_URL = "https://huggingface.co/datasets/qbo-odp/glove-200-angular/resolv
 
 
 def download_sift1m(dest: str = "data/sift1m/"):
-    """Download SIFT-1M dataset."""
+    """Download SIFT-1M if missing."""
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
 
     if (dest / "sift_base.fvecs").exists():
-        print(f"SIFT-1M already exists at {dest}")
+        _emit("dataset_cache_hit", dataset="sift1m", path=str(dest))
         return
 
     tarball = dest / "sift.tar.gz"
-    print(f"Downloading SIFT-1M to {tarball} ...")
+    _emit("dataset_download_start", dataset="sift1m", url=SIFT1M_URL, path=str(tarball))
     urllib.request.urlretrieve(SIFT1M_URL, tarball)
 
-    print("Extracting ...")
     with tarfile.open(tarball, "r:gz") as tar:
         for member in tar.getmembers():
             if member.isfile():
-                member.name = Path(member.name).name  # flatten
+                # Keep extracted filenames flat to match the loader layout.
+                member.name = Path(member.name).name
                 tar.extract(member, dest)
 
     tarball.unlink()
-    print(f"SIFT-1M ready at {dest}")
+    _emit("dataset_ready", dataset="sift1m", path=str(dest))
 
 
 def download_glove200(dest: str = "data/glove200/"):
-    """Download GloVe-200 dataset in HDF5 format."""
+    """Download GloVe-200 if missing."""
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
 
     hdf5_path = dest / "glove-200-angular.hdf5"
     if hdf5_path.exists():
-        print(f"GloVe-200 already exists at {hdf5_path}")
+        _emit("dataset_cache_hit", dataset="glove200", path=str(hdf5_path))
         return
 
-    print(f"Downloading GloVe-200 to {hdf5_path} ...")
+    _emit("dataset_download_start", dataset="glove200", url=GLOVE200_URL, path=str(hdf5_path))
     urllib.request.urlretrieve(GLOVE200_URL, hdf5_path)
-    print(f"GloVe-200 ready at {hdf5_path}")
+    _emit("dataset_ready", dataset="glove200", path=str(hdf5_path))
 
 
 def load_dataset(name: str, base_dir: str = "data/") -> dict:
-    """Load a standard ANN benchmark dataset.
-
-    Supported names: sift1m, gist1m, glove200, or a path to an HDF5 file.
-
-    Returns:
-        dict with keys: base, queries, groundtruth, dim.
-    """
+    """Load a named benchmark dataset or HDF5 path."""
     base_path = Path(base_dir) / name
 
-    # Check if it's an HDF5 file path
     if name.endswith('.hdf5') or name.endswith('.h5'):
         return load_hdf5_dataset(name)
 

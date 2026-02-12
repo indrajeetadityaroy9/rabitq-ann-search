@@ -21,7 +21,6 @@ inline void cpu_relax() {
 #elif defined(__aarch64__)
     asm volatile("yield" ::: "memory");
 #else
-    // Fallback for other architectures
 #endif
 }
 

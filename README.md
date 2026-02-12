@@ -1,15 +1,8 @@
 # Configuration-Parameterless HNSW (CP-HNSW): Zero-Configuration Quantization-Aware ANN Search
 
-## Overview
 ANN system that combines RaBitQ-style quantization, parent-relative edge encoding, NN-Descent graph construction, and recall-target-driven search control.
 
 The goal is to reduce parameter tuning burden while preserving competitive recall/throughput tradeoffs. Instead of exposing multiple coupled search/build knobs, the main user-facing control is `recall_target`; internal controls are derived from quantization-error and graph statistics.
-
-## Objectives
-- Build a single cohesive ANN pipeline with minimal manual tuning.
-- Support flat and hierarchical graph indices under one API.
-- Unify 1-bit, 2-bit, and 4-bit quantized paths in one implementation.
-- Provide reproducible benchmark scripts and structured outputs for analysis.
 
 ## Contributions
 1. `Recall-target` as primary search control:
@@ -23,7 +16,7 @@ The goal is to reduce parameter tuning burden while preserving competitive recal
 5. Unified multi-bit implementation:
    1/2/4-bit code paths share a common graph/search framework (`include/cphnsw/core/codes.hpp`, `include/cphnsw/api/rabitq_index.hpp`).
 
-## System Architecture
+## Architecture
 ### Core C++ Modules
 - `include/cphnsw/api/rabitq_index.hpp`: flat index API (`RaBitQIndex`).
 - `include/cphnsw/api/hnsw_index.hpp`: hierarchical index API (`HNSWIndex`) with upper-layer routing.

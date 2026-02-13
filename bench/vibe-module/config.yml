@@ -35,12 +35,12 @@ float:
         query_args: [[0.80, 0.90, 0.95, 0.97, 0.99]]
 
   - base_args: ['@metric']
-    constructor: CPHNSWGpu
+    constructor: CPHNSWBatch
     disabled: false
     gpu: true
     singularity_image: cphnsw
     module: vibe.algorithms.cphnsw
-    name: cphnsw-gpu
+    name: cphnsw-batch
     run_groups:
       bits-1:
         args: [[1]]

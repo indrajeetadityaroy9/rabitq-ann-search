@@ -44,17 +44,19 @@ foreach(D_VAL 128 256 512)
     target_link_libraries(benchmark_d${D_VAL} PRIVATE cphnsw)
 endforeach()
 
-# Multi-bit test
-add_executable(test_nbit apps/test_nbit.cpp)
-target_link_libraries(test_nbit PRIVATE cphnsw)
+# Optional test executables (development only)
+option(BUILD_TESTS "Build test executables" OFF)
+if(BUILD_TESTS)
+    message(STATUS "Building test executables")
 
-# ITQ test
-add_executable(test_itq apps/test_itq.cpp)
-target_link_libraries(test_itq PRIVATE cphnsw)
+    # Multi-bit test
+    add_executable(test_nbit tests/test_nbit.cpp)
+    target_link_libraries(test_nbit PRIVATE cphnsw)
 
-# HNSW test
-add_executable(test_hnsw apps/test_hnsw.cpp)
-target_link_libraries(test_hnsw PRIVATE cphnsw)
+    # HNSW test
+    add_executable(test_hnsw tests/test_hnsw.cpp)
+    target_link_libraries(test_hnsw PRIVATE cphnsw)
+endif()
 
 # Python bindings
 find_package(pybind11 QUIET)

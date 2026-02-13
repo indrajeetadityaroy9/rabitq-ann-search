@@ -15,22 +15,17 @@ def emit(event: str, **fields) -> None:
     print(json.dumps({"event": event, **fields}, sort_keys=True), flush=True)
 
 
-
 ALGO_STYLE = {
-    "cphnsw-flat-1bit":       {"color": "#d62728", "marker": "o",  "label": "Configuration-Parameterless HNSW (CP-HNSW) flat 1-bit"},
-    "cphnsw-flat-2bit":       {"color": "#ff7f0e", "marker": "s",  "label": "Configuration-Parameterless HNSW (CP-HNSW) flat 2-bit"},
-    "cphnsw-flat-4bit":       {"color": "#e377c2", "marker": "^",  "label": "Configuration-Parameterless HNSW (CP-HNSW) flat 4-bit"},
-    "cphnsw-hnsw-1bit":       {"color": "#2ca02c", "marker": "D",  "label": "Configuration-Parameterless HNSW (CP-HNSW) HNSW 1-bit"},
-    "cphnsw-flat-1bit-M32":   {"color": "#d62728", "marker": "o",  "label": "Configuration-Parameterless HNSW (CP-HNSW) flat 1-bit"},
-    "cphnsw-flat-2bit-M32":   {"color": "#ff7f0e", "marker": "s",  "label": "Configuration-Parameterless HNSW (CP-HNSW) flat 2-bit"},
-    "cphnsw-flat-4bit-M32":   {"color": "#e377c2", "marker": "^",  "label": "Configuration-Parameterless HNSW (CP-HNSW) flat 4-bit"},
-    "cphnsw-hnsw-1bit-M32":   {"color": "#2ca02c", "marker": "D",  "label": "Configuration-Parameterless HNSW (CP-HNSW) HNSW 1-bit"},
-    "hnswlib-M16":            {"color": "#1f77b4", "marker": "v",  "label": "hnswlib M=16"},
-    "hnswlib-M32":            {"color": "#17becf", "marker": "<",  "label": "hnswlib M=32"},
-    "hnswlib-M64":            {"color": "#9467bd", "marker": ">",  "label": "hnswlib M=64"},
-    "faiss-hnsw-M32":         {"color": "#8c564b", "marker": "p",  "label": "FAISS HNSW M=32"},
-    "faiss-ivfflat-1024":     {"color": "#7f7f7f", "marker": "h",  "label": "FAISS IVF-Flat"},
-    "faiss-ivfpq-1024":       {"color": "#bcbd22", "marker": "*",  "label": "FAISS IVF-PQ"},
+    "cphnsw-flat-1bit":  {"color": "#d62728", "marker": "o",  "label": "CP-HNSW flat 1-bit"},
+    "cphnsw-flat-2bit":  {"color": "#ff7f0e", "marker": "s",  "label": "CP-HNSW flat 2-bit"},
+    "cphnsw-flat-4bit":  {"color": "#e377c2", "marker": "^",  "label": "CP-HNSW flat 4-bit"},
+    "cphnsw-hnsw-1bit":  {"color": "#2ca02c", "marker": "D",  "label": "CP-HNSW HNSW 1-bit"},
+    "hnswlib-M16":       {"color": "#1f77b4", "marker": "v",  "label": "hnswlib M=16"},
+    "hnswlib-M32":       {"color": "#17becf", "marker": "<",  "label": "hnswlib M=32"},
+    "hnswlib-M64":       {"color": "#9467bd", "marker": ">",  "label": "hnswlib M=64"},
+    "faiss-hnsw-M32":    {"color": "#8c564b", "marker": "p",  "label": "FAISS HNSW M=32"},
+    "faiss-ivfpq":       {"color": "#bcbd22", "marker": "*",  "label": "FAISS IVF-PQ"},
+    "faiss-ivfopq":      {"color": "#aec7e8", "marker": "P",  "label": "FAISS IVF-OPQ"},
 }
 
 def get_style(name):
@@ -39,9 +34,8 @@ def get_style(name):
     return {"color": "#333333", "marker": "x", "label": name}
 
 
-
-def plot_recall_qps(results, dataset_name, output_dir):
-    """Plot Recall@10 vs QPS."""
+def plot_recall_qps(results, dataset_name, output_dir, recall_key="recall_at_10", label_suffix="10"):
+    """Plot Recall@k vs QPS."""
     fig, ax = plt.subplots(figsize=(10, 7))
 
     for algo in results:
@@ -51,25 +45,56 @@ def plot_recall_qps(results, dataset_name, output_dir):
         if not sweep:
             continue
 
-        recalls = [p["recall_at_10"] for p in sweep]
+        recalls = [p.get(recall_key, 0) for p in sweep]
         qps_vals = [p["qps"] for p in sweep]
 
         ax.plot(recalls, qps_vals,
                 color=style["color"], marker=style["marker"],
                 markersize=7, linewidth=1.5, label=style["label"])
 
-    ax.set_xlabel("Recall@10", fontsize=13)
+    ax.set_xlabel(f"Recall@{label_suffix}", fontsize=13)
     ax.set_ylabel("QPS (queries/sec)", fontsize=13)
     ax.set_yscale("log")
-    ax.set_title(f"Recall@10 vs QPS — {dataset_name}", fontsize=14)
+    ax.set_title(f"Recall@{label_suffix} vs QPS — {dataset_name}", fontsize=14)
     ax.legend(fontsize=9, loc="lower left")
     ax.grid(True, alpha=0.3)
     ax.set_xlim(0, 1.02)
 
-    outpath = Path(output_dir) / f"{dataset_name}_recall_qps.png"
+    outpath = Path(output_dir) / f"{dataset_name}_recall{label_suffix}_qps.png"
     fig.savefig(outpath, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    emit("plot_written", dataset=dataset_name, plot="recall_qps", path=str(outpath))
+    emit("plot_written", dataset=dataset_name, plot=f"recall{label_suffix}_qps", path=str(outpath))
+
+
+def plot_adr_qps(results, dataset_name, output_dir):
+    """Plot ADR vs QPS."""
+    fig, ax = plt.subplots(figsize=(10, 7))
+
+    for algo in results:
+        name = algo["algorithm"]
+        style = get_style(name)
+        sweep = algo["sweep"]
+        if not sweep or "adr" not in sweep[0]:
+            continue
+
+        adrs = [p["adr"] for p in sweep]
+        qps_vals = [p["qps"] for p in sweep]
+
+        ax.plot(adrs, qps_vals,
+                color=style["color"], marker=style["marker"],
+                markersize=7, linewidth=1.5, label=style["label"])
+
+    ax.set_xlabel("Average Distance Ratio (ADR)", fontsize=13)
+    ax.set_ylabel("QPS (queries/sec)", fontsize=13)
+    ax.set_yscale("log")
+    ax.set_title(f"ADR vs QPS — {dataset_name}", fontsize=14)
+    ax.legend(fontsize=9, loc="upper right")
+    ax.grid(True, alpha=0.3)
+
+    outpath = Path(output_dir) / f"{dataset_name}_adr_qps.png"
+    fig.savefig(outpath, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    emit("plot_written", dataset=dataset_name, plot="adr_qps", path=str(outpath))
 
 
 def plot_build_time(results, dataset_name, output_dir):
@@ -142,7 +167,6 @@ def plot_memory(results, dataset_name, output_dir):
     emit("plot_written", dataset=dataset_name, plot="memory", path=str(outpath))
 
 
-
 def process_file(filepath: str):
     """Generate all plots for one result file."""
     with open(filepath) as f:
@@ -155,7 +179,9 @@ def process_file(filepath: str):
 
     emit("plot_dataset_start", dataset=dataset_name, n_algorithms=len(results), source=str(filepath))
 
-    plot_recall_qps(results, dataset_name, output_dir)
+    plot_recall_qps(results, dataset_name, output_dir, "recall_at_10", "10")
+    plot_recall_qps(results, dataset_name, output_dir, "recall_at_100", "100")
+    plot_adr_qps(results, dataset_name, output_dir)
     plot_build_time(results, dataset_name, output_dir)
     plot_memory(results, dataset_name, output_dir)
 
@@ -166,9 +192,6 @@ def main():
     args = parser.parse_args()
 
     for filepath in args.files:
-        if not Path(filepath).exists():
-            emit("plot_input_missing", path=str(filepath))
-            continue
         process_file(filepath)
 
 

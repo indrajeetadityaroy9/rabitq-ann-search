@@ -10,21 +10,17 @@ requires-python = ">=3.8"
 license = {text = "MIT"}
 dependencies = [
     "numpy>=1.20",
+    "faiss-cpu>=1.7.0",
+    "hnswlib>=0.7.0",
+    "huggingface_hub>=0.16",
+    "pandas>=1.5",
+    "pyarrow>=10.0",
+    "matplotlib>=3.7",
+    "psutil>=5.9",
+    "torch>=2.0",
 ]
 
 [project.optional-dependencies]
-bench = [
-    "faiss-cpu>=1.7.0",
-    "hnswlib>=0.7.0",
-    "h5py>=3.8",
-    "matplotlib>=3.7",
-    "psutil>=5.9",
-]
-eval = [
-    "h5py>=3.8",
-    "matplotlib>=3.7",
-    "psutil>=5.9",
-]
 dev = [
     "pytest>=7.0",
 ]

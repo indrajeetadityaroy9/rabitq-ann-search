@@ -3,7 +3,6 @@
 #include "../core/codes.hpp"
 #include "../core/memory.hpp"
 #include "rotation.hpp"
-#include "dense_rotation.hpp"
 #include <cmath>
 #include <algorithm>
 #include <random>
@@ -47,11 +46,8 @@ public:
         }
 
         float d_float = static_cast<float>(D);
-        if constexpr (std::is_same<RotationPolicy, DenseRotation>::value) {
-            norm_factor_ = 1.0f;
-        } else {
-            norm_factor_ = 1.0f / (d_float * std::sqrt(d_float));
-        }
+        // Normalization factor for RandomHadamardRotation
+        norm_factor_ = 1.0f / (d_float * std::sqrt(d_float));
 
         inv_sqrt_d_ = 1.0f / std::sqrt(d_float);
         sqrt_d_ = std::sqrt(d_float);

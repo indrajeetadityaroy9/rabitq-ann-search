@@ -9,9 +9,13 @@ import time
 from pathlib import Path
 from typing import Callable
 
+import faiss
+import hnswlib
 import numpy as np
+import psutil
 
-from cphnsw.datasets import load_dataset, load_hdf5_dataset
+from cphnsw.datasets import ALL_DATASETS, load_dataset
+from cphnsw.metrics import recall_at_k
 
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -20,48 +24,6 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 def emit(event: str, **fields):
     print(json.dumps({"event": event, **fields}, sort_keys=True), flush=True)
-
-
-def normalize(X: np.ndarray) -> np.ndarray:
-    norms = np.linalg.norm(X, axis=1, keepdims=True)
-    norms[norms < 1e-10] = 1.0
-    return (X / norms).astype(np.float32)
-
-
-def load_named_dataset(name: str, base_dir: Path) -> dict:
-    if name.endswith(".hdf5") or name.endswith(".h5"):
-        raw = load_hdf5_dataset(name)
-        return {
-            "name": Path(name).stem,
-            "dim": raw["dim"],
-            "metric": "l2",
-            "base": raw["base"].astype(np.float32),
-            "queries": raw["queries"].astype(np.float32),
-            "groundtruth": raw["groundtruth"].astype(np.int64),
-        }
-
-    if name not in {"sift1m", "gist1m", "glove200"}:
-        raise ValueError(
-            f"Unknown dataset '{name}'. Use sift1m, gist1m, glove200, or an HDF5 path."
-        )
-
-    raw = load_dataset(name, base_dir=str(base_dir))
-    metric = "cosine" if name == "glove200" else "l2"
-    return {
-        "name": name,
-        "dim": raw["dim"],
-        "metric": metric,
-        "base": raw["base"].astype(np.float32),
-        "queries": raw["queries"].astype(np.float32),
-        "groundtruth": raw["groundtruth"].astype(np.int64),
-    }
-
-
-def recall_at_k(results: np.ndarray, gt: np.ndarray, k: int) -> float:
-    res = results[:, :k].astype(np.int64)
-    truth = gt[:, :k].astype(np.int64)
-    hits = np.any(res[:, :, None] == truth[:, None, :], axis=2)
-    return float(hits.sum(axis=1).mean()) / k
 
 
 def timed_search(search_fn: Callable, queries: np.ndarray,
@@ -85,13 +47,6 @@ def timed_search(search_fn: Callable, queries: np.ndarray,
 
 
 def get_rss_mb() -> float:
-    try:
-        import psutil
-    except ImportError as exc:
-        raise ImportError(
-            "psutil is required for benchmarking memory metrics. "
-            "Install benchmark dependencies: `pip install -e '.[bench]'`."
-        ) from exc
     return psutil.Process(os.getpid()).memory_info().rss / (1024 ** 2)
 
 
@@ -134,7 +89,7 @@ ALGORITHM_SPECS = [
         "M": 16,
         "ef_construction": 200,
         "param_name": "ef",
-        "param_values": [10, 20, 40, 80, 100, 200, 400, 800],
+        "param_values": [100, 120, 160, 200, 400, 800, 1200, 2000],
     },
     {
         "algorithm": "hnswlib-M32",
@@ -142,7 +97,7 @@ ALGORITHM_SPECS = [
         "M": 32,
         "ef_construction": 200,
         "param_name": "ef",
-        "param_values": [10, 20, 40, 80, 100, 200, 400, 800],
+        "param_values": [100, 120, 160, 200, 400, 800, 1200, 2000],
     },
     {
         "algorithm": "hnswlib-M64",
@@ -150,7 +105,7 @@ ALGORITHM_SPECS = [
         "M": 64,
         "ef_construction": 200,
         "param_name": "ef",
-        "param_values": [10, 20, 40, 80, 100, 200, 400, 800],
+        "param_values": [100, 120, 160, 200, 400, 800, 1200, 2000],
     },
     {
         "algorithm": "faiss-hnsw-M32",
@@ -158,7 +113,25 @@ ALGORITHM_SPECS = [
         "M": 32,
         "ef_construction": 200,
         "param_name": "ef",
-        "param_values": [10, 20, 40, 80, 100, 200, 400, 800],
+        "param_values": [100, 120, 160, 200, 400, 800, 1200, 2000],
+    },
+    {
+        "algorithm": "faiss-ivfpq",
+        "family": "faiss-ivfpq",
+        "nlist": 4096,
+        "M_pq": 32,
+        "nbits_pq": 8,
+        "param_name": "nprobe",
+        "param_values": [1, 2, 4, 8, 16, 32, 64, 128, 256],
+    },
+    {
+        "algorithm": "faiss-ivfopq",
+        "family": "faiss-ivfopq",
+        "nlist": 4096,
+        "M_pq": 32,
+        "nbits_pq": 8,
+        "param_name": "nprobe",
+        "param_values": [1, 2, 4, 8, 16, 32, 64, 128, 256],
     },
 ]
 
@@ -167,45 +140,35 @@ def run_benchmark(dataset_name: str, base_dir: Path,
                   k: int, n_runs: int, output_dir: Path):
     emit("benchmark_dataset_start", dataset=dataset_name)
 
-    ds = load_named_dataset(dataset_name, base_dir)
+    ds = load_dataset(dataset_name, base_dir=str(base_dir))
 
     base = ds["base"]
     queries = ds["queries"]
-    gt = ds["groundtruth"]
+    gt = ds["groundtruth"].astype(np.int64)
     dim = ds["dim"]
-    metric = ds["metric"]
-
-    if metric == "cosine":
-        base_norm = normalize(base)
-        queries_norm = normalize(queries)
-    else:
-        base_norm = base
-        queries_norm = queries
 
     emit(
         "benchmark_dataset_loaded",
-        dataset=ds["name"],
+        dataset=dataset_name,
         n_base=int(len(base)),
         n_queries=int(len(queries)),
         dim=int(dim),
-        metric=metric,
+        metric="l2",
         k=int(k),
         n_runs=int(n_runs),
     )
+
+    # Precompute ground truth distances once (constant across all algorithms/sweeps)
+    adr_k = min(k, 10)
+    gt_ids = gt[:, :adr_k].astype(np.int64)
+    gt_dists = np.sum((base[gt_ids] - queries[:, None, :]) ** 2, axis=2)
 
     results = []
 
     for spec in ALGORITHM_SPECS:
         family = spec["family"]
         algorithm = spec["algorithm"]
-        emit("benchmark_algorithm_start", dataset=ds["name"], algorithm=algorithm)
-
-        if family == "hnswlib" and metric == "cosine":
-            build_data = base
-            search_data = queries
-        else:
-            build_data = base_norm
-            search_data = queries_norm
+        emit("benchmark_algorithm_start", dataset=dataset_name, algorithm=algorithm)
 
         index = None
         gc.collect()
@@ -219,27 +182,42 @@ def run_benchmark(dataset_name: str, base_dir: Path,
                 index = cphnsw.HNSWIndex(dim=dim, bits=spec["bits"])
             else:
                 index = cphnsw.Index(dim=dim, bits=spec["bits"])
-            index.add(build_data)
+            index.add(base)
             index.finalize()
         elif family == "hnswlib":
-            import hnswlib
-
-            space = "cosine" if metric == "cosine" else "l2"
-            index = hnswlib.Index(space=space, dim=dim)
+            index = hnswlib.Index(space="l2", dim=dim)
             index.init_index(
-                max_elements=len(build_data),
+                max_elements=len(base),
                 ef_construction=spec["ef_construction"],
                 M=spec["M"],
             )
             index.set_num_threads(1)
-            index.add_items(build_data, np.arange(len(build_data)))
+            index.add_items(base, np.arange(len(base)))
         elif family == "faiss-hnsw":
-            import faiss
-
             faiss.omp_set_num_threads(1)
             index = faiss.IndexHNSWFlat(dim, spec["M"])
             index.hnsw.efConstruction = spec["ef_construction"]
-            index.add(build_data)
+            index.add(base)
+        elif family == "faiss-ivfpq":
+            faiss.omp_set_num_threads(1)
+            m_pq = min(spec["M_pq"], dim)
+            while dim % m_pq != 0 and m_pq > 1:
+                m_pq -= 1
+            quantizer = faiss.IndexFlatL2(dim)
+            index = faiss.IndexIVFPQ(quantizer, dim, spec["nlist"], m_pq, spec["nbits_pq"])
+            index.train(base)
+            index.add(base)
+        elif family == "faiss-ivfopq":
+            faiss.omp_set_num_threads(1)
+            m_pq = min(spec["M_pq"], dim)
+            while dim % m_pq != 0 and m_pq > 1:
+                m_pq -= 1
+            index = faiss.index_factory(
+                dim, f"OPQ{m_pq},IVF{spec['nlist']},PQ{m_pq}x{spec['nbits_pq']}"
+            )
+            index.train(base)
+            index.add(base)
+            ivf_sub = faiss.extract_index_ivf(index)
         else:
             raise ValueError(f"Unsupported algorithm family: {family}")
 
@@ -250,7 +228,7 @@ def run_benchmark(dataset_name: str, base_dir: Path,
 
         emit(
             "benchmark_algorithm_built",
-            dataset=ds["name"],
+            dataset=dataset_name,
             algorithm=algorithm,
             build_time_s=round(build_time, 3),
             memory_mb=round(mem_mb, 3),
@@ -259,47 +237,69 @@ def run_benchmark(dataset_name: str, base_dir: Path,
         sweep = []
         for pval in spec["param_values"]:
             if family == "cphnsw":
-                def search_fn(batch):
+                def search_fn(batch, _rt=float(pval)):
                     ids, _ = index.search_batch(
-                        batch, k=k, n_threads=1, recall_target=float(pval)
+                        batch, k=k, n_threads=1, recall_target=_rt
                     )
                     return np.asarray(ids)
             elif family == "hnswlib":
-                def search_fn(batch):
-                    index.set_ef(int(pval))
+                def search_fn(batch, _ef=int(pval)):
+                    index.set_ef(max(_ef, k))
                     labels, _ = index.knn_query(batch, k=k, num_threads=1)
                     return labels
-            else:
-                import faiss
-
-                def search_fn(batch):
+            elif family == "faiss-hnsw":
+                def search_fn(batch, _ef=int(pval)):
                     faiss.omp_set_num_threads(1)
-                    index.hnsw.efSearch = max(int(pval), k)
+                    index.hnsw.efSearch = max(_ef, k)
                     _, ids = index.search(batch, k)
                     return ids
+            elif family == "faiss-ivfpq":
+                def search_fn(batch, _nprobe=int(pval)):
+                    faiss.omp_set_num_threads(1)
+                    index.nprobe = _nprobe
+                    _, ids = index.search(batch, k)
+                    return ids
+            elif family == "faiss-ivfopq":
+                def search_fn(batch, _nprobe=int(pval)):
+                    faiss.omp_set_num_threads(1)
+                    ivf_sub.nprobe = _nprobe
+                    _, ids = index.search(batch, k)
+                    return ids
+            else:
+                raise ValueError(f"Unsupported algorithm family: {family}")
 
-            ids, qps_val, med_time = timed_search(search_fn, search_data, n_warmup=1, n_runs=n_runs)
+            ids, qps_val, med_time = timed_search(search_fn, queries, n_warmup=1, n_runs=n_runs)
             r1 = recall_at_k(ids, gt, 1)
             r10 = recall_at_k(ids, gt, min(k, 10))
-            lat_us = med_time / len(search_data) * 1e6
+            r100 = recall_at_k(ids, gt, min(k, 100))
+            lat_us = med_time / len(queries) * 1e6
+
+            # ADR: exact L2 for result neighbors, divided by precomputed GT distances
+            res_ids = ids[:, :adr_k].astype(np.int64)
+            res_dists = np.sum((base[res_ids] - queries[:, None, :]) ** 2, axis=2)
+            adr = float(np.mean(res_dists / np.maximum(gt_dists, 1e-10)))
 
             sweep.append({
                 "param_name": spec["param_name"],
                 "param_value": float(pval),
                 "recall_at_1": round(r1, 4),
                 "recall_at_10": round(r10, 4),
+                "recall_at_100": round(r100, 4),
+                "adr": round(adr, 6),
                 "qps": round(qps_val, 1),
                 "median_latency_us": round(lat_us, 2),
             })
 
             emit(
                 "benchmark_point",
-                dataset=ds["name"],
+                dataset=dataset_name,
                 algorithm=algorithm,
                 param_name=spec["param_name"],
                 param_value=float(pval),
                 recall_at_1=round(r1, 4),
                 recall_at_10=round(r10, 4),
+                recall_at_100=round(r100, 4),
+                adr=round(adr, 6),
                 qps=round(qps_val, 3),
                 median_latency_us=round(lat_us, 3),
             )
@@ -317,11 +317,11 @@ def run_benchmark(dataset_name: str, base_dir: Path,
     output = {
         "metadata": {
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "dataset": ds["name"],
+            "dataset": dataset_name,
             "n_base": len(base),
             "n_queries": len(queries),
             "dim": dim,
-            "metric": metric,
+            "metric": "l2",
             "k": k,
             "n_runs": n_runs,
             "base_dir": str(base_dir),
@@ -333,7 +333,7 @@ def run_benchmark(dataset_name: str, base_dir: Path,
     outfile = output_dir / f"{dataset_name}_results.json"
     with outfile.open("w") as f:
         json.dump(output, f, indent=2)
-    emit("benchmark_dataset_done", dataset=ds["name"], output=str(outfile))
+    emit("benchmark_dataset_done", dataset=dataset_name, output=str(outfile))
     return str(outfile)
 
 
@@ -342,14 +342,14 @@ def parse_args():
     parser.add_argument(
         "--dataset",
         default="sift1m",
-        help="Dataset name (sift1m, gist1m, glove200, all) or path to HDF5 file",
+        help=f"Dataset name ({', '.join(ALL_DATASETS)}, all)",
     )
     parser.add_argument(
         "--base-dir",
         default="data",
         help="Base directory containing named datasets",
     )
-    parser.add_argument("--k", type=int, default=10)
+    parser.add_argument("--k", type=int, default=100)
     parser.add_argument("--n-runs", type=int, default=3)
     parser.add_argument("--output-dir", default="results")
     return parser.parse_args()
@@ -360,7 +360,7 @@ def main():
     base_dir = Path(args.base_dir).resolve()
     output_dir = Path(args.output_dir).resolve()
 
-    datasets = ["sift1m", "glove200"] if args.dataset == "all" else [args.dataset]
+    datasets = ALL_DATASETS if args.dataset == "all" else [args.dataset]
 
     result_files = []
     for ds_name in datasets:

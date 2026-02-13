@@ -17,16 +17,14 @@ The goal is to reduce parameter tuning burden while preserving competitive recal
    1/2/4-bit code paths share a common graph/search framework (`include/cphnsw/core/codes.hpp`, `include/cphnsw/api/rabitq_index.hpp`).
 
 ## Architecture
-### Core C++ Modules (Novel Contributions)
+### Core C++ Modules
 - `include/cphnsw/api/rabitq_index.hpp`: **flat index API** (`RaBitQIndex`) - main research contribution.
 - `include/cphnsw/encoder/rabitq_encoder.hpp`: centroid-relative quantization and query encoding.
 - `include/cphnsw/graph/graph_refinement.hpp`: graph build pipeline (random init -> NN-Descent -> alpha-CG pruning -> reverse-edge pass -> hub entry).
 - `include/cphnsw/distance/fastscan_kernel.hpp`: SIMD distance estimation and lower-bound kernels.
 - `include/cphnsw/search/rabitq_search.hpp`: quantization-aware traversal/termination.
 - `include/cphnsw/core/adaptive_defaults.hpp`: derived defaults from recall/error objectives.
-
-### Optional Extensions (Standard Techniques)
-- `include/cphnsw/api/hnsw_index.hpp`: **hierarchical index API** (`HNSWIndex`) - optional scalability extension using standard HNSW multi-layer routing (not a core research contribution). Uses exact L2 distances in upper layers for routing, quantized search only at layer 0.
+- `include/cphnsw/api/hnsw_index.hpp`: **hierarchical index API** (`HNSWIndex`) - optional scalability extension using standard HNSW multi-layer routing. Uses exact L2 distances in upper layers for routing, quantized search only at layer 0.
 
 ### Python Layer
 - `src/bindings.cpp`: pybind11 bridge exposing `Index` and `HNSWIndex`.

@@ -21,15 +21,15 @@
 
 namespace cphnsw {
 
-template <size_t D, size_t R = 32, size_t BitWidth = 1, typename RotationPolicy = RandomHadamardRotation>
+template <size_t D, size_t R = 32, size_t BitWidth = 1>
 class RaBitQIndex {
 public:
     using CodeType = std::conditional_t<BitWidth == 1,
         RaBitQCode<D>, NbitRaBitQCode<D, BitWidth>>;
     using QueryType = RaBitQQuery<D>;
     using Encoder = std::conditional_t<BitWidth == 1,
-        RaBitQEncoder<D, RotationPolicy>,
-        NbitRaBitQEncoder<D, BitWidth, RotationPolicy>>;
+        RaBitQEncoder<D>,
+        NbitRaBitQEncoder<D, BitWidth>>;
     using Graph = RaBitQGraph<D, R, BitWidth>;
     using Engine = RaBitQSearchEngine<D, R, BitWidth>;
     using Refinement = GraphRefinement<D, R, BitWidth>;
@@ -47,19 +47,6 @@ public:
 
     explicit RaBitQIndex(size_t dim)
         : RaBitQIndex(IndexParams().set_dim(dim)) {}
-
-    NodeId add(const float* vec) {
-        if (!encoder_.has_centroid()) {
-            std::vector<float> zero(params_.dim, 0.0f);
-            encoder_.set_centroid(zero.data());
-        }
-
-        CodeType code = encoder_.encode(vec);
-        NodeId id = graph_.add_node(code, vec);
-
-        needs_build_ = true;
-        return id;
-    }
 
     void add_batch(const float* vecs, size_t num_vecs,
                    const BuildParams& build_params = BuildParams()) {
@@ -88,10 +75,6 @@ public:
         finalized_ = true;
     }
 
-    void finalize() {
-        finalize(BuildParams{});
-    }
-
     std::vector<SearchResult> search(
         const float* query,
         const SearchParams& params = SearchParams()) const
@@ -101,14 +84,12 @@ public:
         float gamma = AdaptiveDefaults::gamma_from_recall(params.recall_target, D);
         float eps = AdaptiveDefaults::error_epsilon_search(params.recall_target);
 
-        QueryType encoded = encoder_.encode_query(query);
+        // SymphonyQG: use raw query LUT (no centering/normalizing)
+        // for parent-relative edge distance estimation
+        QueryType encoded = encoder_.encode_query_raw(query);
         encoded.error_epsilon = eps;
 
         return Engine::search(encoded, query, graph_, params.k, gamma);
-    }
-
-    std::vector<SearchResult> search(const float* query, size_t k) const {
-        return search(query, SearchParams().set_k(k));
     }
 
     size_t size() const { return graph_.size(); }

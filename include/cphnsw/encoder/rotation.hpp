@@ -3,9 +3,7 @@
 #include "../core/memory.hpp"
 #include "transform/fht.hpp"
 #include <vector>
-#include <array>
 #include <random>
-#include <memory>
 #include <cstring>
 
 namespace cphnsw {
@@ -43,15 +41,10 @@ public:
     size_t original_dim() const { return original_dim_; }
     size_t padded_dim() const { return padded_dim_; }
 
-    const std::array<std::vector<int8_t>, NUM_LAYERS>& get_signs() const {
-        return signs_;
-    }
-
 private:
     size_t original_dim_;
     size_t padded_dim_;
-    std::array<std::vector<int8_t>, NUM_LAYERS> signs_;
-    std::array<AlignedVector<float>, NUM_LAYERS> signs_float_;  // ±1.0f for SIMD diagonal
+    std::array<AlignedVector<float>, NUM_LAYERS> signs_float_;
 
     static size_t next_power_of_two(size_t n) {
         size_t p = 1;
@@ -64,12 +57,9 @@ private:
         std::uniform_int_distribution<int> coin(0, 1);
 
         for (size_t layer = 0; layer < NUM_LAYERS; ++layer) {
-            signs_[layer].resize(padded_dim_);
             signs_float_[layer].resize(padded_dim_);
             for (size_t i = 0; i < padded_dim_; ++i) {
-                int8_t s = coin(rng) ? 1 : -1;
-                signs_[layer][i] = s;
-                signs_float_[layer][i] = static_cast<float>(s);
+                signs_float_[layer][i] = coin(rng) ? 1.0f : -1.0f;
             }
         }
     }

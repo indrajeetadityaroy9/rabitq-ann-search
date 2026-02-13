@@ -233,7 +233,4 @@ private:
     mutable std::mutex graph_mutex_;
 };
 
-template <size_t D, size_t R = 32, size_t BitWidth = 2>
-using NbitRaBitQGraph = RaBitQGraph<D, R, BitWidth>;
-
 }  // namespace cphnsw

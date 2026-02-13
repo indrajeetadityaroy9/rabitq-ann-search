@@ -46,7 +46,8 @@ public:
             float ip_qo = code.ip_quantized_original;
             if (ip_qo < 1e-10f) return 0.0f;
             float ip_qo_sq = ip_qo * ip_qo;
-            float variance = (1.0f - ip_qo_sq) / (ip_qo_sq * static_cast<float>(D));
+            float Df = static_cast<float>(D);
+            float variance = (1.0f - ip_qo_sq) * (Df - 1.0f) / (ip_qo_sq * Df);
             return error_tolerance * std::sqrt(variance) * code.dist_to_centroid;
         };
 
@@ -62,7 +63,10 @@ public:
         auto& nb = graph.get_neighbors(node);
         nb.count = 0;
         const float* vec_node = graph.get_vector(node);
-        float np = graph.get_code(node).dist_to_centroid;
+
+        // SymphonyQG: rotate parent vector once, shared across all edges
+        alignas(32) float rotated_parent[D];
+        encoder.rotate_raw_vector(vec_node, rotated_parent);
 
         for (size_t j = 0; j < selected.size(); ++j) {
             NodeId v = selected[j].id;
@@ -70,7 +74,7 @@ public:
             const float* vec_v = graph.get_vector(v);
             BinaryCodeStorage<EncType::DIMS> pr_code;
             VertexAuxData aux = encoder.compute_neighbor_aux(
-                code_v, vec_node, vec_v, np, &pr_code);
+                code_v, vec_node, vec_v, rotated_parent, &pr_code);
 
             if constexpr (BitWidth == 1) {
                 nb.set_neighbor(j, v, pr_code, aux);

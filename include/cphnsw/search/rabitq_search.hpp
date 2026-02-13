@@ -60,7 +60,6 @@ class RaBitQSearchEngine {
 public:
     using Graph = RaBitQGraph<D, R, BitWidth>;
     using QueryType = RaBitQQuery<D>;
-    using Policy = RaBitQMetricPolicy<D>;
 
     struct BeamEntry {
         float est_distance;
@@ -91,33 +90,9 @@ public:
                            std::greater<BeamEntry>> beam;
         BoundedMaxHeap<SearchResult> nn(k);
 
-        float ep_est;
-        if constexpr (BitWidth == 1) {
-            ep_est = Policy::compute_distance(query, graph.get_code(ep));
-        } else {
-            const auto& nbit_code = graph.get_code(ep);
-            float dist_o = nbit_code.dist_to_centroid;
-            float ip_qo = nbit_code.ip_quantized_original;
-            constexpr size_t NUM_SUB_SEGMENTS = (D + 3) / 4;
-            uint32_t fastscan_sum = 0;
-            auto msb_signs = nbit_code.codes.msb_as_binary();
-            for (size_t j = 0; j < NUM_SUB_SEGMENTS; ++j) {
-                size_t bit_base = j * 4;
-                uint8_t pattern = 0;
-                for (size_t b = 0; b < 4 && (bit_base + b) < D; ++b) {
-                    if (msb_signs.get_bit(bit_base + b)) {
-                        pattern |= (1 << b);
-                    }
-                }
-                fastscan_sum += query.lut[j][pattern];
-            }
-            float ip_approx = query.coeff_fastscan * static_cast<float>(fastscan_sum)
-                            + query.coeff_popcount * static_cast<float>(nbit_code.msb_popcount)
-                            + query.coeff_constant;
-            float ip_est = (ip_qo > 1e-10f) ? ip_approx / ip_qo : 0.0f;
-            ep_est = dist_o * dist_o + query.query_norm_sq
-                   - 2.0f * dist_o * query.query_norm * ip_est;
-        }
+        // Use exact L2 for entry point (SymphonyQG raw query LUT
+        // is not suitable for centroid-relative entry point estimation)
+        float ep_est = l2_distance_simd<D>(raw_query, graph.get_vector(ep));
         beam.push({ep_est, 0.0f, ep});
         visited.check_and_mark_estimated(ep, query_id);
 
@@ -167,7 +142,6 @@ public:
             size_t n_neighbors = nb.size();
             if (n_neighbors == 0) continue;
 
-            float parent_norm = graph.get_code(current.id).dist_to_centroid;
             float dist_qp_sq = exact_dist;
 
             constexpr size_t BATCH = 32;
@@ -186,7 +160,7 @@ public:
                         query, fastscan_sums + batch_start,
                         nb.aux + batch_start, nb.popcounts + batch_start,
                         batch_count, est_distances + batch_start,
-                        lower_bounds + batch_start, parent_norm, dist_qp_sq);
+                        lower_bounds + batch_start, dist_qp_sq);
                 } else {
                     fastscan::compute_nbit_inner_products<D, BitWidth>(
                         query.lut, nb.code_blocks[batch],
@@ -197,7 +171,7 @@ public:
                         nb.popcounts + batch_start,
                         nb.weighted_popcounts + batch_start,
                         batch_count, est_distances + batch_start,
-                        lower_bounds + batch_start, parent_norm, dist_qp_sq);
+                        lower_bounds + batch_start, dist_qp_sq);
                 }
             }
 
@@ -257,143 +231,6 @@ public:
             visited.resize(graph.size() + 1024);
         }
         return search(query, raw_query, graph, k, gamma, visited, 4096, entry);
-    }
-};
-
-struct ExactL2Policy {
-    template <size_t D>
-    static float compute(const float* a, const float* b) {
-        return l2_distance_simd<D>(a, b);
-    }
-};
-
-template <size_t D, size_t R = 32, size_t BitWidth = 1, typename DistancePolicy = ExactL2Policy>
-class GraphSearchEngine {
-public:
-    using Graph = RaBitQGraph<D, R, BitWidth>;
-
-    struct BeamEntry {
-        float distance;
-        NodeId id;
-        bool operator>(const BeamEntry& o) const { return distance > o.distance; }
-    };
-
-    static std::vector<SearchResult> search(
-        const float* raw_query,
-        const Graph& graph,
-        size_t ef,
-        size_t k,
-        VisitationTable& visited,
-        NodeId entry = INVALID_NODE)
-    {
-        if (graph.empty()) return {};
-        if (k == 0) k = ef;
-
-        NodeId ep = (entry != INVALID_NODE) ? entry : graph.entry_point();
-        if (ep == INVALID_NODE) return {};
-
-        uint64_t query_id = visited.new_query();
-
-        std::priority_queue<BeamEntry, std::vector<BeamEntry>,
-                           std::greater<BeamEntry>> beam;
-        BoundedMaxHeap<SearchResult> nn(k);
-
-        float ep_dist = DistancePolicy::template compute<D>(raw_query, graph.get_vector(ep));
-        beam.push({ep_dist, ep});
-        visited.check_and_mark(ep, query_id);
-
-        while (!beam.empty()) {
-            BeamEntry current = beam.top();
-            beam.pop();
-
-            if (nn.size() >= k && current.distance > nn.top().distance) break;
-
-            if (!beam.empty()) {
-                graph.prefetch_vertex(beam.top().id);
-            }
-
-            nn.push({current.id, current.distance});
-
-            const auto& nb = graph.get_neighbors(current.id);
-            size_t n_neighbors = nb.size();
-
-            for (size_t i = 0; i < n_neighbors; ++i) {
-                if (i + 2 < n_neighbors) {
-                    NodeId prefetch_id = nb.neighbor_ids[i + 2];
-                    if (prefetch_id != INVALID_NODE) {
-                        prefetch_t<0>(graph.get_vector(prefetch_id));
-                    }
-                }
-
-                NodeId neighbor_id = nb.neighbor_ids[i];
-                if (neighbor_id == INVALID_NODE) continue;
-                if (visited.check_and_mark(neighbor_id, query_id)) continue;
-
-                float dist = DistancePolicy::template compute<D>(raw_query, graph.get_vector(neighbor_id));
-
-                if (nn.size() >= k && dist >= nn.top().distance) continue;
-
-                beam.push({dist, neighbor_id});
-            }
-
-            if (beam.size() > ef * 4) {
-                std::priority_queue<BeamEntry, std::vector<BeamEntry>,
-                                   std::greater<BeamEntry>> new_beam;
-                size_t kept = 0;
-                while (!beam.empty() && kept < ef) {
-                    new_beam.push(beam.top());
-                    beam.pop();
-                    kept++;
-                }
-                beam = std::move(new_beam);
-            }
-        }
-
-        return nn.extract_sorted();
-    }
-};
-
-template <size_t D, size_t R = 32, size_t BitWidth = 1>
-class QuantizedBuildSearchEngine {
-public:
-    using Graph = RaBitQGraph<D, R, BitWidth>;
-
-    template <typename EncoderType>
-    static std::vector<SearchResult> search(
-        const float* raw_query,
-        const Graph& graph,
-        const EncoderType& encoder,
-        size_t ef, size_t k,
-        TwoLevelVisitationTable& visited,
-        float error_epsilon,
-        NodeId entry = INVALID_NODE)
-    {
-        if (graph.empty()) return {};
-        auto query = encoder.encode_query(raw_query);
-        query.error_epsilon = error_epsilon;
-        float gamma = 0.5f;
-        return RaBitQSearchEngine<D, R, BitWidth>::search(
-            query, raw_query, graph, k, gamma, visited, ef, entry);
-    }
-
-    template <typename EncoderType>
-    static std::vector<SearchResult> search(
-        const float* raw_query,
-        const Graph& graph,
-        const EncoderType& encoder,
-        size_t ef, size_t k,
-        float error_epsilon)
-    {
-        if (graph.empty()) return {};
-        auto query = encoder.encode_query(raw_query);
-        query.error_epsilon = error_epsilon;
-        float gamma = 0.5f;
-        thread_local TwoLevelVisitationTable visited(0);
-        if (visited.capacity() < graph.size()) {
-            visited.resize(graph.size() + 1024);
-        }
-        return RaBitQSearchEngine<D, R, BitWidth>::search(
-            query, raw_query, graph, k, gamma, visited, ef);
     }
 };
 

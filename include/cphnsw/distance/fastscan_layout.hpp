@@ -31,23 +31,6 @@ struct FastScanCodeBlock {
         }
     }
 
-    void load(size_t idx, BinaryCodeStorage<D>& code) const {
-        code.clear();
-        for (size_t sp = 0; sp < NUM_SUB_PAIRS; ++sp) {
-            size_t seg_lo = 2 * sp;
-            size_t seg_hi = 2 * sp + 1;
-
-            uint8_t byte = packed[sp][idx];
-            uint8_t lo = byte & 0x0F;
-            uint8_t hi = (byte >> 4) & 0x0F;
-
-            inject_sub_segment(code, seg_lo, lo);
-            if (seg_hi < NUM_SUB_SEGMENTS) {
-                inject_sub_segment(code, seg_hi, hi);
-            }
-        }
-    }
-
     void clear() {
         std::memset(packed, 0, sizeof(packed));
     }
@@ -64,12 +47,6 @@ private:
         return result;
     }
 
-    static void inject_sub_segment(BinaryCodeStorage<D>& code, size_t seg_idx, uint8_t nibble) {
-        size_t bit_start = seg_idx * 4;
-        for (size_t b = 0; b < 4 && (bit_start + b) < D; ++b) {
-            code.set_bit(bit_start + b, (nibble >> b) & 1);
-        }
-    }
 };
 
 template <size_t D, size_t R = 32, size_t BatchSize = 32>
@@ -108,15 +85,6 @@ struct FastScanNeighborBlock {
     size_t size() const { return count; }
     bool empty() const { return count == 0; }
 };
-
-using FastScanBlock128 = FastScanCodeBlock<128, 32>;
-using FastScanBlock256 = FastScanCodeBlock<256, 32>;
-using FastScanBlock1024 = FastScanCodeBlock<1024, 32>;
-
-using FastScanNeighbors128_32 = FastScanNeighborBlock<128, 32, 32>;
-using FastScanNeighbors256_32 = FastScanNeighborBlock<256, 32, 32>;
-using FastScanNeighbors1024_32 = FastScanNeighborBlock<1024, 32, 32>;
-
 
 template <size_t D, size_t BitWidth, size_t BatchSize = 32>
 struct NbitFastScanCodeBlock {

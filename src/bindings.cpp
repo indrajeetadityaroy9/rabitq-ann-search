@@ -32,14 +32,14 @@ public:
     virtual void save(const std::string& path) const = 0;
 };
 
-template <size_t D, size_t BitWidth = 1>
-class PyIndex : public PyIndexBase {
+template <typename IndexType, size_t D, size_t BitWidth>
+class PyIndexWrapper : public PyIndexBase {
 public:
-    PyIndex(size_t dim, uint64_t seed) {
+    PyIndexWrapper(size_t dim, uint64_t seed) {
         IndexParams params;
         params.dim = dim;
         params.seed = seed;
-        index_ = std::make_unique<RaBitQIndex<D, 32, BitWidth>>(params);
+        index_ = std::make_unique<IndexType>(params);
     }
 
     void add_batch(const float* vecs, size_t n) override {
@@ -64,43 +64,7 @@ public:
     }
 
 private:
-    std::unique_ptr<RaBitQIndex<D, 32, BitWidth>> index_;
-};
-
-
-template <size_t D, size_t BitWidth = 1>
-class PyHNSWIndex : public PyIndexBase {
-public:
-    PyHNSWIndex(size_t dim, uint64_t seed) {
-        IndexParams params;
-        params.dim = dim;
-        params.seed = seed;
-        index_ = std::make_unique<HNSWIndex<D, 32, BitWidth>>(params);
-    }
-
-    void add_batch(const float* vecs, size_t n) override {
-        index_->add_batch(vecs, n);
-    }
-
-    void finalize(const BuildParams& params) override {
-        index_->finalize(params);
-    }
-
-    size_t size() const override { return index_->size(); }
-    size_t dim() const override { return index_->dim(); }
-    bool is_finalized() const override { return index_->is_finalized(); }
-
-    std::vector<SearchResult>
-    search_raw(const float* query, const SearchParams& params) const override {
-        return index_->search(query, params);
-    }
-
-    void save(const std::string& path) const override {
-        IndexSerializer<D, 32, BitWidth>::save(path, index_->graph());
-    }
-
-private:
-    std::unique_ptr<HNSWIndex<D, 32, BitWidth>> index_;
+    std::unique_ptr<IndexType> index_;
 };
 
 
@@ -115,33 +79,30 @@ static std::unique_ptr<PyIndexBase> create_index_with_bits(
     size_t dim, uint64_t seed, bool hierarchical)
 {
     size_t pd = padded_dim(dim);
+
+    #define CASE_DIM(DIM) \
+        case DIM: \
+            return hierarchical \
+                ? std::make_unique<PyIndexWrapper<HNSWIndex<DIM, 32, BitWidth>, DIM, BitWidth>>(dim, seed) \
+                : std::make_unique<PyIndexWrapper<RaBitQIndex<DIM, 32, BitWidth>, DIM, BitWidth>>(dim, seed);
+
     switch (pd) {
-        case 128:
-            return hierarchical
-                ? std::make_unique<PyHNSWIndex<128, BitWidth>>(dim, seed)
-                : std::make_unique<PyIndex<128, BitWidth>>(dim, seed);
-        case 256:
-            return hierarchical
-                ? std::make_unique<PyHNSWIndex<256, BitWidth>>(dim, seed)
-                : std::make_unique<PyIndex<256, BitWidth>>(dim, seed);
-        case 512:
-            return hierarchical
-                ? std::make_unique<PyHNSWIndex<512, BitWidth>>(dim, seed)
-                : std::make_unique<PyIndex<512, BitWidth>>(dim, seed);
-        case 1024:
-            return hierarchical
-                ? std::make_unique<PyHNSWIndex<1024, BitWidth>>(dim, seed)
-                : std::make_unique<PyIndex<1024, BitWidth>>(dim, seed);
-        case 2048:
-            return hierarchical
-                ? std::make_unique<PyHNSWIndex<2048, BitWidth>>(dim, seed)
-                : std::make_unique<PyIndex<2048, BitWidth>>(dim, seed);
+        CASE_DIM(16)
+        CASE_DIM(32)
+        CASE_DIM(64)
+        CASE_DIM(128)
+        CASE_DIM(256)
+        CASE_DIM(512)
+        CASE_DIM(1024)
+        CASE_DIM(2048)
         default:
             throw std::invalid_argument(
                 "Unsupported dimension " + std::to_string(dim) +
                 " (padded to " + std::to_string(pd) +
-                "). Supported padded dims: 128, 256, 512, 1024, 2048.");
+                "). Supported padded dims: 16, 32, 64, 128, 256, 512, 1024, 2048.");
     }
+
+    #undef CASE_DIM
 }
 
 static std::unique_ptr<PyIndexBase> create_index(

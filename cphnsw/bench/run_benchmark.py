@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Run ANN benchmark sweeps and persist JSON results."""
 
 import argparse

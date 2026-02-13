@@ -85,39 +85,6 @@ inline void compute_inner_products(
 }
 
 template <size_t D>
-inline void convert_to_distances(
-    const RaBitQQuery<D>& query,
-    const uint32_t* fastscan_sums,
-    const VertexAuxData* aux,
-    const uint16_t* popcounts,
-    size_t count,
-    float* out,
-    float parent_norm_unused,
-    float dist_qp_sq)
-{
-    (void)parent_norm_unused;
-    float A = query.coeff_fastscan;
-    float B = query.coeff_popcount;
-    float C = query.coeff_constant;
-    float query_norm = query.query_norm;
-
-    for (size_t i = 0; i < count; ++i) {
-        float ip_approx = A * static_cast<float>(fastscan_sums[i])
-                        + B * static_cast<float>(popcounts[i])
-                        + C;
-
-        float ip_qo_p = aux[i].ip_quantized_original;
-
-        float ip_est = (ip_qo_p > 1e-10f) ? ip_approx / ip_qo_p : 0.0f;
-
-        float nop = aux[i].dist_to_centroid;
-        float correction = aux[i].ip_xbar_Pinv_c;
-        out[i] = correction + dist_qp_sq
-               - 2.0f * query_norm * nop * ip_est;
-    }
-}
-
-template <size_t D>
 inline void convert_to_distances_with_bounds(
     const RaBitQQuery<D>& query,
     const uint32_t* fastscan_sums,
@@ -126,15 +93,14 @@ inline void convert_to_distances_with_bounds(
     size_t count,
     float* out_dist,
     float* out_lower,
-    float parent_norm_unused,
     float dist_qp_sq)
 {
-    (void)parent_norm_unused;
     float A = query.coeff_fastscan;
     float B = query.coeff_popcount;
     float C = query.coeff_constant;
-    float query_norm = query.query_norm;
     float epsilon = query.error_epsilon;
+
+    float sqrt_dqp = std::sqrt(dist_qp_sq);
 
     for (size_t i = 0; i < count; ++i) {
         float ip_approx = A * static_cast<float>(fastscan_sums[i])
@@ -143,13 +109,13 @@ inline void convert_to_distances_with_bounds(
 
         float ip_qo_p = aux[i].ip_quantized_original;
 
-        float ip_est = (ip_qo_p > 1e-10f) ? ip_approx / ip_qo_p : 0.0f;
+        // SymphonyQG: subtract precomputed parent contribution
+        float ip_corrected = ip_approx - aux[i].ip_code_parent;
+        float ip_est = (ip_qo_p > 1e-10f) ? ip_corrected / ip_qo_p : 0.0f;
 
         float nop = aux[i].dist_to_centroid;
-        float correction = aux[i].ip_xbar_Pinv_c;
 
-        out_dist[i] = correction + dist_qp_sq
-                    - 2.0f * query_norm * nop * ip_est;
+        out_dist[i] = nop * nop + dist_qp_sq - 2.0f * nop * ip_est;
 
         float ip_qo_p_sq = ip_qo_p * ip_qo_p;
         if (ip_qo_p_sq < 1e-10f) {
@@ -157,14 +123,18 @@ inline void convert_to_distances_with_bounds(
             out_lower[i] = std::max(out_dist[i], 0.0f);
             continue;
         }
+        float Df = static_cast<float>(D);
         float bound_on_cos = epsilon * std::sqrt(
-            (1.0f - ip_qo_p_sq) / (ip_qo_p_sq * static_cast<float>(D)));
+            (1.0f - ip_qo_p_sq) * (Df - 1.0f) / (ip_qo_p_sq * Df));
 
-        float cos_upper = std::min(ip_est + bound_on_cos, 1.0f);
+        // Lower bound: cos could be as high as cos_approx + bound
+        float cos_upper = (sqrt_dqp > 1e-10f)
+            ? std::min(ip_est / sqrt_dqp + bound_on_cos, 1.0f)
+            : 1.0f;
 
         out_dist[i] = std::max(out_dist[i], 0.0f);
-        out_lower[i] = correction + dist_qp_sq
-                      - 2.0f * query_norm * nop * cos_upper;
+        out_lower[i] = nop * nop + dist_qp_sq
+                      - 2.0f * nop * sqrt_dqp * cos_upper;
         if (out_lower[i] < 0.0f) out_lower[i] = 0.0f;
     }
 }
@@ -204,21 +174,20 @@ inline void convert_nbit_to_distances_with_bounds(
     size_t count,
     float* out_dist,
     float* out_lower,
-    float parent_norm_unused,
     float dist_qp_sq)
 {
-    (void)parent_norm_unused;
     constexpr float K = static_cast<float>((1u << BitWidth) - 1);
     constexpr float inv_K = 1.0f / K;
 
     float A_nbit = query.coeff_fastscan * inv_K;
     float B_nbit = query.coeff_popcount * inv_K;
     float C = query.coeff_constant;
-    float query_norm = query.query_norm;
     float epsilon = query.error_epsilon;
 
     float A_msb = query.coeff_fastscan;
     float B_msb = query.coeff_popcount;
+
+    float sqrt_dqp = std::sqrt(dist_qp_sq);
 
     for (size_t i = 0; i < count; ++i) {
         float ip_approx_nbit = A_nbit * static_cast<float>(nbit_fastscan_sums[i])
@@ -226,14 +195,17 @@ inline void convert_nbit_to_distances_with_bounds(
                              + C;
 
         float ip_qo_p = aux[i].ip_quantized_original;
-        float ip_est_nbit = (ip_qo_p > 1e-10f) ? ip_approx_nbit / ip_qo_p : 0.0f;
+
+        // SymphonyQG: subtract precomputed parent contribution (scaled for nbit)
+        float ip_corrected_nbit = ip_approx_nbit - aux[i].ip_code_parent;
+        float ip_est_nbit = (ip_qo_p > 1e-10f) ? ip_corrected_nbit / ip_qo_p : 0.0f;
 
         float nop = aux[i].dist_to_centroid;    // ||o-p||
-        float correction = aux[i].ip_xbar_Pinv_c;  // no² - np²
 
-        out_dist[i] = correction + dist_qp_sq
-                    - 2.0f * query_norm * nop * ip_est_nbit;
+        out_dist[i] = nop * nop + dist_qp_sq
+                    - 2.0f * nop * ip_est_nbit;
 
+        // MSB-based lower bound
         float ip_approx_msb = A_msb * static_cast<float>(msb_fastscan_sums[i])
                             + B_msb * static_cast<float>(msb_popcounts[i])
                             + C;
@@ -244,91 +216,23 @@ inline void convert_nbit_to_distances_with_bounds(
             out_lower[i] = std::max(out_dist[i], 0.0f);
             continue;
         }
+        float Df = static_cast<float>(D);
         float bound_on_cos = epsilon * std::sqrt(
-            (1.0f - ip_qo_p_sq) / (ip_qo_p_sq * static_cast<float>(D)));
+            (1.0f - ip_qo_p_sq) * (Df - 1.0f) / (ip_qo_p_sq * Df));
 
-        float ip_est_msb = ip_approx_msb / ip_qo_p;
-        float cos_upper = std::min(ip_est_msb + bound_on_cos, 1.0f);
+        float ip_corrected_msb = ip_approx_msb - aux[i].ip_code_parent;
+        float ip_est_msb = ip_corrected_msb / ip_qo_p;
+        float cos_upper = (sqrt_dqp > 1e-10f)
+            ? std::min(ip_est_msb / sqrt_dqp + bound_on_cos, 1.0f)
+            : 1.0f;
 
         out_dist[i] = std::max(out_dist[i], 0.0f);
-        out_lower[i] = correction + dist_qp_sq
-                      - 2.0f * query_norm * nop * cos_upper;
+        out_lower[i] = nop * nop + dist_qp_sq
+                      - 2.0f * nop * sqrt_dqp * cos_upper;
         if (out_lower[i] < 0.0f) out_lower[i] = 0.0f;
     }
 }
 
 } // namespace fastscan
-
-template <size_t D>
-struct RaBitQMetricPolicy {
-    using CodeType = RaBitQCode<D>;
-    using QueryType = RaBitQQuery<D>;
-
-    static constexpr size_t DIMS = D;
-
-    static inline float compute_distance(
-        const QueryType& query, const CodeType& code)
-    {
-        constexpr size_t NUM_SUB_SEGMENTS = (D + 3) / 4;
-        uint32_t fastscan_sum = 0;
-
-        for (size_t j = 0; j < NUM_SUB_SEGMENTS; ++j) {
-            size_t bit_base = j * 4;
-            uint8_t pattern = 0;
-            for (size_t b = 0; b < 4 && (bit_base + b) < D; ++b) {
-                if (code.signs.get_bit(bit_base + b)) {
-                    pattern |= (1 << b);
-                }
-            }
-            fastscan_sum += query.lut[j][pattern];
-        }
-
-        float ip_approx = query.coeff_fastscan * static_cast<float>(fastscan_sum)
-                        + query.coeff_popcount * static_cast<float>(code.code_popcount)
-                        + query.coeff_constant;
-
-        float ip_est = (code.ip_quantized_original > 1e-10f)
-                     ? ip_approx / code.ip_quantized_original
-                     : 0.0f;
-
-        float dist_o = code.dist_to_centroid;
-        return dist_o * dist_o + query.query_norm_sq
-             - 2.0f * dist_o * query.query_norm * ip_est;
-    }
-
-    static inline float compute_distance_with_aux(
-        const QueryType& query, const CodeType& code,
-        const VertexAuxData& aux,
-        float parent_norm_unused, float dist_qp_sq)
-    {
-        (void)parent_norm_unused;
-        constexpr size_t NUM_SUB_SEGMENTS = (D + 3) / 4;
-        uint32_t fastscan_sum = 0;
-
-        for (size_t j = 0; j < NUM_SUB_SEGMENTS; ++j) {
-            size_t bit_base = j * 4;
-            uint8_t pattern = 0;
-            for (size_t b = 0; b < 4 && (bit_base + b) < D; ++b) {
-                if (code.signs.get_bit(bit_base + b)) {
-                    pattern |= (1 << b);
-                }
-            }
-            fastscan_sum += query.lut[j][pattern];
-        }
-
-        float ip_approx = query.coeff_fastscan * static_cast<float>(fastscan_sum)
-                        + query.coeff_popcount * static_cast<float>(code.code_popcount)
-                        + query.coeff_constant;
-
-        float ip_qo_p = aux.ip_quantized_original;
-        float ip_est = (ip_qo_p > 1e-10f) ? ip_approx / ip_qo_p : 0.0f;
-
-        float nop = aux.dist_to_centroid;
-        float correction = aux.ip_xbar_Pinv_c;
-        return correction + dist_qp_sq
-             - 2.0f * query.query_norm * nop * ip_est;
-    }
-
-};
 
 }  // namespace cphnsw

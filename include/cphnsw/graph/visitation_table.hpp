@@ -46,11 +46,6 @@ public:
             std::memory_order_relaxed);
     }
 
-    bool is_visited(NodeId node_id, uint64_t query_id) const {
-        if (node_id >= capacity_) return true;
-        return epochs_[node_id].load(std::memory_order_relaxed) == query_id;
-    }
-
     void resize(size_t new_capacity) {
         if (new_capacity <= capacity_) return;
 
@@ -69,13 +64,6 @@ public:
     }
 
     size_t capacity() const { return capacity_; }
-
-    void reset() {
-        for (size_t i = 0; i < capacity_; ++i) {
-            epochs_[i].store(0, std::memory_order_relaxed);
-        }
-        current_epoch_.store(0, std::memory_order_relaxed);
-    }
 
 private:
     mutable std::unique_ptr<std::atomic<uint64_t>[]> epochs_;
@@ -126,11 +114,6 @@ public:
         return !visited_[node_id].compare_exchange_strong(
             expected, query_id,
             std::memory_order_relaxed, std::memory_order_relaxed);
-    }
-
-    bool is_estimated(NodeId node_id, uint64_t query_id) const {
-        if (node_id >= capacity_) return true;
-        return estimated_[node_id].load(std::memory_order_relaxed) == query_id;
     }
 
     bool is_visited(NodeId node_id, uint64_t query_id) const {

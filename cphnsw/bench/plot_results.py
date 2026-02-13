@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Generate benchmark plots from result JSON files."""
 
 import argparse

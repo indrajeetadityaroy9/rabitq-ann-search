@@ -22,15 +22,15 @@
 
 namespace cphnsw {
 
-template <size_t D, size_t R = 32, size_t BitWidth = 1, typename RotationPolicy = RandomHadamardRotation>
+template <size_t D, size_t R = 32, size_t BitWidth = 1>
 class HNSWIndex {
 public:
     using CodeType = std::conditional_t<BitWidth == 1,
         RaBitQCode<D>, NbitRaBitQCode<D, BitWidth>>;
     using QueryType = RaBitQQuery<D>;
     using Encoder = std::conditional_t<BitWidth == 1,
-        RaBitQEncoder<D, RotationPolicy>,
-        NbitRaBitQEncoder<D, BitWidth, RotationPolicy>>;
+        RaBitQEncoder<D>,
+        NbitRaBitQEncoder<D, BitWidth>>;
     using Graph = RaBitQGraph<D, R, BitWidth>;
     using Engine = RaBitQSearchEngine<D, R, BitWidth>;
     using Refinement = GraphRefinement<D, R, BitWidth>;
@@ -94,20 +94,17 @@ public:
         }
     }
 
-    void finalize() {
-        finalize(BuildParams{});
-    }
-
     std::vector<SearchResult> search(
         const float* query,
         const SearchParams& params = SearchParams()) const
     {
         if (graph_.empty()) return {};
 
-        float gamma = AdaptiveDefaults::gamma_from_recall(params.recall_target);
+        float gamma = AdaptiveDefaults::gamma_from_recall(params.recall_target, D);
         float eps = AdaptiveDefaults::error_epsilon_search(params.recall_target);
 
-        QueryType encoded = encoder_.encode_query(query);
+        // SymphonyQG: use raw query LUT for parent-relative edge distance estimation
+        QueryType encoded = encoder_.encode_query_raw(query);
         encoded.error_epsilon = eps;
 
         if (max_level_ <= 0 || entry_point_ == INVALID_NODE) {
@@ -120,10 +117,6 @@ public:
         }
 
         return Engine::search_from(encoded, query, graph_, ep, params.k, gamma);
-    }
-
-    std::vector<SearchResult> search(const float* query, size_t k) const {
-        return search(query, SearchParams().set_k(k));
     }
 
     size_t size() const { return graph_.size(); }

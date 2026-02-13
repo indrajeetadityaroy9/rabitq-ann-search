@@ -65,9 +65,9 @@ struct RaBitQCode {
 };
 
 struct VertexAuxData {
-    float dist_to_centroid;
-    float ip_quantized_original;
-    float ip_xbar_Pinv_c; // <x_bar, P^-1 * c>, precomputed for SymphonyQG decomposition
+    float dist_to_centroid;       // ||o_r - p_r||, edge length
+    float ip_quantized_original;  // <o_bar, o>, quantization quality for edge code
+    float ip_code_parent;         // <x_bar, P^{-1} * p_r * norm_factor>, SymphonyQG Eq 6 precomputed term
 };
 
 template <size_t D>
@@ -90,6 +90,7 @@ struct RaBitQQuery {
 
     float error_epsilon;
     float inv_sqrt_d;
+    float norm_factor;
 };
 
 
@@ -131,12 +132,6 @@ struct alignas(64) NbitCodeStorage {
         for (size_t i = 0; i < NUM_WORDS; ++i)
             count += static_cast<uint32_t>(__builtin_popcountll(planes[0][i]));
         return count;
-    }
-
-    BinaryCodeStorage<D> msb_as_binary() const {
-        BinaryCodeStorage<D> result;
-        std::memcpy(result.signs, planes[0], NUM_WORDS * sizeof(uint64_t));
-        return result;
     }
 
     uint32_t weighted_popcount() const {

@@ -27,7 +27,7 @@ struct EncoderWorkspace {
         : buf(padded_dim), centered(dim), q_bar_u(padded_dim) {}
 };
 
-template <typename Derived, size_t D, typename RotationPolicy>
+template <typename Derived, size_t D>
 class RaBitQEncoderBase {
 public:
     using QueryType = RaBitQQuery<D>;
@@ -46,11 +46,8 @@ public:
         }
 
         float d_float = static_cast<float>(D);
-        // Normalization factor for RandomHadamardRotation
         norm_factor_ = 1.0f / (d_float * std::sqrt(d_float));
-
         inv_sqrt_d_ = 1.0f / std::sqrt(d_float);
-        sqrt_d_ = std::sqrt(d_float);
     }
 
     void set_centroid(const float* c) {
@@ -111,97 +108,74 @@ public:
 #endif
     }
 
-    QueryType encode_query(const float* vec) const {
+    QueryType encode_query_raw(const float* vec) const {
         thread_local EncoderWorkspace<D> ws(padded_dim_, dim_);
         ws.buf.resize(padded_dim_);
-        ws.centered.resize(dim_);
         ws.q_bar_u.resize(padded_dim_);
-        return encode_query_impl(vec, ws.buf.data(), ws.centered.data(), ws.q_bar_u.data());
+        return encode_query_raw_impl(vec, ws.buf.data(), ws.q_bar_u.data());
     }
 
-    QueryType encode_query_impl(const float* vec, float* buf, float* centered_buf,
-                                uint8_t* q_bar_u) const {
-        QueryType query;
-
-        float norm_sq = 0.0f;
-        for (size_t i = 0; i < dim_; ++i) {
-            float v = vec[i] - centroid_[i];
-            centered_buf[i] = v;
-            norm_sq += v * v;
-        }
-        float norm = std::sqrt(norm_sq);
-        query.query_norm = norm;
-        query.query_norm_sq = norm_sq;
-        query.inv_sqrt_d = inv_sqrt_d_;
-        query.error_epsilon = 0.0f;
-
-        if (norm < 1e-10f) {
-            std::memset(query.lut, 0, sizeof(query.lut));
-            query.vl = 0.0f;
-            query.delta = 0.0f;
-            query.sum_qu = 0.0f;
-            query.coeff_fastscan = 0.0f;
-            query.coeff_popcount = 0.0f;
-            query.coeff_constant = 0.0f;
-            return query;
-        }
-
-        float inv_norm = 1.0f / norm;
-        for (size_t i = 0; i < dim_; ++i) {
-            centered_buf[i] *= inv_norm;
-        }
-
-        rotation_.apply_copy(centered_buf, buf);
+    void rotate_raw_vector(const float* vec, float* out) const {
+        rotation_.apply_copy(vec, out);
         for (size_t i = 0; i < padded_dim_; ++i) {
-            buf[i] *= norm_factor_;
+            out[i] *= norm_factor_;
         }
+    }
 
-        float vl = std::numeric_limits<float>::max();
-        float vmax = std::numeric_limits<float>::lowest();
+    float compute_ip_code_parent(const BinaryCodeStorage<D>& code,
+                                  const float* rotated_parent) const {
+        float ip = 0.0f;
         for (size_t i = 0; i < padded_dim_; ++i) {
-            vl = std::min(vl, buf[i]);
-            vmax = std::max(vmax, buf[i]);
+            float sign = code.get_bit(i) ? 1.0f : -1.0f;
+            ip += sign * rotated_parent[i];
         }
-        query.vl = vl;
+        return ip * inv_sqrt_d_;
+    }
 
-        float range = vmax - vl;
-        float delta = (range > 1e-10f) ? range / 15.0f : 1e-10f;
-        query.delta = delta;
+    void build_lut(const float* buf, uint8_t* q_bar_u, QueryType& query) const {
+        constexpr size_t NUM_SUB_SEGMENTS = (D + 3) / 4;
+
+        float vl = buf[0], vmax = buf[0];
+        for (size_t i = 1; i < padded_dim_; ++i) {
+            if (buf[i] < vl) vl = buf[i];
+            if (buf[i] > vmax) vmax = buf[i];
+        }
+
+        float delta = (vmax - vl) / 15.0f;
+        if (delta < 1e-20f) delta = 1e-20f;
         float inv_delta = 1.0f / delta;
 
         float sum_qu = 0.0f;
         for (size_t i = 0; i < padded_dim_; ++i) {
             float val = (buf[i] - vl) * inv_delta;
-            int ival = static_cast<int>(val + 0.5f);
-            if (ival < 0) ival = 0;
-            if (ival > 15) ival = 15;
-            q_bar_u[i] = static_cast<uint8_t>(ival);
-            sum_qu += static_cast<float>(ival);
+            int u = static_cast<int>(val + 0.5f);
+            if (u < 0) u = 0;
+            if (u > 15) u = 15;
+            q_bar_u[i] = static_cast<uint8_t>(u);
+            sum_qu += static_cast<float>(u);
         }
+
+        query.vl = vl;
+        query.delta = delta;
         query.sum_qu = sum_qu;
 
         for (size_t j = 0; j < NUM_SUB_SEGMENTS; ++j) {
-            size_t base = j * 4;
-            uint8_t vals[4] = {0, 0, 0, 0};
-            for (size_t b = 0; b < 4 && (base + b) < padded_dim_; ++b) {
-                vals[b] = q_bar_u[base + b];
-            }
-
             for (uint8_t p = 0; p < 16; ++p) {
                 uint8_t sum = 0;
-                if (p & 1) sum += vals[0];
-                if (p & 2) sum += vals[1];
-                if (p & 4) sum += vals[2];
-                if (p & 8) sum += vals[3];
+                for (size_t b = 0; b < 4; ++b) {
+                    size_t idx = j * 4 + b;
+                    if (idx < D && (p & (1u << b))) {
+                        sum += q_bar_u[idx];
+                    }
+                }
                 query.lut[j][p] = sum;
             }
         }
 
+        float Df = static_cast<float>(D);
         query.coeff_fastscan = 2.0f * delta * inv_sqrt_d_;
         query.coeff_popcount = 2.0f * vl * inv_sqrt_d_;
-        query.coeff_constant = -(delta * inv_sqrt_d_) * sum_qu - vl * sqrt_d_;
-
-        return query;
+        query.coeff_constant = -(Df * vl + delta * sum_qu) * inv_sqrt_d_;
     }
 
     template <typename CodeType>
@@ -209,7 +183,7 @@ public:
         const CodeType& neighbor_code,
         const float* parent_vec,
         const float* neighbor_vec,
-        float parent_dist_centroid = 0.0f,
+        const float* rotated_parent,
         BinaryCodeStorage<D>* out_code = nullptr) const
     {
         VertexAuxData aux;
@@ -230,7 +204,7 @@ public:
 
             if (nop < 1e-10f) {
                 aux.ip_quantized_original = 0.0f;
-                aux.ip_xbar_Pinv_c = 0.0f;
+                aux.ip_code_parent = 0.0f;
                 return aux;
             }
 
@@ -249,16 +223,15 @@ public:
 
             aux.ip_quantized_original = l1_norm * inv_sqrt_d_;  // ip_qo_p
 
-            float no = neighbor_code.dist_to_centroid;
-            float np = parent_dist_centroid;
-            aux.ip_xbar_Pinv_c = no * no - np * np;
+            // SymphonyQG Eq 6: precompute <x_bar, R(p)*nf> / sqrt(D)
+            aux.ip_code_parent = compute_ip_code_parent(*out_code, rotated_parent);
 
             return aux;
         }
 
         aux.dist_to_centroid = neighbor_code.dist_to_centroid;
         aux.ip_quantized_original = neighbor_code.ip_quantized_original;
-        aux.ip_xbar_Pinv_c = 0.0f;
+        aux.ip_code_parent = 0.0f;
         return aux;
     }
 
@@ -267,19 +240,39 @@ public:
 
 protected:
     size_t dim_;
-    RotationPolicy rotation_;
+    RandomHadamardRotation rotation_;
     size_t padded_dim_;
     float norm_factor_;
     float inv_sqrt_d_;
-    float sqrt_d_;
     std::vector<float> centroid_;
     bool has_centroid_;
+
+private:
+    QueryType encode_query_raw_impl(const float* vec, float* buf,
+                                     uint8_t* q_bar_u) const {
+        QueryType query;
+
+        query.query_norm = 0.0f;
+        query.query_norm_sq = 0.0f;
+        query.inv_sqrt_d = inv_sqrt_d_;
+        query.norm_factor = norm_factor_;
+        query.error_epsilon = 0.0f;
+
+        rotation_.apply_copy(vec, buf);
+        for (size_t i = 0; i < padded_dim_; ++i) {
+            buf[i] *= norm_factor_;
+        }
+
+        build_lut(buf, q_bar_u, query);
+
+        return query;
+    }
 };
 
 
-template <size_t D, typename RotationPolicy = RandomHadamardRotation>
-class RaBitQEncoder : public RaBitQEncoderBase<RaBitQEncoder<D, RotationPolicy>, D, RotationPolicy> {
-    using Base = RaBitQEncoderBase<RaBitQEncoder<D, RotationPolicy>, D, RotationPolicy>;
+template <size_t D>
+class RaBitQEncoder : public RaBitQEncoderBase<RaBitQEncoder<D>, D> {
+    using Base = RaBitQEncoderBase<RaBitQEncoder<D>, D>;
     friend Base;
 
 public:
@@ -330,58 +323,12 @@ public:
 
         return code;
     }
-
-    static float compute_distance_estimate(
-        const QueryType& query,
-        const CodeType& code,
-        uint32_t fastscan_sum)
-    {
-        float ip_approx = query.coeff_fastscan * static_cast<float>(fastscan_sum)
-                        + query.coeff_popcount * static_cast<float>(code.code_popcount)
-                        + query.coeff_constant;
-
-        float ip_est = (code.ip_quantized_original > 1e-10f)
-                     ? ip_approx / code.ip_quantized_original
-                     : 0.0f;
-
-        float dist_o = code.dist_to_centroid;
-        float dist_q = query.query_norm;
-        return dist_o * dist_o + dist_q * dist_q - 2.0f * dist_o * dist_q * ip_est;
-    }
-
-    static float compute_error_bound(const QueryType& query, const CodeType& code) {
-        float ip_qo = code.ip_quantized_original;
-        if (ip_qo < 1e-10f) return std::numeric_limits<float>::max();
-
-        float ip_qo_sq = ip_qo * ip_qo;
-        float variance = (1.0f - ip_qo_sq) / (ip_qo_sq * static_cast<float>(D));
-        return query.error_epsilon * std::sqrt(variance);
-    }
-
-    static float compute_distance_scalar(
-        const QueryType& query,
-        const CodeType& code)
-    {
-        uint32_t fastscan_sum = 0;
-        for (size_t j = 0; j < NUM_SUB_SEGMENTS; ++j) {
-            size_t bit_base = j * 4;
-            uint8_t pattern = 0;
-            for (size_t b = 0; b < 4 && (bit_base + b) < D; ++b) {
-                if (code.signs.get_bit(bit_base + b)) {
-                    pattern |= (1 << b);
-                }
-            }
-            fastscan_sum += query.lut[j][pattern];
-        }
-
-        return compute_distance_estimate(query, code, fastscan_sum);
-    }
 };
 
 
-template <size_t D, size_t BitWidth, typename RotationPolicy = RandomHadamardRotation>
-class NbitRaBitQEncoder : public RaBitQEncoderBase<NbitRaBitQEncoder<D, BitWidth, RotationPolicy>, D, RotationPolicy> {
-    using Base = RaBitQEncoderBase<NbitRaBitQEncoder<D, BitWidth, RotationPolicy>, D, RotationPolicy>;
+template <size_t D, size_t BitWidth>
+class NbitRaBitQEncoder : public RaBitQEncoderBase<NbitRaBitQEncoder<D, BitWidth>, D> {
+    using Base = RaBitQEncoderBase<NbitRaBitQEncoder<D, BitWidth>, D>;
     friend Base;
 
 public:

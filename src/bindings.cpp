@@ -6,6 +6,8 @@
 #include <cphnsw/core/adaptive_defaults.hpp>
 #include <cphnsw/io/serialization.hpp>
 
+#include <cstdio>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -40,6 +42,14 @@ public:
         params.dim = dim;
         params.seed = seed;
         index_ = std::make_unique<IndexType>(params);
+    }
+
+    PyIndexWrapper(size_t dim, uint64_t seed,
+                   typename IndexType::Graph&& graph) {
+        IndexParams params;
+        params.dim = dim;
+        params.seed = seed;
+        index_ = std::make_unique<IndexType>(params, std::move(graph));
     }
 
     void add_batch(const float* vecs, size_t n) override {
@@ -120,6 +130,68 @@ static std::unique_ptr<PyIndexBase> create_index(
 }
 
 
+template <size_t BitWidth>
+static std::unique_ptr<PyIndexBase> load_index_with_bits(
+    const std::string& path, size_t original_dim, size_t pd, uint64_t seed)
+{
+    #define LOAD_CASE_DIM(DIM) \
+        case DIM: { \
+            auto graph = IndexSerializer<DIM, 32, BitWidth>::load(path); \
+            return std::make_unique<PyIndexWrapper< \
+                RaBitQIndex<DIM, 32, BitWidth>, DIM, BitWidth>>( \
+                original_dim, seed, std::move(graph)); \
+        }
+
+    switch (pd) {
+        LOAD_CASE_DIM(16)
+        LOAD_CASE_DIM(32)
+        LOAD_CASE_DIM(64)
+        LOAD_CASE_DIM(128)
+        LOAD_CASE_DIM(256)
+        LOAD_CASE_DIM(512)
+        LOAD_CASE_DIM(1024)
+        LOAD_CASE_DIM(2048)
+        default:
+            throw std::invalid_argument(
+                "Unsupported padded dimension " + std::to_string(pd));
+    }
+
+    #undef LOAD_CASE_DIM
+}
+
+static std::unique_ptr<PyIndexBase> load_index(
+    const std::string& path, uint64_t seed)
+{
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) throw std::runtime_error("Cannot open file for reading: " + path);
+
+    SerializationHeader header;
+    if (std::fread(&header, sizeof(header), 1, f) != 1) {
+        std::fclose(f);
+        throw std::runtime_error("Failed to read header");
+    }
+    std::fclose(f);
+
+    if (std::memcmp(header.magic, "RBQGRPH", 7) != 0) {
+        throw std::runtime_error("Invalid file format");
+    }
+
+    size_t original_dim = header.original_dim;
+    size_t pd = header.dims;
+    size_t bits = header.bit_width;
+
+    switch (bits) {
+        case 1: return load_index_with_bits<1>(path, original_dim, pd, seed);
+        case 2: return load_index_with_bits<2>(path, original_dim, pd, seed);
+        case 4: return load_index_with_bits<4>(path, original_dim, pd, seed);
+        default:
+            throw std::invalid_argument(
+                "Unsupported bit_width=" + std::to_string(bits) +
+                " in saved file. Supported: 1, 2, 4.");
+    }
+}
+
+
 PYBIND11_MODULE(_core, m) {
     m.doc() = "Configuration-Parameterless HNSW (CP-HNSW): Zero-tuning RaBitQ approximate nearest neighbor search";
 
@@ -165,7 +237,7 @@ PYBIND11_MODULE(_core, m) {
 
         .def("search", [](const PyIndexBase& self,
                           py::array_t<float, py::array::c_style | py::array::forcecast> query,
-                          size_t k, float recall_target) {
+                          size_t k, float recall_target, float gamma) {
             auto buf = query.request();
             if (buf.ndim != 1 || static_cast<size_t>(buf.shape[0]) != self.dim())
                 throw std::invalid_argument("Query must be 1D array matching index dimension");
@@ -174,6 +246,7 @@ PYBIND11_MODULE(_core, m) {
             SearchParams params;
             params.k = k;
             params.recall_target = recall_target;
+            params.gamma_override = gamma;
 
             std::vector<SearchResult> results;
             {
@@ -192,12 +265,14 @@ PYBIND11_MODULE(_core, m) {
             }
             return std::make_pair(ids, distances);
         }, py::arg("query"), py::arg("k") = 10, py::arg("recall_target") = 0.95f,
+           py::arg("gamma") = -1.0f,
            "Search for k nearest neighbors. Returns (ids, distances) arrays.\n"
-           "recall_target controls the quality/speed tradeoff (default 0.95).")
+           "recall_target controls the quality/speed tradeoff (default 0.95).\n"
+           "gamma overrides the beam exploration budget (negative = derive from recall_target).")
 
         .def("search_batch", [](const PyIndexBase& self,
                                py::array_t<float, py::array::c_style | py::array::forcecast> queries,
-                               size_t k, int n_threads, float recall_target) {
+                               size_t k, int n_threads, float recall_target, float gamma) {
             auto buf = queries.request();
             if (buf.ndim != 2 || static_cast<size_t>(buf.shape[1]) != self.dim())
                 throw std::invalid_argument("queries must be (n, dim) array");
@@ -209,6 +284,7 @@ PYBIND11_MODULE(_core, m) {
             SearchParams params;
             params.k = k;
             params.recall_target = recall_target;
+            params.gamma_override = gamma;
 
             py::array_t<int64_t> ids({n, k});
             py::array_t<float> distances({n, k});
@@ -218,7 +294,8 @@ PYBIND11_MODULE(_core, m) {
             {
                 py::gil_scoped_release release;
                 int actual_threads = n_threads > 0 ? n_threads : omp_get_max_threads();
-                #pragma omp parallel for schedule(dynamic, 16) num_threads(actual_threads)
+                size_t omp_chunk = adaptive_defaults::omp_chunk_size(n, static_cast<size_t>(actual_threads));
+                #pragma omp parallel for schedule(dynamic, omp_chunk) num_threads(actual_threads)
                 for (size_t i = 0; i < n; ++i) {
                     auto results = self.search_raw(ptr + i * dim, params);
                     for (size_t j = 0; j < k && j < results.size(); ++j) {
@@ -234,6 +311,7 @@ PYBIND11_MODULE(_core, m) {
             return std::make_pair(ids, distances);
         }, py::arg("queries"), py::arg("k") = 10,
            py::arg("n_threads") = 0, py::arg("recall_target") = 0.95f,
+           py::arg("gamma") = -1.0f,
            "Batch search for k nearest neighbors (OpenMP parallel). Returns (ids, distances) as (n,k) arrays.")
 
         .def_property_readonly("size", &PyIndexBase::size,
@@ -247,6 +325,13 @@ PYBIND11_MODULE(_core, m) {
             self.save(path);
         }, py::arg("path"),
            "Save the index graph to a binary file.");
+
+    m.def("load", [](const std::string& path, uint64_t seed) {
+        return load_index(path, seed);
+    },
+        py::arg("path"),
+        py::arg("seed") = 42,
+        "Load an index from a binary file previously saved with index.save().");
 
     m.def("HNSWIndex", [](size_t dim, uint64_t seed, size_t bits) {
         return create_index(dim, seed, bits, true);

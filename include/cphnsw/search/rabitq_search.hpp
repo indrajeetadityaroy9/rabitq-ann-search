@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../core/codes.hpp"
+#include "../core/adaptive_defaults.hpp"
 #include "../distance/fastscan_kernel.hpp"
 #include "../distance/fastscan_layout.hpp"
 #include "../graph/rabitq_graph.hpp"
@@ -9,7 +10,6 @@
 #include <vector>
 #include <queue>
 #include <algorithm>
-#include <cmath>
 #include <limits>
 
 namespace cphnsw {
@@ -55,183 +55,151 @@ private:
     size_t capacity_;
 };
 
-template <size_t D, size_t R = 32, size_t BitWidth = 1>
-class RaBitQSearchEngine {
-public:
-    using Graph = RaBitQGraph<D, R, BitWidth>;
-    using QueryType = RaBitQQuery<D>;
+namespace rabitq_search {
 
-    struct BeamEntry {
-        float est_distance;
-        float lower_bound;
-        NodeId id;
-        bool operator>(const BeamEntry& o) const { return est_distance > o.est_distance; }
-    };
-
-    static std::vector<SearchResult> search(
-        const QueryType& query,
-        const float* raw_query,
-        const Graph& graph,
-        size_t k,
-        float gamma,
-        TwoLevelVisitationTable& visited,
-        size_t ef_cap = 4096,
-        NodeId entry = INVALID_NODE)
-    {
-        if (graph.empty()) return {};
-        if (k == 0) k = 10;
-
-        NodeId ep = (entry != INVALID_NODE) ? entry : graph.entry_point();
-        if (ep == INVALID_NODE) return {};
-
-        uint64_t query_id = visited.new_query();
-
-        std::priority_queue<BeamEntry, std::vector<BeamEntry>,
-                           std::greater<BeamEntry>> beam;
-        BoundedMaxHeap<SearchResult> nn(k);
-
-        // Use exact L2 for entry point (SymphonyQG raw query LUT
-        // is not suitable for centroid-relative entry point estimation)
-        float ep_est = l2_distance_simd<D>(raw_query, graph.get_vector(ep));
-        beam.push({ep_est, 0.0f, ep});
-        visited.check_and_mark_estimated(ep, query_id);
-
-        alignas(64) uint32_t fastscan_sums[R];
-        alignas(64) uint32_t msb_sums[R];
-        alignas(64) float est_distances[R];
-        alignas(64) float lower_bounds[R];
-
-        while (!beam.empty()) {
-            BeamEntry current;
-            bool found = false;
-
-            while (!beam.empty()) {
-                current = beam.top();
-                beam.pop();
-                if (visited.is_visited(current.id, query_id)) continue;
-                found = true;
-                break;
-            }
-            if (!found) break;
-
-            if (nn.size() >= k && current.est_distance > (1.0f + gamma) * nn.worst_distance()) break;
-
-            if (nn.size() >= k && current.lower_bound > nn.worst_distance()) continue;
-
-            if (!beam.empty()) {
-                graph.prefetch_vertex(beam.top().id);
-                BeamEntry first_beam = beam.top();
-                beam.pop();
-                if (!beam.empty()) {
-                    graph.prefetch_vertex(beam.top().id);
-                }
-                beam.push(first_beam);
-            }
-
-            visited.check_and_mark_visited(current.id, query_id);
-            prefetch_t<0>(graph.get_vector(current.id));
-
-            const float* vertex_vec = graph.get_vector(current.id);
-            float exact_dist = l2_distance_simd<D>(raw_query, vertex_vec);
-
-            nn.push({current.id, exact_dist});
-
-            if (nn.size() >= k && exact_dist > (1.0f + gamma) * nn.worst_distance()) break;
-
-            const auto& nb = graph.get_neighbors(current.id);
-            size_t n_neighbors = nb.size();
-            if (n_neighbors == 0) continue;
-
-            float dist_qp_sq = exact_dist;
-
-            constexpr size_t BATCH = 32;
-            size_t num_batches = (R + BATCH - 1) / BATCH;
-
-            for (size_t batch = 0; batch < num_batches; ++batch) {
-                size_t batch_start = batch * BATCH;
-                if (batch_start >= n_neighbors) break;
-                size_t batch_count = std::min(BATCH, n_neighbors - batch_start);
-
-                if constexpr (BitWidth == 1) {
-                    fastscan::compute_inner_products(
-                        query.lut, nb.code_blocks[batch],
-                        fastscan_sums + batch_start);
-                    fastscan::convert_to_distances_with_bounds(
-                        query, fastscan_sums + batch_start,
-                        nb.aux + batch_start, nb.popcounts + batch_start,
-                        batch_count, est_distances + batch_start,
-                        lower_bounds + batch_start, dist_qp_sq);
-                } else {
-                    fastscan::compute_nbit_inner_products<D, BitWidth>(
-                        query.lut, nb.code_blocks[batch],
-                        fastscan_sums + batch_start, msb_sums + batch_start);
-                    fastscan::convert_nbit_to_distances_with_bounds<D, BitWidth>(
-                        query, fastscan_sums + batch_start,
-                        msb_sums + batch_start, nb.aux + batch_start,
-                        nb.popcounts + batch_start,
-                        nb.weighted_popcounts + batch_start,
-                        batch_count, est_distances + batch_start,
-                        lower_bounds + batch_start, dist_qp_sq);
-                }
-            }
-
-            for (size_t i = 0; i < n_neighbors; ++i) {
-                NodeId neighbor_id = nb.neighbor_ids[i];
-                if (neighbor_id == INVALID_NODE) continue;
-                if (visited.check_and_mark_estimated(neighbor_id, query_id)) continue;
-
-                float est_dist = est_distances[i];
-                float lower = lower_bounds[i];
-                if (nn.size() >= k && lower >= nn.worst_distance()) continue;
-
-                beam.push({est_dist, lower, neighbor_id});
-                graph.prefetch_vertex(neighbor_id);
-            }
-
-            if (beam.size() > ef_cap * 2) {
-                std::priority_queue<BeamEntry, std::vector<BeamEntry>,
-                                   std::greater<BeamEntry>> new_beam;
-                size_t kept = 0;
-                while (!beam.empty() && kept < ef_cap) {
-                    new_beam.push(beam.top());
-                    beam.pop();
-                    kept++;
-                }
-                beam = std::move(new_beam);
-            }
-        }
-
-        return nn.extract_sorted();
-    }
-
-    static std::vector<SearchResult> search(
-        const QueryType& query,
-        const float* raw_query,
-        const Graph& graph,
-        size_t k,
-        float gamma)
-    {
-        thread_local TwoLevelVisitationTable visited(0);
-        if (visited.capacity() < graph.size()) {
-            visited.resize(graph.size() + 1024);
-        }
-        return search(query, raw_query, graph, k, gamma, visited);
-    }
-
-    static std::vector<SearchResult> search_from(
-        const QueryType& query,
-        const float* raw_query,
-        const Graph& graph,
-        NodeId entry,
-        size_t k,
-        float gamma)
-    {
-        thread_local TwoLevelVisitationTable visited(0);
-        if (visited.capacity() < graph.size()) {
-            visited.resize(graph.size() + 1024);
-        }
-        return search(query, raw_query, graph, k, gamma, visited, 4096, entry);
-    }
+struct BeamEntry {
+    float est_distance;
+    float lower_bound;
+    NodeId id;
+    bool operator>(const BeamEntry& o) const { return est_distance > o.est_distance; }
 };
 
+template <size_t D, size_t R = 32, size_t BitWidth = 1>
+std::vector<SearchResult> search(
+    const RaBitQQuery<D>& query,
+    const float* raw_query,
+    const RaBitQGraph<D, R, BitWidth>& graph,
+    size_t k,
+    float gamma,
+    TwoLevelVisitationTable& visited,
+    size_t ef_cap = 0,
+    NodeId entry = INVALID_NODE)
+{
+    if (graph.empty()) return {};
+    if (k == 0) k = adaptive_defaults::default_k();
+    if (ef_cap == 0) ef_cap = adaptive_defaults::ef_cap(graph.size(), k, gamma);
+
+    NodeId ep = (entry != INVALID_NODE) ? entry : graph.entry_point();
+    if (ep == INVALID_NODE) return {};
+
+    uint64_t query_id = visited.new_query();
+
+    std::priority_queue<BeamEntry, std::vector<BeamEntry>,
+                       std::greater<BeamEntry>> beam;
+    BoundedMaxHeap<SearchResult> nn(k);
+
+    float ep_est = l2_distance_simd<D>(raw_query, graph.get_vector(ep));
+    beam.push({ep_est, 0.0f, ep});
+    visited.check_and_mark_estimated(ep, query_id);
+
+    alignas(64) uint32_t fastscan_sums[R];
+    alignas(64) uint32_t msb_sums[R];
+    alignas(64) float est_distances[R];
+    alignas(64) float lower_bounds[R];
+
+    while (!beam.empty()) {
+        BeamEntry current;
+        bool found = false;
+
+        while (!beam.empty()) {
+            current = beam.top();
+            beam.pop();
+            if (visited.is_visited(current.id, query_id)) continue;
+            found = true;
+            break;
+        }
+        if (!found) break;
+
+        if (nn.size() >= k && current.est_distance > (1.0f + gamma) * nn.worst_distance()) break;
+
+        if (nn.size() >= k && current.lower_bound > nn.worst_distance()) continue;
+
+        if (!beam.empty()) {
+            graph.prefetch_vertex(beam.top().id);
+            BeamEntry first_beam = beam.top();
+            beam.pop();
+            if (!beam.empty()) {
+                graph.prefetch_vertex(beam.top().id);
+            }
+            beam.push(first_beam);
+        }
+
+        visited.check_and_mark_visited(current.id, query_id);
+
+        nn.push({current.id, current.est_distance});
+
+        const auto& nb = graph.get_neighbors(current.id);
+        size_t n_neighbors = nb.size();
+        if (n_neighbors == 0) continue;
+
+        float dist_qp_sq = current.est_distance;
+
+        constexpr size_t BATCH = 32;
+        size_t num_batches = (R + BATCH - 1) / BATCH;
+
+        for (size_t batch = 0; batch < num_batches; ++batch) {
+            size_t batch_start = batch * BATCH;
+            if (batch_start >= n_neighbors) break;
+            size_t batch_count = std::min(BATCH, n_neighbors - batch_start);
+
+            if constexpr (BitWidth == 1) {
+                fastscan::compute_inner_products(
+                    query.lut, nb.code_blocks[batch],
+                    fastscan_sums + batch_start);
+                fastscan::convert_to_distances_with_bounds(
+                    query, fastscan_sums + batch_start,
+                    nb.aux + batch_start, nb.popcounts + batch_start,
+                    batch_count, est_distances + batch_start,
+                    lower_bounds + batch_start, dist_qp_sq);
+            } else {
+                fastscan::compute_nbit_inner_products<D, BitWidth>(
+                    query.lut, nb.code_blocks[batch],
+                    fastscan_sums + batch_start, msb_sums + batch_start);
+                fastscan::convert_nbit_to_distances_with_bounds<D, BitWidth>(
+                    query, fastscan_sums + batch_start,
+                    msb_sums + batch_start, nb.aux + batch_start,
+                    nb.popcounts + batch_start,
+                    nb.weighted_popcounts + batch_start,
+                    batch_count, est_distances + batch_start,
+                    lower_bounds + batch_start, dist_qp_sq);
+            }
+        }
+
+        for (size_t i = 0; i < n_neighbors; ++i) {
+            NodeId neighbor_id = nb.neighbor_ids[i];
+            if (neighbor_id == INVALID_NODE) continue;
+            if (visited.check_and_mark_estimated(neighbor_id, query_id)) continue;
+
+            float est_dist = est_distances[i];
+            float lower = lower_bounds[i];
+            if (nn.size() >= k && lower >= nn.worst_distance()) continue;
+
+            beam.push({est_dist, lower, neighbor_id});
+            graph.prefetch_vertex(neighbor_id);
+        }
+
+        size_t trim_trigger = static_cast<size_t>(ef_cap * adaptive_defaults::beam_trim_trigger_ratio());
+        if (beam.size() > trim_trigger) {
+            std::priority_queue<BeamEntry, std::vector<BeamEntry>,
+                               std::greater<BeamEntry>> new_beam;
+            size_t keep = static_cast<size_t>(ef_cap * adaptive_defaults::beam_trim_keep_ratio());
+            size_t kept = 0;
+            while (!beam.empty() && kept < keep) {
+                new_beam.push(beam.top());
+                beam.pop();
+                kept++;
+            }
+            beam = std::move(new_beam);
+        }
+    }
+
+    auto results = nn.extract_sorted();
+    for (auto& r : results) {
+        r.distance = l2_distance_simd<D>(raw_query, graph.get_vector(r.id));
+    }
+    std::sort(results.begin(), results.end());
+    return results;
+}
+
+}  // namespace rabitq_search
 }  // namespace cphnsw

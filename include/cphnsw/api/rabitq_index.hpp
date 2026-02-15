@@ -9,9 +9,9 @@
 #include "../graph/rabitq_graph.hpp"
 #include "../graph/graph_refinement.hpp"
 #include "../search/rabitq_search.hpp"
+#include "../graph/visitation_table.hpp"
 #include "params.hpp"
 #include <vector>
-#include <random>
 #include <stdexcept>
 #include <type_traits>
 
@@ -31,9 +31,6 @@ public:
         RaBitQEncoder<D>,
         NbitRaBitQEncoder<D, BitWidth>>;
     using Graph = RaBitQGraph<D, R, BitWidth>;
-    using Engine = RaBitQSearchEngine<D, R, BitWidth>;
-    using Refinement = GraphRefinement<D, R, BitWidth>;
-
     static constexpr size_t DIMS = D;
     static constexpr size_t DEGREE = R;
     static constexpr size_t BIT_WIDTH = BitWidth;
@@ -45,11 +42,15 @@ public:
         if (params.dim == 0) throw std::invalid_argument("dim must be > 0");
     }
 
-    explicit RaBitQIndex(size_t dim)
-        : RaBitQIndex(IndexParams().set_dim(dim)) {}
+    RaBitQIndex(const IndexParams& params, Graph&& graph)
+        : params_(params)
+        , encoder_(params.dim, params.seed)
+        , graph_(std::move(graph))
+        , finalized_(true) {
+        if (params.dim == 0) throw std::invalid_argument("dim must be > 0");
+    }
 
-    void add_batch(const float* vecs, size_t num_vecs,
-                   const BuildParams& build_params = BuildParams()) {
+    void add_batch(const float* vecs, size_t num_vecs) {
         if (num_vecs == 0) return;
 
         graph_.reserve(graph_.size() + num_vecs);
@@ -62,14 +63,12 @@ public:
         }
 
         needs_build_ = true;
-
-        (void)build_params;
     }
 
     void finalize(const BuildParams& params) {
         if (needs_build_) {
-            Refinement::optimize_graph_adaptive(
-                graph_, encoder_, params.num_threads, params.verbose);
+            graph_refinement::optimize_graph_adaptive(
+                graph_, encoder_, params.num_threads, params.verbose, params_.seed);
             needs_build_ = false;
         }
         finalized_ = true;
@@ -81,40 +80,25 @@ public:
     {
         if (graph_.empty()) return {};
 
-        float gamma = AdaptiveDefaults::gamma_from_recall(params.recall_target, D);
-        float eps = AdaptiveDefaults::error_epsilon_search(params.recall_target);
+        float gamma = (params.gamma_override >= 0.0f)
+            ? params.gamma_override
+            : adaptive_defaults::gamma_from_recall(params.recall_target, D);
+        float eps = adaptive_defaults::error_epsilon_search(params.recall_target);
 
-        // SymphonyQG: use raw query LUT (no centering/normalizing)
-        // for parent-relative edge distance estimation
         QueryType encoded = encoder_.encode_query_raw(query);
         encoded.error_epsilon = eps;
 
-        return Engine::search(encoded, query, graph_, params.k, gamma);
+        thread_local TwoLevelVisitationTable visited(0);
+        if (visited.capacity() < graph_.size()) {
+            visited.resize(graph_.size() + adaptive_defaults::visitation_headroom(graph_.size()));
+        }
+        return rabitq_search::search<D, R, BitWidth>(encoded, query, graph_, params.k, gamma, visited);
     }
 
     size_t size() const { return graph_.size(); }
-    bool empty() const { return graph_.empty(); }
     size_t dim() const { return params_.dim; }
     bool is_finalized() const { return finalized_; }
-    const IndexParams& params() const { return params_; }
     const Graph& graph() const { return graph_; }
-    const Encoder& encoder() const { return encoder_; }
-
-    struct Stats {
-        size_t num_nodes;
-        float avg_degree;
-        size_t max_degree;
-        size_t isolated_nodes;
-    };
-
-    Stats get_stats() const {
-        return Stats{
-            graph_.size(),
-            graph_.average_degree(),
-            graph_.max_degree(),
-            graph_.count_isolated()
-        };
-    }
 
 private:
     IndexParams params_;

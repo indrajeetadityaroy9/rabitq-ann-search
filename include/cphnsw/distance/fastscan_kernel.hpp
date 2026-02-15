@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../core/codes.hpp"
+#include "../core/adaptive_defaults.hpp"
 #include "fastscan_layout.hpp"
 #include <cstdint>
 #include <cmath>
@@ -11,6 +12,12 @@
 namespace cphnsw {
 
 namespace fastscan {
+
+// Each sub-pair contributes up to 2 LUT lookups (lo + hi nibble), max LUT value = 15.
+// After N pairs: accumulated max per byte = N * 2 * 15 = 30N.
+// uint8 overflows at 255, so theoretical max N = 8.
+// Flush at N=2 (max accumulation = 60) for conservative safety margin.
+constexpr size_t FLUSH_INTERVAL = 2;
 
 template <size_t D>
 inline void compute_inner_products(
@@ -57,7 +64,7 @@ inline void compute_inner_products(
 
         pairs_since_flush++;
 
-        if (pairs_since_flush >= 2 || sp == NUM_SUB_PAIRS - 1) {
+        if (pairs_since_flush >= FLUSH_INTERVAL || sp == NUM_SUB_PAIRS - 1) {
             __m256i widened_lo = _mm256_cvtepu8_epi16(
                 _mm256_castsi256_si128(tmp_acc));
             acc_lo = _mm256_add_epi16(acc_lo, widened_lo);
@@ -109,16 +116,15 @@ inline void convert_to_distances_with_bounds(
 
         float ip_qo_p = aux[i].ip_quantized_original;
 
-        // SymphonyQG: subtract precomputed parent contribution
         float ip_corrected = ip_approx - aux[i].ip_code_parent;
-        float ip_est = (ip_qo_p > 1e-10f) ? ip_corrected / ip_qo_p : 0.0f;
+        float ip_est = (ip_qo_p > adaptive_defaults::ip_quality_epsilon()) ? ip_corrected / ip_qo_p : 0.0f;
 
         float nop = aux[i].dist_to_centroid;
 
         out_dist[i] = nop * nop + dist_qp_sq - 2.0f * nop * ip_est;
 
         float ip_qo_p_sq = ip_qo_p * ip_qo_p;
-        if (ip_qo_p_sq < 1e-10f) {
+        if (ip_qo_p_sq < adaptive_defaults::ip_quality_epsilon()) {
             out_dist[i] = std::max(out_dist[i], 0.0f);
             out_lower[i] = std::max(out_dist[i], 0.0f);
             continue;
@@ -127,8 +133,7 @@ inline void convert_to_distances_with_bounds(
         float bound_on_cos = epsilon * std::sqrt(
             (1.0f - ip_qo_p_sq) * (Df - 1.0f) / (ip_qo_p_sq * Df));
 
-        // Lower bound: cos could be as high as cos_approx + bound
-        float cos_upper = (sqrt_dqp > 1e-10f)
+        float cos_upper = (sqrt_dqp > adaptive_defaults::ip_quality_epsilon())
             ? std::min(ip_est / sqrt_dqp + bound_on_cos, 1.0f)
             : 1.0f;
 
@@ -196,22 +201,20 @@ inline void convert_nbit_to_distances_with_bounds(
 
         float ip_qo_p = aux[i].ip_quantized_original;
 
-        // SymphonyQG: subtract precomputed parent contribution (scaled for nbit)
         float ip_corrected_nbit = ip_approx_nbit - aux[i].ip_code_parent;
-        float ip_est_nbit = (ip_qo_p > 1e-10f) ? ip_corrected_nbit / ip_qo_p : 0.0f;
+        float ip_est_nbit = (ip_qo_p > adaptive_defaults::ip_quality_epsilon()) ? ip_corrected_nbit / ip_qo_p : 0.0f;
 
-        float nop = aux[i].dist_to_centroid;    // ||o-p||
+        float nop = aux[i].dist_to_centroid;
 
         out_dist[i] = nop * nop + dist_qp_sq
                     - 2.0f * nop * ip_est_nbit;
 
-        // MSB-based lower bound
         float ip_approx_msb = A_msb * static_cast<float>(msb_fastscan_sums[i])
                             + B_msb * static_cast<float>(msb_popcounts[i])
                             + C;
 
         float ip_qo_p_sq = ip_qo_p * ip_qo_p;
-        if (ip_qo_p_sq < 1e-10f) {
+        if (ip_qo_p_sq < adaptive_defaults::ip_quality_epsilon()) {
             out_dist[i] = std::max(out_dist[i], 0.0f);
             out_lower[i] = std::max(out_dist[i], 0.0f);
             continue;
@@ -222,7 +225,7 @@ inline void convert_nbit_to_distances_with_bounds(
 
         float ip_corrected_msb = ip_approx_msb - aux[i].ip_code_parent;
         float ip_est_msb = ip_corrected_msb / ip_qo_p;
-        float cos_upper = (sqrt_dqp > 1e-10f)
+        float cos_upper = (sqrt_dqp > adaptive_defaults::ip_quality_epsilon())
             ? std::min(ip_est_msb / sqrt_dqp + bound_on_cos, 1.0f)
             : 1.0f;
 

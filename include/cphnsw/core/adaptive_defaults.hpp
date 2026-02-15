@@ -5,33 +5,152 @@
 #include <algorithm>
 
 namespace cphnsw {
+namespace adaptive_defaults {
 
-struct AdaptiveDefaults {
-    static constexpr float BUILD_FALSE_PRUNE_RATE = 0.25f;
+    // --- Error tolerance ---
 
-    static float error_epsilon_build() {
-        return std::sqrt(-2.0f * std::log(BUILD_FALSE_PRUNE_RATE));
-    }
-
-    static float error_tolerance(size_t D) {
+    inline float error_tolerance(size_t D) {
         return 1.0f / std::sqrt(static_cast<float>(D));
     }
 
-    static constexpr float NNDESCENT_DELTA = 0.001f;
+    // --- Recall-derived parameters ---
 
-    static constexpr size_t NNDESCENT_MAX_ITERS = 20;
-
-    static float gamma_from_recall(float recall_target, size_t D) {
-        float epsilon = error_epsilon_search(recall_target);
-        return epsilon / std::sqrt(static_cast<float>(D));
+    inline float gamma_from_recall(float recall_target, size_t /*D*/) {
+        float p = 1.0f - std::clamp(recall_target, 0.5f, 0.9999f);
+        return -std::log(p);
     }
 
-    static float error_epsilon_search(float recall_target) {
+    inline float error_epsilon_search(float recall_target) {
         float p = 1.0f - std::clamp(recall_target, 0.5f, 0.9999f);
         return std::sqrt(-2.0f * std::log(p));
     }
 
-    static constexpr size_t EF_SAFETY_CAP = 4096;
-};
+    // --- Graph Construction ---
 
+    inline float nndescent_delta(size_t n, size_t R) {
+        float base = 1.0f / (std::log2(static_cast<float>(std::max(n, size_t(64)))) * static_cast<float>(R));
+        return std::clamp(base, 0.0001f, 0.01f);
+    }
+
+    inline size_t nndescent_max_iters(size_t n) {
+        size_t iters = static_cast<size_t>(std::log2(static_cast<float>(std::max(n, size_t(64)))));
+        return std::clamp(iters, size_t(8), size_t(40));
+    }
+
+    inline size_t alpha_sample_size(size_t n) {
+        size_t s = static_cast<size_t>(std::sqrt(static_cast<double>(n)));
+        return std::clamp(s, size_t(64), size_t(10000));
+    }
+
+    inline size_t alpha_inter_limit(size_t R) {
+        size_t lim = static_cast<size_t>(2.0 * std::sqrt(static_cast<double>(R)));
+        return std::clamp(lim, size_t(4), R);
+    }
+
+    constexpr size_t alpha_percentile_divisor() { return 4; }
+
+    inline float alpha_default(size_t D) {
+        float a = 1.0f + 0.1f * std::log2(static_cast<float>(D)) / 5.0f;
+        return std::clamp(a, 1.1f, 1.5f);
+    }
+
+    constexpr float alpha_ceiling() { return 2.0f; }
+    constexpr float alpha_floor_threshold() { return 1.02f; }
+
+    inline size_t random_init_pool(size_t R, size_t n) {
+        size_t pool = static_cast<size_t>(static_cast<double>(R) * (1.0 + std::log(static_cast<double>(R))));
+        return std::min(pool, n - 1);
+    }
+
+    inline size_t random_init_attempts(size_t R, size_t n) {
+        size_t pool = random_init_pool(R, n);
+        return std::min(pool + pool / 2, n);
+    }
+
+    inline size_t omp_chunk_size(size_t n, size_t num_threads) {
+        if (num_threads == 0) num_threads = 1;
+        size_t chunk = n / (num_threads * 16);
+        return std::clamp(chunk, size_t(16), size_t(1024));
+    }
+
+    // --- Search ---
+
+    inline size_t ef_cap(size_t n, size_t k, float gamma) {
+        float log_n = std::log2(static_cast<float>(std::max(n, size_t(64))));
+        size_t cap = static_cast<size_t>(static_cast<float>(k) * gamma * log_n * 0.5f);
+        return std::clamp(cap, size_t(k * 4), size_t(8192));
+    }
+
+    constexpr size_t default_k() { return 10; }
+
+    inline float beam_trim_trigger_ratio() { return 2.0f; }
+    inline float beam_trim_keep_ratio() { return 0.75f; }
+
+    inline size_t visitation_headroom(size_t n) {
+        size_t headroom = std::max(size_t(256), n / 4);
+        return std::min(headroom, size_t(100000));
+    }
+
+    // --- HNSW Upper Layers ---
+
+    inline size_t upper_layer_ef(size_t R, int level) {
+        float ef = static_cast<float>(R) * std::pow(1.5f, static_cast<float>(level - 1));
+        return std::clamp(static_cast<size_t>(ef), R, R * 4);
+    }
+
+    constexpr size_t upper_layer_degree(size_t R, size_t D) {
+        size_t base = R / 2;
+        size_t bonus = (D >= 256) ? (R / 8) : 0;
+        return base + bonus;
+    }
+
+    // --- Encoder Optimization ---
+
+    constexpr size_t nbit_grid_resolution(size_t D, size_t BitWidth) {
+        size_t base = 64 * (size_t(1) << BitWidth);
+        size_t dim_adj = (D >= 512) ? base / 2 : base;
+        return dim_adj < 64 ? 64 : (dim_adj > 1024 ? 1024 : dim_adj);
+    }
+
+    constexpr size_t golden_section_iters(size_t grid_resolution) {
+        size_t iters = 0;
+        size_t g = grid_resolution;
+        while (g > 1) { g = (g * 618) / 1000; ++iters; }
+        return iters + 2;
+    }
+
+    constexpr bool use_critical_point_search(size_t D, size_t BitWidth) {
+        return (D * (size_t(1) << BitWidth)) <= 8192;
+    }
+
+    constexpr float nbit_initial_scale() { return 1e-6f; }
+    constexpr float nbit_overshoot_relative() { return 1.1f; }
+    constexpr float nbit_overshoot_absolute() { return 0.1f; }
+    constexpr float nbit_scale_floor() { return 1e-8f; }
+
+    // --- Numerical Guards ---
+
+    inline float norm_epsilon(size_t D) {
+        return 1e-8f / static_cast<float>(D);
+    }
+
+    constexpr float division_epsilon() { return 1e-20f; }
+
+    inline float coordinate_epsilon(size_t D) {
+        return 1e-10f / std::sqrt(static_cast<float>(D));
+    }
+
+    constexpr float ip_quality_epsilon() { return 1e-10f; }
+
+    // --- Platform ---
+
+    constexpr size_t prefetch_line_cap() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+        return 8;
+#else
+        return 16;
+#endif
+    }
+
+}  // namespace adaptive_defaults
 }  // namespace cphnsw

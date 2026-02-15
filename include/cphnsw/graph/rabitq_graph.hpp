@@ -3,14 +3,12 @@
 #include "../core/types.hpp"
 #include "../core/codes.hpp"
 #include "../core/memory.hpp"
+#include "../core/adaptive_defaults.hpp"
 #include "../distance/fastscan_layout.hpp"
 #include "neighbor_selection.hpp"
-#include "visitation_table.hpp"
 #include <vector>
 #include <mutex>
 #include <atomic>
-#include <stdexcept>
-#include <random>
 #include <cstring>
 #include <type_traits>
 
@@ -108,8 +106,8 @@ public:
     }
 
     static constexpr size_t PREFETCH_LINES =
-        (sizeof(VertexDataType) / CACHE_LINE_SIZE < 12)
-            ? (sizeof(VertexDataType) / CACHE_LINE_SIZE) : 12;
+        (sizeof(VertexDataType) / CACHE_LINE_SIZE < adaptive_defaults::prefetch_line_cap())
+            ? (sizeof(VertexDataType) / CACHE_LINE_SIZE) : adaptive_defaults::prefetch_line_cap();
 
     void prefetch_vertex(NodeId id) const {
         if (id >= vertices_.size()) return;
@@ -132,14 +130,6 @@ public:
             if (vd.neighbors.size() > m) m = vd.neighbors.size();
         }
         return m;
-    }
-
-    size_t count_isolated() const {
-        size_t c = 0;
-        for (const auto& vd : vertices_) {
-            if (vd.neighbors.empty()) ++c;
-        }
-        return c;
     }
 
     NodeId find_medoid() const {

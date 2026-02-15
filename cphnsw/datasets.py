@@ -6,7 +6,8 @@ from pathlib import Path
 
 import faiss
 import numpy as np
-from huggingface_hub import hf_hub_download
+import pandas as pd
+from huggingface_hub import HfApi, hf_hub_download
 
 
 def _emit(event: str, **fields) -> None:
@@ -89,7 +90,6 @@ def download_openai1536(dest: str = "data/openai1536/"):
     repo_id = "Qdrant/dbpedia-entities-openai3-text-embedding-3-large-1536-1M"
     _emit("dataset_download_start", dataset="openai1536", repo=repo_id, path=str(dest))
 
-    import pandas as pd
     parquet_path = hf_hub_download(repo_id=repo_id, filename="data/train-00000-of-00001.parquet",
                                    repo_type="dataset")
     df = pd.read_parquet(parquet_path)
@@ -120,7 +120,6 @@ def download_msmarco10m(dest: str = "data/msmarco10m/"):
         _emit("dataset_cache_hit", dataset="msmarco10m", path=str(dest))
         return
 
-    from huggingface_hub import HfApi
     repo_id = "Cohere/msmarco-v2.1-embed-english-v3"
     target_n = 10_000_000
     _emit("dataset_download_start", dataset="msmarco10m", repo=repo_id, path=str(dest))

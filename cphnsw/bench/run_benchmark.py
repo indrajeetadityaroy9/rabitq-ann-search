@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
+import cphnsw
 import faiss
 import hnswlib
 import numpy as np
@@ -175,8 +176,6 @@ def run_benchmark(dataset_name: str, base_dir: Path,
         t0 = time.perf_counter()
 
         if family == "cphnsw":
-            import cphnsw
-
             if spec["hierarchical"]:
                 index = cphnsw.HNSWIndex(dim=dim, bits=spec["bits"])
             else:

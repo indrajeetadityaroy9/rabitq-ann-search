@@ -83,17 +83,4 @@ inline float l2_distance_simd(const float* a, const float* b) {
     return _mm_cvtss_f32(s);
 }
 
-#ifdef __AVX512F__
-template <size_t D>
-inline float l2_distance_avx512(const float* a, const float* b) {
-    static_assert(D % 16 == 0, "D must be a multiple of 16 for AVX-512");
-    __m512 sum = _mm512_setzero_ps();
-    for (size_t i = 0; i < D; i += 16) {
-        __m512 diff = _mm512_sub_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i));
-        sum = _mm512_fmadd_ps(diff, diff, sum);
-    }
-    return _mm512_reduce_add_ps(sum);
-}
-#endif
-
 }  // namespace cphnsw

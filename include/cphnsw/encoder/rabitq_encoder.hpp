@@ -2,14 +2,13 @@
 
 #include "../core/codes.hpp"
 #include "../core/memory.hpp"
+#include "../core/adaptive_defaults.hpp"
 #include "rotation.hpp"
 #include <cmath>
 #include <algorithm>
-#include <random>
 #include <vector>
 #include <limits>
 #include <stdexcept>
-#include <string>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -50,11 +49,6 @@ public:
         inv_sqrt_d_ = 1.0f / std::sqrt(d_float);
     }
 
-    void set_centroid(const float* c) {
-        centroid_.assign(c, c + dim_);
-        has_centroid_ = true;
-    }
-
     void compute_centroid(const float* vecs, size_t num_vecs) {
         centroid_.assign(dim_, 0.0f);
         for (size_t i = 0; i < num_vecs; ++i) {
@@ -68,16 +62,6 @@ public:
             centroid_[j] *= inv_n;
         }
         has_centroid_ = true;
-    }
-
-    bool has_centroid() const { return has_centroid_; }
-    const std::vector<float>& centroid() const { return centroid_; }
-
-    auto encode(const float* vec) const {
-        thread_local EncoderWorkspace<D> ws(padded_dim_, dim_);
-        ws.buf.resize(padded_dim_);
-        ws.centered.resize(dim_);
-        return static_cast<const Derived*>(this)->encode_impl(vec, ws.buf.data(), ws.centered.data());
     }
 
     template <typename CodeType>
@@ -142,7 +126,7 @@ public:
         }
 
         float delta = (vmax - vl) / 15.0f;
-        if (delta < 1e-20f) delta = 1e-20f;
+        if (delta < adaptive_defaults::division_epsilon()) delta = adaptive_defaults::division_epsilon();
         float inv_delta = 1.0f / delta;
 
         float sum_qu = 0.0f;
@@ -154,10 +138,6 @@ public:
             q_bar_u[i] = static_cast<uint8_t>(u);
             sum_qu += static_cast<float>(u);
         }
-
-        query.vl = vl;
-        query.delta = delta;
-        query.sum_qu = sum_qu;
 
         for (size_t j = 0; j < NUM_SUB_SEGMENTS; ++j) {
             for (uint8_t p = 0; p < 16; ++p) {
@@ -200,9 +180,9 @@ public:
             for (size_t i = dim_; i < D; ++i) diff_op[i] = 0.0f;
 
             float nop = std::sqrt(nop_sq);
-            aux.dist_to_centroid = nop;  // ||o - p||
+            aux.dist_to_centroid = nop;
 
-            if (nop < 1e-10f) {
+            if (nop < adaptive_defaults::norm_epsilon(D)) {
                 aux.ip_quantized_original = 0.0f;
                 aux.ip_code_parent = 0.0f;
                 return aux;
@@ -221,9 +201,9 @@ public:
                 l1_norm += std::abs(rotated[i]);
             }
 
-            aux.ip_quantized_original = l1_norm * inv_sqrt_d_;  // ip_qo_p
+            aux.ip_quantized_original = l1_norm * inv_sqrt_d_;
 
-            // SymphonyQG Eq 6: precompute <x_bar, R(p)*nf> / sqrt(D)
+            // SymphonyQG Eq 6: precomputed parent-relative inner product
             aux.ip_code_parent = compute_ip_code_parent(*out_code, rotated_parent);
 
             return aux;
@@ -234,9 +214,6 @@ public:
         aux.ip_code_parent = 0.0f;
         return aux;
     }
-
-    size_t dim() const { return dim_; }
-    size_t padded_dim() const { return padded_dim_; }
 
 protected:
     size_t dim_;
@@ -252,10 +229,6 @@ private:
                                      uint8_t* q_bar_u) const {
         QueryType query;
 
-        query.query_norm = 0.0f;
-        query.query_norm_sq = 0.0f;
-        query.inv_sqrt_d = inv_sqrt_d_;
-        query.norm_factor = norm_factor_;
         query.error_epsilon = 0.0f;
 
         rotation_.apply_copy(vec, buf);
@@ -281,7 +254,7 @@ public:
     static constexpr size_t DIMS = D;
     static constexpr size_t NUM_SUB_SEGMENTS = (D + 3) / 4;
 
-    using Base::Base;  // inherit constructors
+    using Base::Base;
 
     CodeType encode_impl(const float* vec, float* buf, float* centered_buf) const {
         CodeType code;
@@ -296,9 +269,8 @@ public:
         float norm = std::sqrt(norm_sq);
         code.dist_to_centroid = norm;
 
-        if (norm < 1e-10f) {
+        if (norm < adaptive_defaults::norm_epsilon(D)) {
             code.ip_quantized_original = 0.0f;
-            code.code_popcount = 0;
             return code;
         }
 
@@ -319,7 +291,6 @@ public:
         }
 
         code.ip_quantized_original = l1_norm * this->inv_sqrt_d_;
-        code.code_popcount = static_cast<uint16_t>(code.signs.popcount());
 
         return code;
     }
@@ -340,7 +311,7 @@ public:
     static constexpr int K_INT = (1 << BitWidth) - 1;
     static constexpr float K = static_cast<float>(K_INT);
 
-    using Base::Base;  // inherit constructors
+    using Base::Base;
 
     CodeType encode_impl(const float* vec, float* buf, float* centered_buf) const {
         CodeType code;
@@ -355,7 +326,7 @@ public:
         float norm = std::sqrt(norm_sq);
         code.dist_to_centroid = norm;
 
-        if (norm < 1e-10f) {
+        if (norm < adaptive_defaults::norm_epsilon(D)) {
             code.ip_quantized_original = 0.0f;
             code.msb_popcount = 0;
             return code;
@@ -369,23 +340,23 @@ public:
 
 
         constexpr float midpoint = K * 0.5f;
-        constexpr size_t NUM_LEVELS = static_cast<size_t>(1) << BitWidth;  // 2^B
+        constexpr size_t NUM_LEVELS = static_cast<size_t>(1) << BitWidth;
         const size_t pd = this->padded_dim_;
 
 
         float best_t = 0.0f;
         float best_cosine = -std::numeric_limits<float>::max();
 
-        if constexpr (BitWidth <= 3) {
+        if constexpr (adaptive_defaults::use_critical_point_search(D, BitWidth)) {
             thread_local std::vector<float> crits;
             crits.clear();
             crits.reserve(pd * NUM_LEVELS);
 
             for (size_t i = 0; i < pd; ++i) {
                 float xi = buf[i];
-                if (std::abs(xi) < 1e-12f) continue;
+                if (std::abs(xi) < adaptive_defaults::coordinate_epsilon(D)) continue;
                 for (size_t b = 0; b < NUM_LEVELS; ++b) {
-                    float boundary = static_cast<float>(b) + 0.5f;  // 0.5, 1.5, ..., K-0.5
+                    float boundary = static_cast<float>(b) + 0.5f;
                     float t_crit = (boundary - midpoint) / xi;
                     if (t_crit > 0.0f) {
                         crits.push_back(t_crit);
@@ -407,22 +378,22 @@ public:
                     dot += c * buf[i];
                     norm_c_sq += c * c;
                 }
-                if (norm_c_sq < 1e-20f) return -std::numeric_limits<float>::max();
+                if (norm_c_sq < adaptive_defaults::division_epsilon()) return -std::numeric_limits<float>::max();
                 return dot / std::sqrt(norm_c_sq);
             };
 
             {
-                float cosine = evaluate_cosine(1e-6f);
+                float cosine = evaluate_cosine(adaptive_defaults::nbit_initial_scale());
                 if (cosine > best_cosine) {
                     best_cosine = cosine;
-                    best_t = 1e-6f;
+                    best_t = adaptive_defaults::nbit_initial_scale();
                 }
             }
 
             float prev = 0.0f;
             for (size_t k = 0; k < crits.size(); ++k) {
                 float cur = crits[k];
-                if (cur - prev < 1e-10f) { prev = cur; continue; }
+                if (cur - prev < adaptive_defaults::coordinate_epsilon(D)) { prev = cur; continue; }
                 float t_mid = 0.5f * (prev + cur);
                 float cosine = evaluate_cosine(t_mid);
                 if (cosine > best_cosine) {
@@ -432,7 +403,7 @@ public:
                 prev = cur;
             }
             if (!crits.empty()) {
-                float t_last = crits.back() * 1.1f + 0.1f;
+                float t_last = crits.back() * adaptive_defaults::nbit_overshoot_relative() + adaptive_defaults::nbit_overshoot_absolute();
                 float cosine = evaluate_cosine(t_last);
                 if (cosine > best_cosine) {
                     best_cosine = cosine;
@@ -446,8 +417,8 @@ public:
                 if (a > max_abs) max_abs = a;
             }
 
-            float t_max = (max_abs > 1e-12f) ? (K + 0.5f) / max_abs : 1.0f;
-            constexpr size_t NUM_GRID = 256;
+            float t_max = (max_abs > adaptive_defaults::coordinate_epsilon(D)) ? (K + 0.5f) / max_abs : 1.0f;
+            constexpr size_t NUM_GRID = adaptive_defaults::nbit_grid_resolution(D, BitWidth);
 
             auto evaluate_cosine_grid = [&](float t) -> float {
                 float dot_val = 0.0f;
@@ -461,7 +432,7 @@ public:
                     dot_val += c * buf[i];
                     norm_c_sq += c * c;
                 }
-                if (norm_c_sq < 1e-20f) return -std::numeric_limits<float>::max();
+                if (norm_c_sq < adaptive_defaults::division_epsilon()) return -std::numeric_limits<float>::max();
                 return dot_val / std::sqrt(norm_c_sq);
             };
 
@@ -475,11 +446,13 @@ public:
             }
 
             float step = t_max / static_cast<float>(NUM_GRID);
-            float lo = std::max(1e-8f, best_t - step);
+            float lo = std::max(adaptive_defaults::nbit_scale_floor(), best_t - step);
             float hi = std::min(t_max, best_t + step);
             constexpr float phi = 0.6180339887f;
 
-            for (int iter = 0; iter < 20; ++iter) {
+            constexpr size_t gs_iters = adaptive_defaults::golden_section_iters(
+                adaptive_defaults::nbit_grid_resolution(D, BitWidth));
+            for (size_t iter = 0; iter < gs_iters; ++iter) {
                 float m1 = hi - phi * (hi - lo);
                 float m2 = lo + phi * (hi - lo);
                 if (evaluate_cosine_grid(m1) < evaluate_cosine_grid(m2))

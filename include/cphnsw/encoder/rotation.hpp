@@ -38,7 +38,6 @@ public:
         apply(output);
     }
 
-    size_t original_dim() const { return original_dim_; }
     size_t padded_dim() const { return padded_dim_; }
 
 private:

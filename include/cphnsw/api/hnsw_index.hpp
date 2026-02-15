@@ -10,6 +10,7 @@
 #include "../graph/graph_refinement.hpp"
 #include "../graph/neighbor_selection.hpp"
 #include "../search/rabitq_search.hpp"
+#include "../graph/visitation_table.hpp"
 #include "params.hpp"
 #include <vector>
 #include <random>
@@ -32,14 +33,11 @@ public:
         RaBitQEncoder<D>,
         NbitRaBitQEncoder<D, BitWidth>>;
     using Graph = RaBitQGraph<D, R, BitWidth>;
-    using Engine = RaBitQSearchEngine<D, R, BitWidth>;
-    using Refinement = GraphRefinement<D, R, BitWidth>;
-
     static constexpr size_t DIMS = D;
     static constexpr size_t DEGREE = R;
     static constexpr size_t BIT_WIDTH = BitWidth;
 
-    static constexpr size_t M_UPPER = R / 2;
+    static constexpr size_t M_UPPER = adaptive_defaults::upper_layer_degree(R, D);
 
     explicit HNSWIndex(const IndexParams& params)
         : params_(params)
@@ -51,11 +49,18 @@ public:
         if (params.dim == 0) throw std::invalid_argument("dim must be > 0");
     }
 
-    explicit HNSWIndex(size_t dim)
-        : HNSWIndex(IndexParams().set_dim(dim)) {}
+    HNSWIndex(const IndexParams& params, Graph&& graph)
+        : params_(params)
+        , encoder_(params.dim, params.seed)
+        , graph_(std::move(graph))
+        , finalized_(true)
+        , mL_(1.0 / std::log(static_cast<double>(M_UPPER)))
+        , rng_(params.seed)
+    {
+        if (params.dim == 0) throw std::invalid_argument("dim must be > 0");
+    }
 
-    void add_batch(const float* vecs, size_t num_vecs,
-                   const BuildParams& build_params = BuildParams()) {
+    void add_batch(const float* vecs, size_t num_vecs) {
         if (num_vecs == 0) return;
 
         graph_.reserve(graph_.size() + num_vecs);
@@ -68,8 +73,6 @@ public:
         }
 
         needs_build_ = true;
-
-        (void)build_params;
     }
 
     void finalize(const BuildParams& params) {
@@ -81,10 +84,10 @@ public:
         }
         assign_layers(n);
 
-        build_upper_layers(params.verbose);
+        build_upper_layers();
 
-        Refinement::optimize_graph_adaptive(
-            graph_, encoder_, params.num_threads, params.verbose);
+        graph_refinement::optimize_graph_adaptive(
+            graph_, encoder_, params.num_threads, params.verbose, params_.seed);
 
         needs_build_ = false;
         finalized_ = true;
@@ -100,15 +103,21 @@ public:
     {
         if (graph_.empty()) return {};
 
-        float gamma = AdaptiveDefaults::gamma_from_recall(params.recall_target, D);
-        float eps = AdaptiveDefaults::error_epsilon_search(params.recall_target);
+        float gamma = (params.gamma_override >= 0.0f)
+            ? params.gamma_override
+            : adaptive_defaults::gamma_from_recall(params.recall_target, D);
+        float eps = adaptive_defaults::error_epsilon_search(params.recall_target);
 
-        // SymphonyQG: use raw query LUT for parent-relative edge distance estimation
         QueryType encoded = encoder_.encode_query_raw(query);
         encoded.error_epsilon = eps;
 
+        thread_local TwoLevelVisitationTable visited(0);
+        if (visited.capacity() < graph_.size()) {
+            visited.resize(graph_.size() + adaptive_defaults::visitation_headroom(graph_.size()));
+        }
+
         if (max_level_ <= 0 || entry_point_ == INVALID_NODE) {
-            return Engine::search(encoded, query, graph_, params.k, gamma);
+            return rabitq_search::search<D, R, BitWidth>(encoded, query, graph_, params.k, gamma, visited);
         }
 
         NodeId ep = entry_point_;
@@ -116,41 +125,13 @@ public:
             ep = greedy_search_layer(query, ep, level);
         }
 
-        return Engine::search_from(encoded, query, graph_, ep, params.k, gamma);
+        return rabitq_search::search<D, R, BitWidth>(encoded, query, graph_, params.k, gamma, visited, 0, ep);
     }
 
     size_t size() const { return graph_.size(); }
-    bool empty() const { return graph_.empty(); }
     size_t dim() const { return params_.dim; }
     bool is_finalized() const { return finalized_; }
-    int max_level() const { return max_level_; }
-    const IndexParams& params() const { return params_; }
     const Graph& graph() const { return graph_; }
-    const Encoder& encoder() const { return encoder_; }
-
-    struct Stats {
-        size_t num_nodes;
-        float avg_degree;
-        size_t max_degree;
-        size_t isolated_nodes;
-        int max_level;
-        size_t nodes_above_layer0;
-    };
-
-    Stats get_stats() const {
-        size_t above = 0;
-        for (size_t i = 0; i < node_levels_.size(); ++i) {
-            if (node_levels_[i] > 0) ++above;
-        }
-        return Stats{
-            graph_.size(),
-            graph_.average_degree(),
-            graph_.max_degree(),
-            graph_.count_isolated(),
-            max_level_,
-            above
-        };
-    }
 
 private:
     IndexParams params_;
@@ -219,9 +200,8 @@ private:
         upper_layers_.resize(max_level_);
     }
 
-    void build_upper_layers(bool verbose) {
+    void build_upper_layers() {
         size_t n = graph_.size();
-        size_t upper_ef = R;
 
         std::vector<NodeId> insertion_order(n);
         for (size_t i = 0; i < n; ++i) insertion_order[i] = static_cast<NodeId>(i);
@@ -239,15 +219,16 @@ private:
             }
 
             for (int level = std::min(node_level, max_level_); level >= 1; --level) {
+                size_t upper_ef = adaptive_defaults::upper_layer_ef(R, level);
                 auto candidates = search_upper_layer(
                     graph_.get_vector(node), ep, level, upper_ef);
 
                 auto dist_fn = [this](NodeId a, NodeId b) {
                     return exact_distance(graph_.get_vector(a), graph_.get_vector(b));
                 };
-                auto zero_error_fn = [](NodeId) -> float { return 0.0f; };
                 auto selected = select_neighbors_alpha_cg(
-                    std::move(candidates), M_UPPER, dist_fn, zero_error_fn);
+                    std::move(candidates), M_UPPER, dist_fn, zero_error,
+                    adaptive_defaults::alpha_default(D));
 
                 auto& node_neighbors = get_or_create_edge(level, node).neighbors;
                 node_neighbors.clear();
@@ -270,7 +251,6 @@ private:
             }
         }
 
-        (void)verbose;
     }
 
     NodeId greedy_search_layer(const float* query, NodeId ep, int level) const {
@@ -312,7 +292,7 @@ private:
 
         thread_local VisitationTable visited_table(0);
         if (visited_table.capacity() < graph_.size()) {
-            visited_table.resize(graph_.size() + 1024);
+            visited_table.resize(graph_.size() + adaptive_defaults::visitation_headroom(graph_.size()));
         }
         uint64_t qid = visited_table.new_query();
         visited_table.check_and_mark(ep, qid);
@@ -368,15 +348,17 @@ private:
         auto dist_fn = [this](NodeId a, NodeId b) {
             return exact_distance(graph_.get_vector(a), graph_.get_vector(b));
         };
-        auto zero_error_fn = [](NodeId) -> float { return 0.0f; };
         auto selected = select_neighbors_alpha_cg(
-            std::move(candidates), M_UPPER, dist_fn, zero_error_fn);
+            std::move(candidates), M_UPPER, dist_fn, zero_error,
+            adaptive_defaults::alpha_default(D));
         nb.clear();
         nb.reserve(selected.size());
         for (const auto& s : selected) {
             nb.push_back(s.id);
         }
     }
+
+    static float zero_error(NodeId) { return 0.0f; }
 
     static float exact_distance(const float* a, const float* b) {
         return l2_distance_simd<D>(a, b);

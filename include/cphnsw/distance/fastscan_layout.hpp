@@ -1,8 +1,6 @@
 #pragma once
 
 #include "../core/codes.hpp"
-#include <algorithm>
-#include <cfloat>
 #include <cstdint>
 #include <cstring>
 

@@ -30,13 +30,6 @@ struct alignas(64) BinaryCodeStorage {
         return (signs[idx / 64] >> (idx % 64)) & 1;
     }
 
-    bool operator==(const BinaryCodeStorage& other) const {
-        for (size_t i = 0; i < NUM_WORDS; ++i) {
-            if (signs[i] != other.signs[i]) return false;
-        }
-        return true;
-    }
-
     uint32_t popcount() const {
         uint32_t count = 0;
         for (size_t i = 0; i < NUM_WORDS; ++i) {
@@ -53,14 +46,12 @@ struct RaBitQCode {
 
     BinaryCodeStorage<D> signs;
     float dist_to_centroid;
-    float ip_quantized_original; // <o_bar, o> = ||P^-1 * o||_1 / sqrt(D)
-    uint16_t code_popcount;
+    float ip_quantized_original;
 
     void clear() {
         signs.clear();
         dist_to_centroid = 0.0f;
         ip_quantized_original = 0.0f;
-        code_popcount = 0;
     }
 };
 
@@ -77,20 +68,11 @@ struct RaBitQQuery {
 
     alignas(64) uint8_t lut[NUM_SUB_SEGMENTS][16];
 
-    float vl;
-    float delta;
-    float sum_qu;
-
-    float query_norm;
-    float query_norm_sq;
-
     float coeff_fastscan;
     float coeff_popcount;
     float coeff_constant;
 
     float error_epsilon;
-    float inv_sqrt_d;
-    float norm_factor;
 };
 
 
@@ -114,17 +96,6 @@ struct alignas(64) NbitCodeStorage {
             else
                 planes[b][word] &= ~(1ULL << bit);
         }
-    }
-
-    uint8_t get_value(size_t idx) const {
-        size_t word = idx / 64;
-        size_t bit = idx % 64;
-        uint8_t value = 0;
-        for (size_t b = 0; b < BitWidth; ++b) {
-            if ((planes[b][word] >> bit) & 1)
-                value |= (1 << (BitWidth - 1 - b));
-        }
-        return value;
     }
 
     uint32_t msb_popcount() const {

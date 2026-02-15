@@ -22,7 +22,7 @@ std::vector<NeighborCandidate> select_neighbors_alpha_cg(
     size_t R,
     DistanceFn distance_fn,
     ErrorFn error_fn,
-    float alpha = 1.2f)
+    float alpha)
 {
     std::sort(candidates.begin(), candidates.end(),
               [](const auto& a, const auto& b) {
@@ -44,15 +44,14 @@ std::vector<NeighborCandidate> select_neighbors_alpha_cg(
     for (size_t i = 0; i < candidates.size() && selected.size() < R; ++i) {
         bool should_add = true;
         float err_candidate = error_fn(candidates[i].id);
-        float dist_cq = candidates[i].distance;  // dist(candidate, query)
+        float dist_cq = candidates[i].distance;
 
         for (const auto& existing : selected) {
             float dist_ce = distance_fn(candidates[i].id, existing.id);
-            float dist_eq = existing.distance;  // dist(existing, query)
             float err_existing = error_fn(existing.id);
             float margin = err_candidate + err_existing;
 
-            if (dist_ce < alpha * dist_cq + (alpha - 1.0f) * dist_eq + margin) {
+            if (dist_ce < alpha * dist_cq + margin) {
                 should_add = false;
                 break;
             }

@@ -127,8 +127,7 @@ inline void fht(float* vec, size_t len) {
     assert(detail::is_power_of_two(len));
 
 #ifdef __AVX512F__
-    static bool has_avx512 = __builtin_cpu_supports("avx512f");
-    if (has_avx512 && len >= 16) {
+    if (len >= 16) {
         fht_avx512(vec, len);
         return;
     }

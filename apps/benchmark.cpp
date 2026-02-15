@@ -129,12 +129,16 @@ int main(int argc, char** argv) {
     std::string sift_dir = (argc > 1) ? argv[1] : "data/sift";
     Dataset sift = load_sift1m(sift_dir);
 
-    RaBitQIndex<PADDED_DIM, 32> index(IndexParams().set_dim(sift.dim));
+    IndexParams idx_params;
+    idx_params.dim = sift.dim;
+    RaBitQIndex<PADDED_DIM, 32> index(idx_params);
     Timer timer;
 
     timer.start();
     index.add_batch(sift.base_vectors.data(), sift.num_base);
-    index.finalize(BuildParams().set_verbose(true));
+    BuildParams build_params;
+    build_params.verbose = true;
+    index.finalize(build_params);
     double build_time_s = timer.elapsed_s();
     size_t rss_kb = get_rss_kb();
 
@@ -149,16 +153,18 @@ int main(int argc, char** argv) {
         double total_recall = 0.0;
         for (size_t q = 0; q < sift.num_queries; ++q) {
             timer.start();
+            SearchParams search_params;
+            search_params.k = 10;
+            search_params.recall_target = rt;
             auto results = index.search(
-                sift.query_vectors.data() + q * sift.dim,
-                SearchParams().set_k(10).set_recall_target(rt));
+                sift.query_vectors.data() + q * sift.dim, search_params);
             latencies.push_back(timer.elapsed_us());
             total_recall += compute_recall(results, sift.ground_truth[q], 10);
         }
         std::sort(latencies.begin(), latencies.end());
         double avg_latency = std::accumulate(latencies.begin(), latencies.end(), 0.0) / latencies.size();
-        float gamma = AdaptiveDefaults::gamma_from_recall(rt, PADDED_DIM);
-        float eps = AdaptiveDefaults::error_epsilon_search(rt);
+        float gamma = adaptive_defaults::gamma_from_recall(rt, PADDED_DIM);
+        float eps = adaptive_defaults::error_epsilon_search(rt);
         printf("event=benchmark_point recall_target=%.2f gamma=%.3f eps=%.2f recall_at_10=%.4f qps=%.0f p50_us=%.0f p99_us=%.0f\n",
                rt, gamma, eps, total_recall / sift.num_queries,
                1e6 / avg_latency,

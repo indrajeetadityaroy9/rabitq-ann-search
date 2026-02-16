@@ -116,23 +116,27 @@ std::vector<SearchResult> search(
 
         if (!beam.empty()) {
             graph.prefetch_vertex(beam.top().id);
+            graph.prefetch_vector(beam.top().id);
             BeamEntry first_beam = beam.top();
             beam.pop();
             if (!beam.empty()) {
                 graph.prefetch_vertex(beam.top().id);
+                graph.prefetch_vector(beam.top().id);
             }
             beam.push(first_beam);
         }
 
         visited.check_and_mark_visited(current.id, query_id);
 
-        nn.push({current.id, current.est_distance});
+        // Compute exact L2 distance to parent node for RaBitQ formula accuracy
+        float exact_dist = l2_distance_simd<D>(raw_query, graph.get_vector(current.id));
+        nn.push({current.id, exact_dist});
 
         const auto& nb = graph.get_neighbors(current.id);
         size_t n_neighbors = nb.size();
         if (n_neighbors == 0) continue;
 
-        float dist_qp_sq = current.est_distance;
+        float dist_qp_sq = exact_dist;
 
         constexpr size_t BATCH = 32;
         size_t num_batches = (R + BATCH - 1) / BATCH;
@@ -152,16 +156,45 @@ std::vector<SearchResult> search(
                     batch_count, est_distances + batch_start,
                     lower_bounds + batch_start, dist_qp_sq);
             } else {
-                fastscan::compute_nbit_inner_products<D, BitWidth>(
-                    query.lut, nb.code_blocks[batch],
-                    fastscan_sums + batch_start, msb_sums + batch_start);
-                fastscan::convert_nbit_to_distances_with_bounds<D, BitWidth>(
-                    query, fastscan_sums + batch_start,
-                    msb_sums + batch_start, nb.aux + batch_start,
-                    nb.popcounts + batch_start,
-                    nb.weighted_popcounts + batch_start,
-                    batch_count, est_distances + batch_start,
+                // Two-stage progressive filtering:
+                // Stage 1: MSB-only fast lower bounds
+                fastscan::compute_msb_only_inner_products<D, BitWidth>(
+                    query.lut, nb.code_blocks[batch], msb_sums + batch_start);
+                fastscan::convert_msb_to_lower_bounds<D>(
+                    query, msb_sums + batch_start, nb.aux + batch_start,
+                    nb.popcounts + batch_start, batch_count,
                     lower_bounds + batch_start, dist_qp_sq);
+
+                // Check if any candidate in this batch survives the MSB filter
+                float threshold = nn.worst_distance();
+                bool any_survivor = (nn.size() < k);
+                if (!any_survivor) {
+                    for (size_t j = 0; j < batch_count; ++j) {
+                        if (lower_bounds[batch_start + j] < threshold) {
+                            any_survivor = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (any_survivor) {
+                    // Stage 2: Full N-bit computation for survivors
+                    fastscan::compute_nbit_inner_products<D, BitWidth>(
+                        query.lut, nb.code_blocks[batch],
+                        fastscan_sums + batch_start, msb_sums + batch_start);
+                    fastscan::convert_nbit_to_distances_with_bounds<D, BitWidth>(
+                        query, fastscan_sums + batch_start,
+                        msb_sums + batch_start, nb.aux + batch_start,
+                        nb.popcounts + batch_start,
+                        nb.weighted_popcounts + batch_start,
+                        batch_count, est_distances + batch_start,
+                        lower_bounds + batch_start, dist_qp_sq);
+                } else {
+                    // Entire batch filtered by MSB bounds
+                    for (size_t j = 0; j < batch_count; ++j) {
+                        est_distances[batch_start + j] = std::numeric_limits<float>::max();
+                    }
+                }
             }
         }
 
@@ -193,12 +226,7 @@ std::vector<SearchResult> search(
         }
     }
 
-    auto results = nn.extract_sorted();
-    for (auto& r : results) {
-        r.distance = l2_distance_simd<D>(raw_query, graph.get_vector(r.id));
-    }
-    std::sort(results.begin(), results.end());
-    return results;
+    return nn.extract_sorted();
 }
 
 }  // namespace rabitq_search

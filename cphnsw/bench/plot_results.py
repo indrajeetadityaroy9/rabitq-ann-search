@@ -10,15 +10,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-def emit(event: str, **fields) -> None:
-    print(json.dumps({"event": event, **fields}, sort_keys=True), flush=True)
-
-
 ALGO_STYLE = {
-    "cphnsw-flat-1bit":  {"color": "#d62728", "marker": "o",  "label": "CP-HNSW flat 1-bit"},
-    "cphnsw-flat-2bit":  {"color": "#ff7f0e", "marker": "s",  "label": "CP-HNSW flat 2-bit"},
-    "cphnsw-flat-4bit":  {"color": "#e377c2", "marker": "^",  "label": "CP-HNSW flat 4-bit"},
-    "cphnsw-hnsw-1bit":  {"color": "#2ca02c", "marker": "D",  "label": "CP-HNSW HNSW 1-bit"},
+    "cphnsw-1bit":       {"color": "#d62728", "marker": "o",  "label": "CP-HNSW 1-bit"},
+    "cphnsw-2bit":       {"color": "#ff7f0e", "marker": "s",  "label": "CP-HNSW 2-bit"},
+    "cphnsw-4bit":       {"color": "#e377c2", "marker": "^",  "label": "CP-HNSW 4-bit"},
     "hnswlib-M16":       {"color": "#1f77b4", "marker": "v",  "label": "hnswlib M=16"},
     "hnswlib-M32":       {"color": "#17becf", "marker": "<",  "label": "hnswlib M=32"},
     "hnswlib-M64":       {"color": "#9467bd", "marker": ">",  "label": "hnswlib M=64"},
@@ -62,7 +57,6 @@ def plot_recall_qps(results, dataset_name, output_dir, recall_key="recall_at_10"
     outpath = Path(output_dir) / f"{dataset_name}_recall{label_suffix}_qps.png"
     fig.savefig(outpath, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    emit("plot_written", dataset=dataset_name, plot=f"recall{label_suffix}_qps", path=str(outpath))
 
 
 def plot_adr_qps(results, dataset_name, output_dir):
@@ -93,7 +87,6 @@ def plot_adr_qps(results, dataset_name, output_dir):
     outpath = Path(output_dir) / f"{dataset_name}_adr_qps.png"
     fig.savefig(outpath, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    emit("plot_written", dataset=dataset_name, plot="adr_qps", path=str(outpath))
 
 
 def plot_build_time(results, dataset_name, output_dir):
@@ -128,7 +121,6 @@ def plot_build_time(results, dataset_name, output_dir):
     outpath = Path(output_dir) / f"{dataset_name}_build_time.png"
     fig.savefig(outpath, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    emit("plot_written", dataset=dataset_name, plot="build_time", path=str(outpath))
 
 
 def plot_memory(results, dataset_name, output_dir):
@@ -163,7 +155,6 @@ def plot_memory(results, dataset_name, output_dir):
     outpath = Path(output_dir) / f"{dataset_name}_memory.png"
     fig.savefig(outpath, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    emit("plot_written", dataset=dataset_name, plot="memory", path=str(outpath))
 
 
 def process_file(filepath: str):
@@ -175,8 +166,6 @@ def process_file(filepath: str):
     results = data["results"]
     dataset_name = meta["dataset"].replace(" ", "-")
     output_dir = Path(filepath).parent
-
-    emit("plot_dataset_start", dataset=dataset_name, n_algorithms=len(results), source=str(filepath))
 
     plot_recall_qps(results, dataset_name, output_dir, "recall_at_10", "10")
     plot_recall_qps(results, dataset_name, output_dir, "recall_at_100", "100")

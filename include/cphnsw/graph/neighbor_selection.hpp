@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../core/types.hpp"
+#include "../core/adaptive_defaults.hpp"
 #include <vector>
 #include <algorithm>
 #include <cmath>
@@ -16,13 +17,18 @@ struct NeighborCandidate {
     }
 };
 
+// alpha-CNG pruning rule with convergence radius tau and per-node adaptive alpha.
+// Prune candidate v if existing neighbor e satisfies:
+//   dist(v, e) < local_alpha * dist(v, node) + margin - (local_alpha - 1) * tau
+// where local_alpha scales with candidate pool density.
 template <typename DistanceFn, typename ErrorFn>
-std::vector<NeighborCandidate> select_neighbors_alpha_cg(
+std::vector<NeighborCandidate> select_neighbors_alpha_cng(
     std::vector<NeighborCandidate> candidates,
     size_t R,
     DistanceFn distance_fn,
     ErrorFn error_fn,
-    float alpha)
+    float alpha,
+    float tau)
 {
     std::sort(candidates.begin(), candidates.end(),
               [](const auto& a, const auto& b) {
@@ -36,6 +42,11 @@ std::vector<NeighborCandidate> select_neighbors_alpha_cg(
     std::sort(candidates.begin(), candidates.end());
 
     if (candidates.size() <= R) return candidates;
+
+    // Per-node adaptive alpha: denser candidate pools get more aggressive pruning
+    float local_alpha = alpha * std::sqrt(
+        static_cast<float>(candidates.size()) / static_cast<float>(R));
+    local_alpha = std::clamp(local_alpha, 1.0f, adaptive_defaults::alpha_max_cap());
 
     std::vector<NeighborCandidate> selected;
     selected.reserve(R);
@@ -51,7 +62,8 @@ std::vector<NeighborCandidate> select_neighbors_alpha_cg(
             float err_existing = error_fn(existing.id);
             float margin = err_candidate + err_existing;
 
-            if (dist_ce < alpha * dist_cq + margin) {
+            float threshold = local_alpha * dist_cq + margin - (local_alpha - 1.0f) * tau;
+            if (dist_ce < threshold) {
                 should_add = false;
                 break;
             }

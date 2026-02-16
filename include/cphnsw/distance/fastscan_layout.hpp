@@ -137,29 +137,6 @@ struct NbitFastScanNeighborBlock {
         if (slot >= count) count = static_cast<uint32_t>(slot + 1);
     }
 
-    void set_neighbor_with_pr_msb(size_t slot, uint32_t id,
-                                   const BinaryCodeStorage<D>& pr_msb_code,
-                                   const NbitCodeStorage<D, BitWidth>& global_code,
-                                   const VertexAuxData& aux_data) {
-        size_t batch = slot / BatchSize;
-        size_t idx_in_batch = slot % BatchSize;
-        neighbor_ids[slot] = id;
-
-        code_blocks[batch].planes[0].store(idx_in_batch, pr_msb_code);
-
-        for (size_t b = 1; b < BitWidth; ++b) {
-            BinaryCodeStorage<D> plane_binary;
-            std::memcpy(plane_binary.signs, global_code.planes[b],
-                        BinaryCodeStorage<D>::NUM_WORDS * sizeof(uint64_t));
-            code_blocks[batch].planes[b].store(idx_in_batch, plane_binary);
-        }
-
-        aux[slot] = aux_data;
-        popcounts[slot] = static_cast<uint16_t>(pr_msb_code.popcount());
-        weighted_popcounts[slot] = static_cast<uint16_t>(global_code.weighted_popcount());
-        if (slot >= count) count = static_cast<uint32_t>(slot + 1);
-    }
-
     size_t size() const { return count; }
     bool empty() const { return count == 0; }
 };

@@ -1,6 +1,6 @@
 
 
-#include <cphnsw/api/rabitq_index.hpp>
+#include <cphnsw/api/hnsw_index.hpp>
 #include <iostream>
 #include <iomanip>
 #include <fstream>
@@ -131,7 +131,7 @@ int main(int argc, char** argv) {
 
     IndexParams idx_params;
     idx_params.dim = sift.dim;
-    RaBitQIndex<PADDED_DIM, 32> index(idx_params);
+    Index<PADDED_DIM, 32> index(idx_params);
     Timer timer;
 
     timer.start();
@@ -163,7 +163,8 @@ int main(int argc, char** argv) {
         }
         std::sort(latencies.begin(), latencies.end());
         double avg_latency = std::accumulate(latencies.begin(), latencies.end(), 0.0) / latencies.size();
-        float gamma = adaptive_defaults::gamma_from_recall(rt, PADDED_DIM);
+        float p = 1.0f - std::clamp(rt, 0.5f, 0.9999f);
+        float gamma = -std::log(p);
         float eps = adaptive_defaults::error_epsilon_search(rt);
         printf("event=benchmark_point recall_target=%.2f gamma=%.3f eps=%.2f recall_at_10=%.4f qps=%.0f p50_us=%.0f p99_us=%.0f\n",
                rt, gamma, eps, total_recall / sift.num_queries,

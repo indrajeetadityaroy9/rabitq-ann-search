@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "cphnsw"
 version = "0.1.0"
 description = "RaBitQ approximate nearest neighbor search"
-requires-python = ">=3.8"
+requires-python = ">=3.12"
 license = {text = "MIT"}
 dependencies = [
     "numpy>=1.20",
@@ -17,11 +17,7 @@ dependencies = [
     "pyarrow>=10.0",
     "matplotlib>=3.7",
     "psutil>=5.9",
-]
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=7.0",
+    "pyyaml>=6.0",
 ]
 
 [tool.setuptools.packages.find]

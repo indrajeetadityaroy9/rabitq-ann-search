@@ -1,0 +1,17 @@
+run:
+  output_dir: results
+  seed: 42
+
+data:
+  dataset: all          # or: sift1m, gist1m, openai1536, msmarco10m
+  base_dir: data
+
+index:
+  bits: [1, 2, 4]
+
+eval:
+  k: 100
+  recall_targets: [0.80, 0.90, 0.95, 0.97, 0.99]
+  n_runs: 3
+  n_threads: 1
+  competitors: true     # run hnswlib + FAISS baselines

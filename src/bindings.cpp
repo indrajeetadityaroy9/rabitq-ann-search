@@ -1,7 +1,6 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
-#include <cphnsw/api/rabitq_index.hpp>
 #include <cphnsw/api/hnsw_index.hpp>
 #include <cphnsw/core/adaptive_defaults.hpp>
 #include <cphnsw/io/serialization.hpp>
@@ -34,32 +33,31 @@ public:
     virtual void save(const std::string& path) const = 0;
 };
 
-template <typename IndexType, size_t D, size_t BitWidth>
+template <size_t D, size_t BitWidth>
 class PyIndexWrapper : public PyIndexBase {
 public:
+    using IndexType = Index<D, 32, BitWidth>;
+    using Graph = typename IndexType::Graph;
+
     PyIndexWrapper(size_t dim, uint64_t seed) {
         IndexParams params;
         params.dim = dim;
         params.seed = seed;
         index_ = std::make_unique<IndexType>(params);
+        seed_ = seed;
     }
 
     PyIndexWrapper(size_t dim, uint64_t seed,
-                   typename IndexType::Graph&& graph) {
+                   Graph&& graph, const HNSWLayerSnapshot& layer_data) {
         IndexParams params;
         params.dim = dim;
         params.seed = seed;
-        index_ = std::make_unique<IndexType>(params, std::move(graph));
+        index_ = std::make_unique<IndexType>(params, std::move(graph), layer_data);
+        seed_ = seed;
     }
 
-    void add_batch(const float* vecs, size_t n) override {
-        index_->add_batch(vecs, n);
-    }
-
-    void finalize(const BuildParams& params) override {
-        index_->finalize(params);
-    }
-
+    void add_batch(const float* vecs, size_t n) override { index_->add_batch(vecs, n); }
+    void finalize(const BuildParams& params) override { index_->finalize(params); }
     size_t size() const override { return index_->size(); }
     size_t dim() const override { return index_->dim(); }
     bool is_finalized() const override { return index_->is_finalized(); }
@@ -70,11 +68,13 @@ public:
     }
 
     void save(const std::string& path) const override {
-        IndexSerializer<D, 32, BitWidth>::save(path, index_->graph());
+        auto snap = index_->get_layer_snapshot();
+        IndexSerializer<D, 32, BitWidth>::save(path, index_->graph(), snap);
     }
 
 private:
     std::unique_ptr<IndexType> index_;
+    uint64_t seed_;
 };
 
 
@@ -86,15 +86,12 @@ static size_t padded_dim(size_t dim) {
 
 template <size_t BitWidth>
 static std::unique_ptr<PyIndexBase> create_index_with_bits(
-    size_t dim, uint64_t seed, bool hierarchical)
+    size_t dim, uint64_t seed)
 {
     size_t pd = padded_dim(dim);
 
     #define CASE_DIM(DIM) \
-        case DIM: \
-            return hierarchical \
-                ? std::make_unique<PyIndexWrapper<HNSWIndex<DIM, 32, BitWidth>, DIM, BitWidth>>(dim, seed) \
-                : std::make_unique<PyIndexWrapper<RaBitQIndex<DIM, 32, BitWidth>, DIM, BitWidth>>(dim, seed);
+        case DIM: return std::make_unique<PyIndexWrapper<DIM, BitWidth>>(dim, seed);
 
     switch (pd) {
         CASE_DIM(16)
@@ -116,12 +113,12 @@ static std::unique_ptr<PyIndexBase> create_index_with_bits(
 }
 
 static std::unique_ptr<PyIndexBase> create_index(
-    size_t dim, uint64_t seed, size_t bits, bool hierarchical = false)
+    size_t dim, uint64_t seed, size_t bits)
 {
     switch (bits) {
-        case 1: return create_index_with_bits<1>(dim, seed, hierarchical);
-        case 2: return create_index_with_bits<2>(dim, seed, hierarchical);
-        case 4: return create_index_with_bits<4>(dim, seed, hierarchical);
+        case 1: return create_index_with_bits<1>(dim, seed);
+        case 2: return create_index_with_bits<2>(dim, seed);
+        case 4: return create_index_with_bits<4>(dim, seed);
         default:
             throw std::invalid_argument(
                 "Unsupported bits=" + std::to_string(bits) +
@@ -136,10 +133,9 @@ static std::unique_ptr<PyIndexBase> load_index_with_bits(
 {
     #define LOAD_CASE_DIM(DIM) \
         case DIM: { \
-            auto graph = IndexSerializer<DIM, 32, BitWidth>::load(path); \
-            return std::make_unique<PyIndexWrapper< \
-                RaBitQIndex<DIM, 32, BitWidth>, DIM, BitWidth>>( \
-                original_dim, seed, std::move(graph)); \
+            auto result = IndexSerializer<DIM, 32, BitWidth>::load(path); \
+            return std::make_unique<PyIndexWrapper<DIM, BitWidth>>( \
+                original_dim, seed, std::move(result.graph), result.hnsw_data); \
         }
 
     switch (pd) {
@@ -332,13 +328,4 @@ PYBIND11_MODULE(_core, m) {
         py::arg("path"),
         py::arg("seed") = 42,
         "Load an index from a binary file previously saved with index.save().");
-
-    m.def("HNSWIndex", [](size_t dim, uint64_t seed, size_t bits) {
-        return create_index(dim, seed, bits, true);
-    },
-        py::arg("dim"),
-        py::arg("seed") = 42,
-        py::arg("bits") = 1,
-        "Create an HNSW multi-layer index. Same interface as Index but uses "
-        "hierarchical routing for faster search on large datasets.");
 }

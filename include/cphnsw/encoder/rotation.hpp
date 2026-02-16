@@ -2,6 +2,8 @@
 
 #include "../core/memory.hpp"
 #include "transform/fht.hpp"
+#include <array>
+#include <immintrin.h>
 #include <vector>
 #include <random>
 #include <cstring>
@@ -65,13 +67,11 @@ private:
 
     void apply_diagonal_simd(float* x, const float* signs_f) const {
         size_t i = 0;
-#ifdef __AVX2__
         for (; i + 8 <= padded_dim_; i += 8) {
             __m256 vx = _mm256_loadu_ps(x + i);
             __m256 vs = _mm256_load_ps(signs_f + i);
             _mm256_storeu_ps(x + i, _mm256_mul_ps(vx, vs));
         }
-#endif
         for (; i < padded_dim_; ++i) {
             x[i] *= signs_f[i];
         }

@@ -1,0 +1,8 @@
+Loading SIFT-1M dataset...
+
+======================================================================
+SIFT-1M Evaluation: 1,000,000 vectors, 128D, 10,000 queries
+Raw data: 0.477 GiB, Baseline RSS: 0.618 GiB
+======================================================================
+
+{"dim": 128, "event": "test_start", "n": 1000000, "test": "hnsw-1bit"}

@@ -15,11 +15,6 @@ namespace adaptive_defaults {
 
     // --- Recall-derived parameters ---
 
-    inline float gamma_from_recall(float recall_target, size_t /*D*/) {
-        float p = 1.0f - std::clamp(recall_target, 0.5f, 0.9999f);
-        return -std::log(p);
-    }
-
     inline float error_epsilon_search(float recall_target) {
         float p = 1.0f - std::clamp(recall_target, 0.5f, 0.9999f);
         return std::sqrt(-2.0f * std::log(p));
@@ -55,7 +50,9 @@ namespace adaptive_defaults {
     }
 
     constexpr float alpha_ceiling() { return 2.0f; }
+    constexpr float alpha_max_cap() { return 2.5f; }
     constexpr float alpha_floor_threshold() { return 1.02f; }
+    constexpr float tau_scaling_factor() { return 0.5f; }
 
     inline size_t random_init_pool(size_t R, size_t n) {
         size_t pool = static_cast<size_t>(static_cast<double>(R) * (1.0 + std::log(static_cast<double>(R))));
@@ -104,29 +101,9 @@ namespace adaptive_defaults {
         return base + bonus;
     }
 
-    // --- Encoder Optimization ---
+    // --- CAQ Encoder ---
 
-    constexpr size_t nbit_grid_resolution(size_t D, size_t BitWidth) {
-        size_t base = 64 * (size_t(1) << BitWidth);
-        size_t dim_adj = (D >= 512) ? base / 2 : base;
-        return dim_adj < 64 ? 64 : (dim_adj > 1024 ? 1024 : dim_adj);
-    }
-
-    constexpr size_t golden_section_iters(size_t grid_resolution) {
-        size_t iters = 0;
-        size_t g = grid_resolution;
-        while (g > 1) { g = (g * 618) / 1000; ++iters; }
-        return iters + 2;
-    }
-
-    constexpr bool use_critical_point_search(size_t D, size_t BitWidth) {
-        return (D * (size_t(1) << BitWidth)) <= 8192;
-    }
-
-    constexpr float nbit_initial_scale() { return 1e-6f; }
-    constexpr float nbit_overshoot_relative() { return 1.1f; }
-    constexpr float nbit_overshoot_absolute() { return 0.1f; }
-    constexpr float nbit_scale_floor() { return 1e-8f; }
+    constexpr size_t caq_max_iterations() { return 3; }
 
     // --- Numerical Guards ---
 
@@ -142,15 +119,7 @@ namespace adaptive_defaults {
 
     constexpr float ip_quality_epsilon() { return 1e-10f; }
 
-    // --- Platform ---
-
-    constexpr size_t prefetch_line_cap() {
-#if defined(__aarch64__) || defined(_M_ARM64)
-        return 8;
-#else
-        return 16;
-#endif
-    }
+    constexpr size_t prefetch_line_cap() { return 16; }
 
 }  // namespace adaptive_defaults
 }  // namespace cphnsw

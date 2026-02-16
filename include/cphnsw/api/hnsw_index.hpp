@@ -4,6 +4,7 @@
 #include "../core/codes.hpp"
 #include "../core/memory.hpp"
 #include "../core/adaptive_defaults.hpp"
+#include "../core/adaptive_gamma.hpp"
 #include "../encoder/rabitq_encoder.hpp"
 #include "../distance/fastscan_kernel.hpp"
 #include "../graph/rabitq_graph.hpp"
@@ -11,6 +12,7 @@
 #include "../graph/neighbor_selection.hpp"
 #include "../search/rabitq_search.hpp"
 #include "../graph/visitation_table.hpp"
+#include "../io/serialization.hpp"
 #include "params.hpp"
 #include <vector>
 #include <random>
@@ -19,12 +21,12 @@
 #include <algorithm>
 #include <type_traits>
 
-#include "../core/omp_compat.hpp"
+#include <omp.h>
 
 namespace cphnsw {
 
 template <size_t D, size_t R = 32, size_t BitWidth = 1>
-class HNSWIndex {
+class Index {
 public:
     using CodeType = std::conditional_t<BitWidth == 1,
         RaBitQCode<D>, NbitRaBitQCode<D, BitWidth>>;
@@ -39,7 +41,7 @@ public:
 
     static constexpr size_t M_UPPER = adaptive_defaults::upper_layer_degree(R, D);
 
-    explicit HNSWIndex(const IndexParams& params)
+    explicit Index(const IndexParams& params)
         : params_(params)
         , encoder_(params.dim, params.seed)
         , graph_(params.dim)
@@ -49,15 +51,28 @@ public:
         if (params.dim == 0) throw std::invalid_argument("dim must be > 0");
     }
 
-    HNSWIndex(const IndexParams& params, Graph&& graph)
+    Index(const IndexParams& params, Graph&& graph, const HNSWLayerSnapshot& layer_data)
         : params_(params)
         , encoder_(params.dim, params.seed)
         , graph_(std::move(graph))
         , finalized_(true)
         , mL_(1.0 / std::log(static_cast<double>(M_UPPER)))
         , rng_(params.seed)
+        , max_level_(layer_data.max_level)
+        , entry_point_(layer_data.entry_point)
+        , upper_tau_(layer_data.upper_tau)
+        , node_levels_(layer_data.node_levels)
     {
         if (params.dim == 0) throw std::invalid_argument("dim must be > 0");
+        // Convert HNSWLayerSnapshot edges to internal UpperLayerEdge format
+        upper_layers_.resize(layer_data.upper_layers.size());
+        for (size_t l = 0; l < layer_data.upper_layers.size(); ++l) {
+            upper_layers_[l].reserve(layer_data.upper_layers[l].size());
+            for (const auto& ext_edge : layer_data.upper_layers[l]) {
+                upper_layers_[l].push_back(UpperLayerEdge{ext_edge.node, ext_edge.neighbors});
+            }
+        }
+        compute_gamma_statistics();
     }
 
     void add_batch(const float* vecs, size_t num_vecs) {
@@ -89,6 +104,8 @@ public:
         graph_refinement::optimize_graph_adaptive(
             graph_, encoder_, params.num_threads, params.verbose, params_.seed);
 
+        compute_gamma_statistics();
+
         needs_build_ = false;
         finalized_ = true;
         if (params.verbose) {
@@ -103,9 +120,15 @@ public:
     {
         if (graph_.empty()) return {};
 
-        float gamma = (params.gamma_override >= 0.0f)
-            ? params.gamma_override
-            : adaptive_defaults::gamma_from_recall(params.recall_target, D);
+        float gamma;
+        if (params.gamma_override >= 0.0f) {
+            gamma = params.gamma_override;
+        } else if (gamma_estimator_.is_initialized()) {
+            gamma = estimate_per_query_gamma(query, params.recall_target);
+        } else {
+            float p = 1.0f - std::clamp(params.recall_target, 0.5f, 0.9999f);
+            gamma = -std::log(p);
+        }
         float eps = adaptive_defaults::error_epsilon_search(params.recall_target);
 
         QueryType encoded = encoder_.encode_query_raw(query);
@@ -128,6 +151,22 @@ public:
         return rabitq_search::search<D, R, BitWidth>(encoded, query, graph_, params.k, gamma, visited, 0, ep);
     }
 
+    HNSWLayerSnapshot get_layer_snapshot() const {
+        HNSWLayerSnapshot snap;
+        snap.max_level = max_level_;
+        snap.entry_point = entry_point_;
+        snap.upper_tau = upper_tau_;
+        snap.node_levels = node_levels_;
+        snap.upper_layers.resize(upper_layers_.size());
+        for (size_t l = 0; l < upper_layers_.size(); ++l) {
+            snap.upper_layers[l].reserve(upper_layers_[l].size());
+            for (const auto& edge : upper_layers_[l]) {
+                snap.upper_layers[l].push_back(HNSWLayerEdge{edge.node, edge.neighbors});
+            }
+        }
+        return snap;
+    }
+
     size_t size() const { return graph_.size(); }
     size_t dim() const { return params_.dim; }
     bool is_finalized() const { return finalized_; }
@@ -137,6 +176,7 @@ private:
     IndexParams params_;
     Encoder encoder_;
     Graph graph_;
+    AdaptiveGammaEstimator gamma_estimator_;
     bool finalized_ = false;
     bool needs_build_ = false;
 
@@ -145,6 +185,7 @@ private:
 
     int max_level_ = 0;
     NodeId entry_point_ = INVALID_NODE;
+    float upper_tau_ = 0.0f;
 
     std::vector<int> node_levels_;
 
@@ -208,6 +249,30 @@ private:
         std::sort(insertion_order.begin(), insertion_order.end(),
                   [this](NodeId a, NodeId b) { return node_levels_[a] > node_levels_[b]; });
 
+        // Estimate upper_tau_ from nearest-neighbor distances of upper-layer nodes
+        std::vector<float> upper_nn_dists;
+        for (size_t idx = 0; idx < n && upper_nn_dists.size() < 200; ++idx) {
+            NodeId node = insertion_order[idx];
+            if (node_levels_[node] == 0) break;
+            // Find nearest among other upper-layer nodes
+            float best = std::numeric_limits<float>::max();
+            for (size_t jdx = 0; jdx < n && jdx < 500; ++jdx) {
+                NodeId other = insertion_order[jdx];
+                if (other == node) continue;
+                if (node_levels_[other] == 0) break;
+                float d = exact_distance(graph_.get_vector(node), graph_.get_vector(other));
+                if (d < best) best = d;
+            }
+            if (best < std::numeric_limits<float>::max()) {
+                upper_nn_dists.push_back(best);
+            }
+        }
+        if (!upper_nn_dists.empty()) {
+            std::sort(upper_nn_dists.begin(), upper_nn_dists.end());
+            size_t p10 = upper_nn_dists.size() / 10;
+            upper_tau_ = upper_nn_dists[p10] * adaptive_defaults::tau_scaling_factor();
+        }
+
         for (size_t idx = 0; idx < n; ++idx) {
             NodeId node = insertion_order[idx];
             int node_level = node_levels_[node];
@@ -226,9 +291,9 @@ private:
                 auto dist_fn = [this](NodeId a, NodeId b) {
                     return exact_distance(graph_.get_vector(a), graph_.get_vector(b));
                 };
-                auto selected = select_neighbors_alpha_cg(
+                auto selected = select_neighbors_alpha_cng(
                     std::move(candidates), M_UPPER, dist_fn, zero_error,
-                    adaptive_defaults::alpha_default(D));
+                    adaptive_defaults::alpha_default(D), upper_tau_);
 
                 auto& node_neighbors = get_or_create_edge(level, node).neighbors;
                 node_neighbors.clear();
@@ -348,14 +413,57 @@ private:
         auto dist_fn = [this](NodeId a, NodeId b) {
             return exact_distance(graph_.get_vector(a), graph_.get_vector(b));
         };
-        auto selected = select_neighbors_alpha_cg(
+        auto selected = select_neighbors_alpha_cng(
             std::move(candidates), M_UPPER, dist_fn, zero_error,
-            adaptive_defaults::alpha_default(D));
+            adaptive_defaults::alpha_default(D), upper_tau_);
         nb.clear();
         nb.reserve(selected.size());
         for (const auto& s : selected) {
             nb.push_back(s.id);
         }
+    }
+
+    void compute_gamma_statistics() {
+        size_t n = graph_.size();
+        size_t sample_size = std::min(n, size_t(500));
+        if (sample_size == 0) return;
+
+        std::vector<float> rotated_sample(sample_size * D);
+        std::mt19937 rng(params_.seed + 12345);
+        std::vector<size_t> indices(n);
+        std::iota(indices.begin(), indices.end(), 0);
+        std::shuffle(indices.begin(), indices.end(), rng);
+
+        for (size_t i = 0; i < sample_size; ++i) {
+            NodeId id = static_cast<NodeId>(indices[i]);
+            encoder_.rotate_raw_vector(graph_.get_vector(id), rotated_sample.data() + i * D);
+        }
+
+        gamma_estimator_.compute_statistics(rotated_sample.data(), sample_size, D);
+    }
+
+    float estimate_per_query_gamma(const float* query, float recall_target) const {
+        alignas(32) float query_rotated[D];
+        encoder_.rotate_raw_vector(query, query_rotated);
+
+        NodeId ep = (entry_point_ != INVALID_NODE) ? entry_point_ : graph_.entry_point();
+        if (ep == INVALID_NODE) {
+            float p = 1.0f - std::clamp(recall_target, 0.5f, 0.9999f);
+            return -std::log(p);
+        }
+
+        const auto& nb = graph_.get_neighbors(ep);
+        thread_local std::vector<float> dist_samples;
+        dist_samples.clear();
+        dist_samples.reserve(R);
+        for (size_t i = 0; i < nb.size(); ++i) {
+            NodeId nid = nb.neighbor_ids[i];
+            if (nid == INVALID_NODE) continue;
+            dist_samples.push_back(l2_distance_simd<D>(query, graph_.get_vector(nid)));
+        }
+
+        return gamma_estimator_.estimate_gamma(
+            query_rotated, dist_samples.data(), dist_samples.size(), recall_target);
     }
 
     static float zero_error(NodeId) { return 0.0f; }

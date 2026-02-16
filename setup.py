@@ -1,10 +1,10 @@
 """CMake-based build for pybind11 extension module."""
 
-import os
 import subprocess
 import sys
 from pathlib import Path
 
+import pybind11
 from setuptools import Extension, find_packages, setup
 from setuptools.command.build_ext import build_ext
 
@@ -12,7 +12,7 @@ from setuptools.command.build_ext import build_ext
 class CMakeExtension(Extension):
     def __init__(self, name, sourcedir=""):
         super().__init__(name, sources=[])
-        self.sourcedir = os.fspath(Path(sourcedir).resolve())
+        self.sourcedir = str(Path(sourcedir).resolve())
 
 
 class CMakeBuild(build_ext):
@@ -22,11 +22,9 @@ class CMakeBuild(build_ext):
 
         cmake_args = [
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}",
-            f"-DPYTHON_EXECUTABLE={sys.executable}",
             f"-DCMAKE_BUILD_TYPE={cfg}",
+            f"-Dpybind11_DIR={pybind11.get_cmake_dir()}",
         ]
-
-        build_args = ["--config", cfg, "--target", "_core"]
 
         build_temp = Path(self.build_temp) / ext.name
         build_temp.mkdir(parents=True, exist_ok=True)
@@ -36,7 +34,7 @@ class CMakeBuild(build_ext):
             cwd=build_temp, check=True,
         )
         subprocess.run(
-            ["cmake", "--build", ".", *build_args],
+            ["cmake", "--build", ".", "--config", cfg, "--target", "_core"],
             cwd=build_temp, check=True,
         )
 

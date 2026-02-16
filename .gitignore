@@ -51,9 +51,6 @@ checkpoints/
 *~
 .DS_Store
 
-# External benchmark framework (cloned)
-bench/vibe/
-
 # Local paper downloads / conversions
 papers/arxiv_pdfs/
 papers/arxiv_md/

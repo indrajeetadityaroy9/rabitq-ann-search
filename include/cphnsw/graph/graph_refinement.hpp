@@ -12,7 +12,7 @@
 #include <algorithm>
 #include <numeric>
 #include <cmath>
-#include <cstring>
+#include <cstdint>
 #include <random>
 #include <atomic>
 
@@ -20,6 +20,8 @@
 
 namespace cphnsw {
 namespace graph_refinement {
+
+static constexpr uint64_t DEFAULT_GRAPH_SEED = 42;
 
 struct WorkingNeighbor {
     NodeId id = INVALID_NODE;
@@ -59,19 +61,15 @@ void write_neighbors(RaBitQGraph<D, R, BitWidth>& graph, const EncType& encoder,
 template <size_t D, size_t R, size_t BitWidth, typename EncType>
 void prune_and_write(RaBitQGraph<D, R, BitWidth>& graph, const EncType& encoder,
                      NodeId node, std::vector<NeighborCandidate>& candidates,
-                     float alpha, float tau, float error_tolerance = 0.0f) {
+                     float alpha, float tau, float error_tolerance = 0.0f,
+                     float resid_sigma = 1.0f) {
     auto dist_fn = [&](NodeId a, NodeId b) -> float {
         return l2_distance_simd<D>(graph.get_vector(a), graph.get_vector(b));
     };
     auto error_fn = [&](NodeId nid) -> float {
         if (error_tolerance <= 0.0f) return 0.0f;
         const auto& code = graph.get_code(nid);
-        float ip_qo = code.ip_quantized_original;
-        if (ip_qo < adaptive_defaults::norm_epsilon(D)) return 0.0f;
-        float ip_qo_sq = ip_qo * ip_qo;
-        float Df = static_cast<float>(D);
-        float variance = (1.0f - ip_qo_sq) * (Df - 1.0f) / (ip_qo_sq * Df);
-        return error_tolerance * std::sqrt(variance) * code.dist_to_centroid;
+        return error_tolerance * resid_sigma * code.nop;
     };
 
     auto selected = select_neighbors_alpha_cng(
@@ -85,14 +83,14 @@ template <size_t D, size_t R, size_t BitWidth>
 void init_working_random(
     const RaBitQGraph<D, R, BitWidth>& graph,
     std::vector<std::vector<WorkingNeighbor>>& working,
-    size_t actual_threads, uint64_t seed)
+    size_t actual_threads)
 {
     size_t n = graph.size();
 
     #pragma omp parallel num_threads(actual_threads)
     {
         int tid = omp_get_thread_num();
-        std::mt19937 rng(seed + tid);
+        std::mt19937 rng(static_cast<uint32_t>(DEFAULT_GRAPH_SEED + static_cast<uint64_t>(tid)));
 
         #pragma omp for schedule(static)
         for (size_t i = 0; i < n; ++i) {
@@ -285,14 +283,14 @@ template <size_t D, size_t R, size_t BitWidth>
 AlphaTauResult derive_alpha_tau_from_working(
     const RaBitQGraph<D, R, BitWidth>& graph,
     const std::vector<std::vector<WorkingNeighbor>>& working,
-    size_t sample_size = 0, uint64_t seed = 42)
+    size_t sample_size = 0)
 {
     size_t n = working.size();
     if (n == 0) return {adaptive_defaults::alpha_default(D), 0.0f};
     if (sample_size == 0) sample_size = adaptive_defaults::alpha_sample_size(n);
 
     size_t actual_sample = std::min(sample_size, n);
-    std::mt19937 rng(seed);
+    std::mt19937 rng(static_cast<uint32_t>(DEFAULT_GRAPH_SEED + 1));
     std::vector<size_t> sample_indices(n);
     std::iota(sample_indices.begin(), sample_indices.end(), 0);
     std::shuffle(sample_indices.begin(), sample_indices.end(), rng);
@@ -300,7 +298,7 @@ AlphaTauResult derive_alpha_tau_from_working(
 
     std::vector<float> neighbor_dists;
     std::vector<float> inter_neighbor_dists;
-    std::vector<float> nn_dists;  // nearest-neighbor distances for tau
+    std::vector<float> nn_dists;
     neighbor_dists.reserve(actual_sample * R);
     inter_neighbor_dists.reserve(actual_sample * R);
     nn_dists.reserve(actual_sample);
@@ -312,7 +310,6 @@ AlphaTauResult derive_alpha_tau_from_working(
                 neighbor_dists.push_back(nb.distance);
             }
         }
-        // Collect nearest-neighbor distance (first element, already sorted by distance)
         if (!wl.empty() && wl[0].id != INVALID_NODE) {
             nn_dists.push_back(wl[0].distance);
         }
@@ -346,7 +343,6 @@ AlphaTauResult derive_alpha_tau_from_working(
         if (alpha < adaptive_defaults::alpha_floor_threshold()) alpha = adaptive_defaults::alpha_default(D);
     }
 
-    // Tau = P10 of nearest-neighbor distances, scaled down
     float tau = 0.0f;
     if (!nn_dists.empty()) {
         std::sort(nn_dists.begin(), nn_dists.end());
@@ -361,7 +357,8 @@ AlphaTauResult derive_alpha_tau_from_working(
 template <size_t D, size_t R, size_t BitWidth, typename EncType>
 void run_reverse_edge_pass(RaBitQGraph<D, R, BitWidth>& graph, const EncType& encoder,
                            float alpha, float tau, float error_tolerance,
-                           size_t actual_threads, size_t omp_chunk) {
+                           size_t actual_threads, size_t omp_chunk,
+                           float resid_sigma = 1.0f) {
     size_t n = graph.size();
 
     std::vector<std::vector<NeighborCandidate>> reverse_cands(n);
@@ -398,18 +395,20 @@ void run_reverse_edge_pass(RaBitQGraph<D, R, BitWidth>& graph, const EncType& en
             all.push_back(cand);
         }
 
-        prune_and_write<D, R, BitWidth>(graph, encoder, v, all, alpha, tau, error_tolerance);
+        prune_and_write<D, R, BitWidth>(graph, encoder, v, all, alpha, tau, error_tolerance, resid_sigma);
     }
 }
 
 
 template <size_t D, size_t R, size_t BitWidth, typename EncType>
-void optimize_graph_adaptive(RaBitQGraph<D, R, BitWidth>& graph, const EncType& encoder,
-                             size_t num_threads, bool verbose, uint64_t seed = 42) {
+typename RaBitQGraph<D, R, BitWidth>::Permutation
+optimize_graph_adaptive(RaBitQGraph<D, R, BitWidth>& graph, const EncType& encoder,
+                        float resid_sigma = 1.0f) {
+    using Permutation = typename RaBitQGraph<D, R, BitWidth>::Permutation;
     size_t n = graph.size();
-    if (n == 0) return;
+    if (n == 0) return Permutation{};
 
-    size_t actual_threads = num_threads ? num_threads : omp_get_max_threads();
+    size_t actual_threads = static_cast<size_t>(omp_get_max_threads());
     float error_tolerance = adaptive_defaults::error_tolerance(D);
     size_t omp_chunk = adaptive_defaults::omp_chunk_size(n, actual_threads);
 
@@ -424,27 +423,23 @@ void optimize_graph_adaptive(RaBitQGraph<D, R, BitWidth>& graph, const EncType& 
     std::vector<std::vector<WorkingNeighbor>> working(n);
     std::vector<std::vector<uint8_t>> new_flags(n);
 
-    if (verbose) {
-        printf("event=graph_opt_start nodes=%zu degree=%zu threads=%zu delta=%.4f threshold=%zu max_iters=%zu\n",
-               n, R, actual_threads, delta, delta_threshold, max_iters);
-    }
-    init_working_random<D, R, BitWidth>(graph, working, actual_threads, seed);
+    init_working_random<D, R, BitWidth>(graph, working, actual_threads);
 
     for (size_t i = 0; i < n; ++i) {
         new_flags[i].assign(working[i].size(), 1);
     }
 
-    size_t converged_round = max_iters;
     for (size_t round = 0; round < max_iters; ++round) {
         size_t updates = nndescent_join_pass<D, R, BitWidth>(graph, working, new_flags, actual_threads, omp_chunk);
 
         if (updates <= delta_threshold) {
-            converged_round = round + 1;
             break;
         }
     }
 
-    auto [alpha, tau] = derive_alpha_tau_from_working<D, R, BitWidth>(graph, working, 0, seed);
+    AlphaTauResult alpha_tau = derive_alpha_tau_from_working<D, R, BitWidth>(graph, working, 0);
+    float alpha = alpha_tau.alpha;
+    float tau = alpha_tau.tau;
 
     #pragma omp parallel for schedule(dynamic, omp_chunk) num_threads(actual_threads)
     for (size_t i = 0; i < n; ++i) {
@@ -456,21 +451,20 @@ void optimize_graph_adaptive(RaBitQGraph<D, R, BitWidth>& graph, const EncType& 
                 candidates.push_back({nb.id, nb.distance});
             }
         }
-        prune_and_write<D, R, BitWidth>(graph, encoder, u, candidates, alpha, tau, error_tolerance);
+        prune_and_write<D, R, BitWidth>(graph, encoder, u, candidates, alpha, tau, error_tolerance, resid_sigma);
     }
 
     { std::vector<std::vector<WorkingNeighbor>>().swap(working); }
     { std::vector<std::vector<uint8_t>>().swap(new_flags); }
 
-    run_reverse_edge_pass<D, R, BitWidth>(graph, encoder, alpha, tau, error_tolerance, actual_threads, omp_chunk);
+    run_reverse_edge_pass<D, R, BitWidth>(graph, encoder, alpha, tau, error_tolerance, actual_threads, omp_chunk, resid_sigma);
 
     NodeId hub = graph.find_hub_entry();
     graph.set_entry_point(hub);
-    if (verbose) {
-        printf("event=graph_opt_done converged_round=%zu alpha=%.3f tau=%.4f hub=%u hub_degree=%zu avg_degree=%.3f max_degree=%zu\n",
-               converged_round, alpha, tau, hub, graph.neighbor_count(hub),
-               graph.average_degree(), graph.max_degree());
-    }
+
+    auto perm = graph.reorder_bfs(hub);
+
+    return perm;
 }
 
 }  // namespace graph_refinement

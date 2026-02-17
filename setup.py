@@ -1,7 +1,6 @@
 """CMake-based build for pybind11 extension module."""
 
 import subprocess
-import sys
 from pathlib import Path
 
 import pybind11

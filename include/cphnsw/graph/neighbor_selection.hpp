@@ -17,10 +17,7 @@ struct NeighborCandidate {
     }
 };
 
-// alpha-CNG pruning rule with convergence radius tau and per-node adaptive alpha.
-// Prune candidate v if existing neighbor e satisfies:
-//   dist(v, e) < local_alpha * dist(v, node) + margin - (local_alpha - 1) * tau
-// where local_alpha scales with candidate pool density.
+// alpha-CNG pruning with adaptive local alpha and convergence radius tau.
 template <typename DistanceFn, typename ErrorFn>
 std::vector<NeighborCandidate> select_neighbors_alpha_cng(
     std::vector<NeighborCandidate> candidates,
@@ -43,7 +40,6 @@ std::vector<NeighborCandidate> select_neighbors_alpha_cng(
 
     if (candidates.size() <= R) return candidates;
 
-    // Per-node adaptive alpha: denser candidate pools get more aggressive pruning
     float local_alpha = alpha * std::sqrt(
         static_cast<float>(candidates.size()) / static_cast<float>(R));
     local_alpha = std::clamp(local_alpha, 1.0f, adaptive_defaults::alpha_max_cap());
@@ -74,9 +70,15 @@ std::vector<NeighborCandidate> select_neighbors_alpha_cng(
         }
     }
 
-    for (size_t i = 0; i < candidates.size() && selected.size() < R; ++i) {
-        if (!used[i]) {
-            selected.push_back(candidates[i]);
+    if (selected.size() < R) {
+        std::vector<size_t> backfill_indices;
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            if (!used[i]) backfill_indices.push_back(i);
+        }
+
+        for (size_t idx : backfill_indices) {
+            if (selected.size() >= R) break;
+            selected.push_back(candidates[idx]);
         }
     }
 

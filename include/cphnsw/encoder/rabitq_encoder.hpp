@@ -7,7 +7,6 @@
 #include <cmath>
 #include <algorithm>
 #include <vector>
-#include <limits>
 #include <stdexcept>
 
 #include <omp.h>
@@ -31,9 +30,9 @@ public:
 
     static constexpr size_t NUM_SUB_SEGMENTS = (D + 3) / 4;
 
-    RaBitQEncoderBase(size_t dim, uint64_t seed = 42)
+    explicit RaBitQEncoderBase(size_t dim)
         : dim_(dim)
-        , rotation_(dim, seed)
+        , rotation_(dim)
         , padded_dim_(rotation_.padded_dim())
         , centroid_(dim, 0.0f)
         , has_centroid_(false) {
@@ -95,7 +94,7 @@ public:
         }
     }
 
-    float compute_ip_code_parent(const BinaryCodeStorage<D>& code,
+    float compute_ip_cp(const BinaryCodeStorage<D>& code,
                                   const float* rotated_parent) const {
         float ip = 0.0f;
         for (size_t i = 0; i < padded_dim_; ++i) {
@@ -169,11 +168,11 @@ public:
             for (size_t i = dim_; i < D; ++i) diff_op[i] = 0.0f;
 
             float nop = std::sqrt(nop_sq);
-            aux.dist_to_centroid = nop;
+            aux.nop = nop;
 
             if (nop < adaptive_defaults::norm_epsilon(D)) {
-                aux.ip_quantized_original = 0.0f;
-                aux.ip_code_parent = 0.0f;
+                aux.ip_qo = 0.0f;
+                aux.ip_cp = 0.0f;
                 return aux;
             }
 
@@ -190,17 +189,16 @@ public:
                 l1_norm += std::abs(rotated[i]);
             }
 
-            aux.ip_quantized_original = l1_norm * inv_sqrt_d_;
+            aux.ip_qo = l1_norm * inv_sqrt_d_;
 
-            // SymphonyQG Eq 6: precomputed parent-relative inner product
-            aux.ip_code_parent = compute_ip_code_parent(*out_code, rotated_parent);
+            aux.ip_cp = compute_ip_cp(*out_code, rotated_parent);
 
             return aux;
         }
 
-        aux.dist_to_centroid = neighbor_code.dist_to_centroid;
-        aux.ip_quantized_original = neighbor_code.ip_quantized_original;
-        aux.ip_code_parent = 0.0f;
+        aux.nop = neighbor_code.nop;
+        aux.ip_qo = neighbor_code.ip_qo;
+        aux.ip_cp = 0.0f;
         return aux;
     }
 
@@ -217,8 +215,6 @@ private:
     QueryType encode_query_raw_impl(const float* vec, float* buf,
                                      uint8_t* q_bar_u) const {
         QueryType query;
-
-        query.error_epsilon = 0.0f;
 
         rotation_.apply_copy(vec, buf);
         for (size_t i = 0; i < padded_dim_; ++i) {
@@ -256,10 +252,10 @@ public:
             norm_sq += v * v;
         }
         float norm = std::sqrt(norm_sq);
-        code.dist_to_centroid = norm;
+        code.nop = norm;
 
         if (norm < adaptive_defaults::norm_epsilon(D)) {
-            code.ip_quantized_original = 0.0f;
+            code.ip_qo = 0.0f;
             return code;
         }
 
@@ -279,7 +275,7 @@ public:
             l1_norm += std::abs(buf[i]);
         }
 
-        code.ip_quantized_original = l1_norm * this->inv_sqrt_d_;
+        code.ip_qo = l1_norm * this->inv_sqrt_d_;
 
         return code;
     }
@@ -307,8 +303,7 @@ public:
 
     using Base::Base;
 
-    // Encode parent-relative direction with full N-bit CAQ precision.
-    // All planes are parent-relative, making the distance formula consistent.
+    // Parent-relative CAQ encoding keeps edge-distance formulas consistent.
     NbitNeighborResult compute_neighbor_aux_nbit(
         const float* parent_vec, const float* neighbor_vec,
         const float* rotated_parent) const
@@ -325,11 +320,11 @@ public:
         for (size_t i = this->dim_; i < D; ++i) diff[i] = 0.0f;
 
         float nop = std::sqrt(nop_sq);
-        result.aux.dist_to_centroid = nop;
+        result.aux.nop = nop;
 
         if (nop < adaptive_defaults::norm_epsilon(D)) {
-            result.aux.ip_quantized_original = 0.0f;
-            result.aux.ip_code_parent = 0.0f;
+            result.aux.ip_qo = 0.0f;
+            result.aux.ip_cp = 0.0f;
             return result;
         }
 
@@ -342,7 +337,6 @@ public:
 
         const size_t pd = this->padded_dim_;
 
-        // Delta-based initialization
         float buf_min = rotated[0], buf_max = rotated[0];
         for (size_t i = 1; i < pd; ++i) {
             if (rotated[i] < buf_min) buf_min = rotated[i];
@@ -368,7 +362,6 @@ public:
             norm_c_sq += c * c;
         }
 
-        // CAQ coordinate descent
         constexpr size_t max_iters = adaptive_defaults::caq_max_iterations();
         for (size_t iter = 0; iter < max_iters; ++iter) {
             bool changed = false;
@@ -401,7 +394,6 @@ public:
             if (!changed) break;
         }
 
-        // Write codes and compute aux data
         float ip_qo = 0.0f, ip_cp = 0.0f;
         for (size_t i = 0; i < pd; ++i) {
             result.code.set_value(i, static_cast<uint8_t>(pr_codes[i]));
@@ -409,14 +401,12 @@ public:
             ip_qo += c * rotated[i];
             ip_cp += c * rotated_parent[i];
         }
-        result.aux.ip_quantized_original = ip_qo * this->inv_sqrt_d_;
-        result.aux.ip_code_parent = ip_cp * this->inv_sqrt_d_;
+        result.aux.ip_qo = ip_qo * this->inv_sqrt_d_;
+        result.aux.ip_cp = ip_cp * this->inv_sqrt_d_;
         return result;
     }
 
-    // CAQ (Code Adjustment Quantization) encoding via coordinate descent.
-    // For each dimension, greedily selects the codeword maximizing cos(quantized, original).
-    // O(D * 2^B) per vector vs O(2^B * D * log D) for the old critical-point search.
+    // Coordinate-descent CAQ maximizes cosine alignment in quantized space.
     CodeType encode_impl(const float* vec, float* buf, float* centered_buf) const {
         CodeType code;
         code.clear();
@@ -428,10 +418,10 @@ public:
             norm_sq += v * v;
         }
         float norm = std::sqrt(norm_sq);
-        code.dist_to_centroid = norm;
+        code.nop = norm;
 
         if (norm < adaptive_defaults::norm_epsilon(D)) {
-            code.ip_quantized_original = 0.0f;
+            code.ip_qo = 0.0f;
             code.msb_popcount = 0;
             return code;
         }
@@ -444,14 +434,12 @@ public:
 
         const size_t pd = this->padded_dim_;
 
-        // Initialize codes to nearest-rounding assignment
         thread_local std::vector<int> codes_arr;
         codes_arr.resize(pd);
 
-        float dot_co = 0.0f;   // <code_vector, original>
-        float norm_c_sq = 0.0f; // ||code_vector||^2
+        float dot_co = 0.0f;
+        float norm_c_sq = 0.0f;
 
-        // Delta-based initialization: find min/max of buf, scale to [0, K]
         float buf_min = buf[0], buf_max = buf[0];
         for (size_t i = 1; i < pd; ++i) {
             if (buf[i] < buf_min) buf_min = buf[i];
@@ -473,9 +461,6 @@ public:
             norm_c_sq += c * c;
         }
 
-        // Coordinate descent: sweep each dimension, try all 2^B codewords,
-        // keep the one that maximizes cos^2 = dot_co^2 / norm_c_sq
-        // (avoiding sqrt by comparing dot^2 * other_norm vs other_dot^2 * norm)
         constexpr size_t max_iters = adaptive_defaults::caq_max_iterations();
         for (size_t iter = 0; iter < max_iters; ++iter) {
             bool changed = false;
@@ -483,14 +468,10 @@ public:
                 int old_u = codes_arr[i];
                 float old_c = (2.0f * old_u - K) / K;
 
-                // Remove contribution of dimension i
                 float dot_without = dot_co - old_c * buf[i];
                 float norm_without = norm_c_sq - old_c * old_c;
 
                 int best_u = old_u;
-                // Current objective: dot_co^2 * 1 (comparing against norm_c_sq)
-                // We want: (dot_without + new_c * buf[i])^2 / (norm_without + new_c^2) > best
-                // Avoid division: compare cross-multiplied
                 float best_dot = dot_co;
                 float best_norm = norm_c_sq;
 
@@ -500,7 +481,6 @@ public:
                     float new_dot = dot_without + c * buf[i];
                     float new_norm = norm_without + c * c;
 
-                    // Compare new_dot^2 * best_norm vs best_dot^2 * new_norm
                     if (new_dot * new_dot * best_norm > best_dot * best_dot * new_norm) {
                         best_u = u;
                         best_dot = new_dot;
@@ -519,7 +499,6 @@ public:
             if (!changed) break;
         }
 
-        // Write final codes
         float ip_qo = 0.0f;
         for (size_t i = 0; i < pd; ++i) {
             code.codes.set_value(i, static_cast<uint8_t>(codes_arr[i]));
@@ -527,7 +506,7 @@ public:
             ip_qo += c * buf[i];
         }
 
-        code.ip_quantized_original = ip_qo * this->inv_sqrt_d_;
+        code.ip_qo = ip_qo * this->inv_sqrt_d_;
         code.msb_popcount = static_cast<uint16_t>(code.codes.msb_popcount());
         return code;
     }

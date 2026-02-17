@@ -1,0 +1,7 @@
+/Users/indrajeetadityaroy/Desktop/rabitq-ann-search/build-ext/CMakeFiles/_core.dir
+/Users/indrajeetadityaroy/Desktop/rabitq-ann-search/build-ext/CMakeFiles/edit_cache.dir
+/Users/indrajeetadityaroy/Desktop/rabitq-ann-search/build-ext/CMakeFiles/rebuild_cache.dir
+/Users/indrajeetadityaroy/Desktop/rabitq-ann-search/build-ext/CMakeFiles/list_install_components.dir
+/Users/indrajeetadityaroy/Desktop/rabitq-ann-search/build-ext/CMakeFiles/install.dir
+/Users/indrajeetadityaroy/Desktop/rabitq-ann-search/build-ext/CMakeFiles/install/local.dir
+/Users/indrajeetadityaroy/Desktop/rabitq-ann-search/build-ext/CMakeFiles/install/strip.dir

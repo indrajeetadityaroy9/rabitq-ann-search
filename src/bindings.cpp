@@ -16,13 +16,12 @@
 namespace py = pybind11;
 using namespace cphnsw;
 
-
 class PyIndexBase {
 public:
     virtual ~PyIndexBase() = default;
 
     virtual void add_batch(const float* vecs, size_t n) = 0;
-    virtual void finalize(const BuildParams& params) = 0;
+    virtual void finalize() = 0;
     virtual size_t size() const = 0;
     virtual size_t dim() const = 0;
     virtual bool is_finalized() const = 0;
@@ -31,6 +30,8 @@ public:
     search_raw(const float* query, const SearchParams& params) const = 0;
 
     virtual void save(const std::string& path) const = 0;
+
+    virtual py::dict calibration_info() const = 0;
 };
 
 template <size_t D, size_t BitWidth>
@@ -39,25 +40,22 @@ public:
     using IndexType = Index<D, 32, BitWidth>;
     using Graph = typename IndexType::Graph;
 
-    PyIndexWrapper(size_t dim, uint64_t seed) {
+    explicit PyIndexWrapper(size_t dim) {
         IndexParams params;
         params.dim = dim;
-        params.seed = seed;
         index_ = std::make_unique<IndexType>(params);
-        seed_ = seed;
     }
 
-    PyIndexWrapper(size_t dim, uint64_t seed,
-                   Graph&& graph, const HNSWLayerSnapshot& layer_data) {
+    PyIndexWrapper(size_t dim,
+                   Graph&& graph, const HNSWLayerSnapshot& layer_data,
+                   const CalibrationSnapshot& cal = CalibrationSnapshot()) {
         IndexParams params;
         params.dim = dim;
-        params.seed = seed;
-        index_ = std::make_unique<IndexType>(params, std::move(graph), layer_data);
-        seed_ = seed;
+        index_ = std::make_unique<IndexType>(params, std::move(graph), layer_data, cal);
     }
 
     void add_batch(const float* vecs, size_t n) override { index_->add_batch(vecs, n); }
-    void finalize(const BuildParams& params) override { index_->finalize(params); }
+    void finalize() override { index_->finalize(); }
     size_t size() const override { return index_->size(); }
     size_t dim() const override { return index_->dim(); }
     bool is_finalized() const override { return index_->is_finalized(); }
@@ -69,12 +67,38 @@ public:
 
     void save(const std::string& path) const override {
         auto snap = index_->get_layer_snapshot();
-        IndexSerializer<D, 32, BitWidth>::save(path, index_->graph(), snap);
+        auto cal = index_->get_calibration_snapshot();
+        IndexSerializer<D, 32, BitWidth>::save(path, index_->graph(), snap, cal);
+    }
+
+    py::dict calibration_info() const override {
+        py::dict info;
+        info["affine_a"] = index_->calibration_affine_a();
+        info["affine_b"] = index_->calibration_affine_b();
+        info["ip_qo_floor"] = index_->calibration_ip_qo_floor();
+        info["resid_sigma"] = index_->calibration_resid_sigma();
+        info["resid_q99_dot"] = index_->calibration_resid_q99_dot();
+        info["median_nn_dist_sq"] = index_->calibration_median_nn_dist_sq();
+        info["calibration_corr"] = index_->calibration_corr();
+        info["calibrated"] = index_->calibration_calibrated();
+
+        auto cal = index_->get_calibration_snapshot();
+        py::dict evt;
+        evt["fitted"] = cal.evt.fitted;
+        evt["u"] = cal.evt.u;
+        evt["p_u"] = cal.evt.p_u;
+        evt["xi"] = cal.evt.xi;
+        evt["beta"] = cal.evt.beta;
+        evt["nop_p95"] = cal.evt.nop_p95;
+        evt["n_resid"] = cal.evt.n_resid;
+        evt["n_tail"] = cal.evt.n_tail;
+        info["evt"] = evt;
+
+        return info;
     }
 
 private:
     std::unique_ptr<IndexType> index_;
-    uint64_t seed_;
 };
 
 
@@ -86,12 +110,12 @@ static size_t padded_dim(size_t dim) {
 
 template <size_t BitWidth>
 static std::unique_ptr<PyIndexBase> create_index_with_bits(
-    size_t dim, uint64_t seed)
+    size_t dim)
 {
     size_t pd = padded_dim(dim);
 
     #define CASE_DIM(DIM) \
-        case DIM: return std::make_unique<PyIndexWrapper<DIM, BitWidth>>(dim, seed);
+        case DIM: return std::make_unique<PyIndexWrapper<DIM, BitWidth>>(dim);
 
     switch (pd) {
         CASE_DIM(16)
@@ -113,12 +137,12 @@ static std::unique_ptr<PyIndexBase> create_index_with_bits(
 }
 
 static std::unique_ptr<PyIndexBase> create_index(
-    size_t dim, uint64_t seed, size_t bits)
+    size_t dim, size_t bits)
 {
     switch (bits) {
-        case 1: return create_index_with_bits<1>(dim, seed);
-        case 2: return create_index_with_bits<2>(dim, seed);
-        case 4: return create_index_with_bits<4>(dim, seed);
+        case 1: return create_index_with_bits<1>(dim);
+        case 2: return create_index_with_bits<2>(dim);
+        case 4: return create_index_with_bits<4>(dim);
         default:
             throw std::invalid_argument(
                 "Unsupported bits=" + std::to_string(bits) +
@@ -129,13 +153,13 @@ static std::unique_ptr<PyIndexBase> create_index(
 
 template <size_t BitWidth>
 static std::unique_ptr<PyIndexBase> load_index_with_bits(
-    const std::string& path, size_t original_dim, size_t pd, uint64_t seed)
+    const std::string& path, size_t original_dim, size_t pd)
 {
     #define LOAD_CASE_DIM(DIM) \
         case DIM: { \
             auto result = IndexSerializer<DIM, 32, BitWidth>::load(path); \
             return std::make_unique<PyIndexWrapper<DIM, BitWidth>>( \
-                original_dim, seed, std::move(result.graph), result.hnsw_data); \
+                original_dim, std::move(result.graph), result.hnsw_data, result.calibration); \
         }
 
     switch (pd) {
@@ -156,7 +180,7 @@ static std::unique_ptr<PyIndexBase> load_index_with_bits(
 }
 
 static std::unique_ptr<PyIndexBase> load_index(
-    const std::string& path, uint64_t seed)
+    const std::string& path)
 {
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) throw std::runtime_error("Cannot open file for reading: " + path);
@@ -177,9 +201,9 @@ static std::unique_ptr<PyIndexBase> load_index(
     size_t bits = header.bit_width;
 
     switch (bits) {
-        case 1: return load_index_with_bits<1>(path, original_dim, pd, seed);
-        case 2: return load_index_with_bits<2>(path, original_dim, pd, seed);
-        case 4: return load_index_with_bits<4>(path, original_dim, pd, seed);
+        case 1: return load_index_with_bits<1>(path, original_dim, pd);
+        case 2: return load_index_with_bits<2>(path, original_dim, pd);
+        case 4: return load_index_with_bits<4>(path, original_dim, pd);
         default:
             throw std::invalid_argument(
                 "Unsupported bit_width=" + std::to_string(bits) +
@@ -192,11 +216,10 @@ PYBIND11_MODULE(_core, m) {
     m.doc() = "Configuration-Parameterless HNSW (CP-HNSW): Zero-tuning RaBitQ approximate nearest neighbor search";
 
     py::class_<PyIndexBase>(m, "Index")
-        .def(py::init([](size_t dim, uint64_t seed, size_t bits) {
-            return create_index(dim, seed, bits);
+        .def(py::init([](size_t dim, size_t bits) {
+            return create_index(dim, bits);
         }),
             py::arg("dim"),
-            py::arg("seed") = 42,
             py::arg("bits") = 1)
 
         .def("add", [](PyIndexBase& self, py::array_t<float, py::array::c_style | py::array::forcecast> vectors) {
@@ -221,19 +244,15 @@ PYBIND11_MODULE(_core, m) {
         }, py::arg("vectors"),
            "Add vector(s) to the index. Accepts (dim,) or (n, dim) arrays.")
 
-        .def("finalize", [](PyIndexBase& self, bool verbose, size_t num_threads) {
-            BuildParams params;
-            params.verbose = verbose;
-            params.num_threads = num_threads;
+        .def("finalize", [](PyIndexBase& self) {
             py::gil_scoped_release release;
-            self.finalize(params);
-        }, py::arg("verbose") = false,
-           py::arg("num_threads") = 0,
-           "Finalize the index. All construction parameters are derived automatically.")
+            self.finalize();
+        },
+           "Finalize the index and run mandatory calibration/EVT fitting.")
 
         .def("search", [](const PyIndexBase& self,
                           py::array_t<float, py::array::c_style | py::array::forcecast> query,
-                          size_t k, float recall_target, float gamma) {
+                          size_t k, float recall_target) {
             auto buf = query.request();
             if (buf.ndim != 1 || static_cast<size_t>(buf.shape[0]) != self.dim())
                 throw std::invalid_argument("Query must be 1D array matching index dimension");
@@ -242,7 +261,6 @@ PYBIND11_MODULE(_core, m) {
             SearchParams params;
             params.k = k;
             params.recall_target = recall_target;
-            params.gamma_override = gamma;
 
             std::vector<SearchResult> results;
             {
@@ -261,14 +279,12 @@ PYBIND11_MODULE(_core, m) {
             }
             return std::make_pair(ids, distances);
         }, py::arg("query"), py::arg("k") = 10, py::arg("recall_target") = 0.95f,
-           py::arg("gamma") = -1.0f,
            "Search for k nearest neighbors. Returns (ids, distances) arrays.\n"
-           "recall_target controls the quality/speed tradeoff (default 0.95).\n"
-           "gamma overrides the beam exploration budget (negative = derive from recall_target).")
+           "recall_target controls the quality/speed tradeoff (default 0.95).")
 
         .def("search_batch", [](const PyIndexBase& self,
                                py::array_t<float, py::array::c_style | py::array::forcecast> queries,
-                               size_t k, int n_threads, float recall_target, float gamma) {
+                               size_t k, float recall_target) {
             auto buf = queries.request();
             if (buf.ndim != 2 || static_cast<size_t>(buf.shape[1]) != self.dim())
                 throw std::invalid_argument("queries must be (n, dim) array");
@@ -280,7 +296,6 @@ PYBIND11_MODULE(_core, m) {
             SearchParams params;
             params.k = k;
             params.recall_target = recall_target;
-            params.gamma_override = gamma;
 
             py::array_t<int64_t> ids({n, k});
             py::array_t<float> distances({n, k});
@@ -289,7 +304,7 @@ PYBIND11_MODULE(_core, m) {
 
             {
                 py::gil_scoped_release release;
-                int actual_threads = n_threads > 0 ? n_threads : omp_get_max_threads();
+                int actual_threads = omp_get_max_threads();
                 size_t omp_chunk = adaptive_defaults::omp_chunk_size(n, static_cast<size_t>(actual_threads));
                 #pragma omp parallel for schedule(dynamic, omp_chunk) num_threads(actual_threads)
                 for (size_t i = 0; i < n; ++i) {
@@ -306,8 +321,7 @@ PYBIND11_MODULE(_core, m) {
             }
             return std::make_pair(ids, distances);
         }, py::arg("queries"), py::arg("k") = 10,
-           py::arg("n_threads") = 0, py::arg("recall_target") = 0.95f,
-           py::arg("gamma") = -1.0f,
+           py::arg("recall_target") = 0.95f,
            "Batch search for k nearest neighbors (OpenMP parallel). Returns (ids, distances) as (n,k) arrays.")
 
         .def_property_readonly("size", &PyIndexBase::size,
@@ -320,12 +334,16 @@ PYBIND11_MODULE(_core, m) {
         .def("save", [](const PyIndexBase& self, const std::string& path) {
             self.save(path);
         }, py::arg("path"),
-           "Save the index graph to a binary file.");
+           "Save the index graph to a binary file.")
 
-    m.def("load", [](const std::string& path, uint64_t seed) {
-        return load_index(path, seed);
+        .def_property_readonly("calibration_info", &PyIndexBase::calibration_info,
+                               "Calibration state: {affine_a, affine_b, ip_qo_floor, resid_sigma, "
+                               "resid_q99_dot, median_nn_dist_sq, calibration_corr, calibrated}")
+        ;
+
+    m.def("load", [](const std::string& path) {
+        return load_index(path);
     },
         py::arg("path"),
-        py::arg("seed") = 42,
         "Load an index from a binary file previously saved with index.save().");
 }

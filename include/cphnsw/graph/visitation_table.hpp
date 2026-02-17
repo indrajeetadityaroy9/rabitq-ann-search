@@ -6,9 +6,6 @@
 
 namespace cphnsw {
 
-// Thread-local visitation tables — no atomics needed since each thread
-// owns its own table instance (used via thread_local in search paths).
-
 class VisitationTable {
 public:
     explicit VisitationTable(size_t capacity)
@@ -97,6 +94,12 @@ public:
     bool is_visited(NodeId node_id, uint64_t query_id) const {
         if (node_id >= capacity_) return true;
         return visited_[node_id] == query_id;
+    }
+
+    void prefetch_estimated(NodeId node_id) const {
+        if (node_id < capacity_) {
+            prefetch_t<0>(reinterpret_cast<const char*>(&estimated_[node_id]));
+        }
     }
 
     void resize(size_t new_capacity) {

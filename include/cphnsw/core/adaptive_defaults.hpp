@@ -7,20 +7,9 @@
 namespace cphnsw {
 namespace adaptive_defaults {
 
-    // --- Error tolerance ---
-
     inline float error_tolerance(size_t D) {
         return 1.0f / std::sqrt(static_cast<float>(D));
     }
-
-    // --- Recall-derived parameters ---
-
-    inline float error_epsilon_search(float recall_target) {
-        float p = 1.0f - std::clamp(recall_target, 0.5f, 0.9999f);
-        return std::sqrt(-2.0f * std::log(p));
-    }
-
-    // --- Graph Construction ---
 
     inline float nndescent_delta(size_t n, size_t R) {
         float base = 1.0f / (std::log2(static_cast<float>(std::max(n, size_t(64)))) * static_cast<float>(R));
@@ -70,11 +59,9 @@ namespace adaptive_defaults {
         return std::clamp(chunk, size_t(16), size_t(1024));
     }
 
-    // --- Search ---
-
-    inline size_t ef_cap(size_t n, size_t k, float gamma) {
+    inline size_t ef_cap(size_t n, size_t k, float slack_factor) {
         float log_n = std::log2(static_cast<float>(std::max(n, size_t(64))));
-        size_t cap = static_cast<size_t>(static_cast<float>(k) * gamma * log_n * 0.5f);
+        size_t cap = static_cast<size_t>(static_cast<float>(k) * slack_factor * log_n * 0.5f);
         return std::clamp(cap, size_t(k * 4), size_t(8192));
     }
 
@@ -88,8 +75,6 @@ namespace adaptive_defaults {
         return std::min(headroom, size_t(100000));
     }
 
-    // --- HNSW Upper Layers ---
-
     inline size_t upper_layer_ef(size_t R, int level) {
         float ef = static_cast<float>(R) * std::pow(1.5f, static_cast<float>(level - 1));
         return std::clamp(static_cast<size_t>(ef), R, R * 4);
@@ -101,11 +86,7 @@ namespace adaptive_defaults {
         return base + bonus;
     }
 
-    // --- CAQ Encoder ---
-
     constexpr size_t caq_max_iterations() { return 3; }
-
-    // --- Numerical Guards ---
 
     inline float norm_epsilon(size_t D) {
         return 1e-8f / static_cast<float>(D);

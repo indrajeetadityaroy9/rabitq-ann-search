@@ -7,8 +7,6 @@ import time
 from pathlib import Path
 
 import cphnsw
-import faiss
-import hnswlib
 import numpy as np
 import psutil
 
@@ -32,88 +30,26 @@ def timed_search(search_fn, queries: np.ndarray, n_warmup: int = 1, n_runs: int 
     median_time = float(np.median(times))
     return result, len(queries) / median_time, median_time
 
-
-def _adjust_m_pq(dim, m_pq_max):
-    m_pq = min(m_pq_max, dim)
-    while dim % m_pq != 0 and m_pq > 1:
-        m_pq -= 1
-    return m_pq
-
-
-ALGORITHM_SPECS = [
+CPHNSW_SPECS = [
     {
         "algorithm": "cphnsw-1bit",
-        "family": "cphnsw",
         "bits": 1,
         "param_name": "recall_target",
         "param_values": [0.80, 0.90, 0.95, 0.97, 0.99],
     },
     {
         "algorithm": "cphnsw-2bit",
-        "family": "cphnsw",
         "bits": 2,
         "param_name": "recall_target",
         "param_values": [0.80, 0.90, 0.95, 0.97, 0.99],
     },
     {
         "algorithm": "cphnsw-4bit",
-        "family": "cphnsw",
         "bits": 4,
         "param_name": "recall_target",
         "param_values": [0.80, 0.90, 0.95, 0.97, 0.99],
     },
-    {
-        "algorithm": "hnswlib-M16",
-        "family": "hnswlib",
-        "M": 16,
-        "ef_construction": 200,
-        "param_name": "ef",
-        "param_values": [100, 120, 160, 200, 400, 800, 1200, 2000],
-    },
-    {
-        "algorithm": "hnswlib-M32",
-        "family": "hnswlib",
-        "M": 32,
-        "ef_construction": 200,
-        "param_name": "ef",
-        "param_values": [100, 120, 160, 200, 400, 800, 1200, 2000],
-    },
-    {
-        "algorithm": "hnswlib-M64",
-        "family": "hnswlib",
-        "M": 64,
-        "ef_construction": 200,
-        "param_name": "ef",
-        "param_values": [100, 120, 160, 200, 400, 800, 1200, 2000],
-    },
-    {
-        "algorithm": "faiss-hnsw-M32",
-        "family": "faiss-hnsw",
-        "M": 32,
-        "ef_construction": 200,
-        "param_name": "ef",
-        "param_values": [100, 120, 160, 200, 400, 800, 1200, 2000],
-    },
-    {
-        "algorithm": "faiss-ivfpq",
-        "family": "faiss-ivfpq",
-        "nlist": 4096,
-        "M_pq": 32,
-        "nbits_pq": 8,
-        "param_name": "nprobe",
-        "param_values": [1, 2, 4, 8, 16, 32, 64, 128, 256],
-    },
-    {
-        "algorithm": "faiss-ivfopq",
-        "family": "faiss-ivfopq",
-        "nlist": 4096,
-        "M_pq": 32,
-        "nbits_pq": 8,
-        "param_name": "nprobe",
-        "param_values": [1, 2, 4, 8, 16, 32, 64, 128, 256],
-    },
 ]
-
 
 def run_benchmark(dataset_name: str, base_dir: Path,
                   k: int, n_runs: int, output_dir: Path):
@@ -129,8 +65,7 @@ def run_benchmark(dataset_name: str, base_dir: Path,
 
     results = []
 
-    for spec in ALGORITHM_SPECS:
-        family = spec["family"]
+    for spec in CPHNSW_SPECS:
         algorithm = spec["algorithm"]
 
         index = None
@@ -138,37 +73,9 @@ def run_benchmark(dataset_name: str, base_dir: Path,
         rss_before = psutil.Process(os.getpid()).memory_info().rss / (1024 ** 2)
         t0 = time.perf_counter()
 
-        if family == "cphnsw":
-            index = cphnsw.Index(dim=dim, bits=spec["bits"])
-            index.add(base)
-            index.finalize()
-        elif family == "hnswlib":
-            index = hnswlib.Index(space="l2", dim=dim)
-            index.init_index(max_elements=len(base),
-                             ef_construction=spec["ef_construction"], M=spec["M"])
-            index.set_num_threads(1)
-            index.add_items(base, np.arange(len(base)))
-        elif family == "faiss-hnsw":
-            faiss.omp_set_num_threads(1)
-            index = faiss.IndexHNSWFlat(dim, spec["M"])
-            index.hnsw.efConstruction = spec["ef_construction"]
-            index.add(base)
-        elif family == "faiss-ivfpq":
-            faiss.omp_set_num_threads(1)
-            m_pq = _adjust_m_pq(dim, spec["M_pq"])
-            quantizer = faiss.IndexFlatL2(dim)
-            index = faiss.IndexIVFPQ(quantizer, dim, spec["nlist"], m_pq, spec["nbits_pq"])
-            index.train(base)
-            index.add(base)
-        elif family == "faiss-ivfopq":
-            faiss.omp_set_num_threads(1)
-            m_pq = _adjust_m_pq(dim, spec["M_pq"])
-            index = faiss.index_factory(
-                dim, f"OPQ{m_pq},IVF{spec['nlist']},PQ{m_pq}x{spec['nbits_pq']}"
-            )
-            index.train(base)
-            index.add(base)
-            ivf_sub = faiss.extract_index_ivf(index)
+        index = cphnsw.Index(dim=dim, bits=spec["bits"])
+        index.add(base)
+        index.finalize()
 
         build_time = time.perf_counter() - t0
         gc.collect()
@@ -177,33 +84,9 @@ def run_benchmark(dataset_name: str, base_dir: Path,
 
         sweep = []
         for pval in spec["param_values"]:
-            if family == "cphnsw":
-                def search_fn(batch, _rt=float(pval)):
-                    ids, _ = index.search_batch(batch, k=k, n_threads=1, recall_target=_rt)
-                    return np.asarray(ids)
-            elif family == "hnswlib":
-                def search_fn(batch, _ef=int(pval)):
-                    index.set_ef(max(_ef, k))
-                    labels, _ = index.knn_query(batch, k=k, num_threads=1)
-                    return labels
-            elif family == "faiss-hnsw":
-                def search_fn(batch, _ef=int(pval)):
-                    faiss.omp_set_num_threads(1)
-                    index.hnsw.efSearch = max(_ef, k)
-                    _, ids = index.search(batch, k)
-                    return ids
-            elif family == "faiss-ivfpq":
-                def search_fn(batch, _nprobe=int(pval)):
-                    faiss.omp_set_num_threads(1)
-                    index.nprobe = _nprobe
-                    _, ids = index.search(batch, k)
-                    return ids
-            elif family == "faiss-ivfopq":
-                def search_fn(batch, _nprobe=int(pval)):
-                    faiss.omp_set_num_threads(1)
-                    ivf_sub.nprobe = _nprobe
-                    _, ids = index.search(batch, k)
-                    return ids
+            def search_fn(batch, _rt=float(pval)):
+                ids, _ = index.search_batch(batch, k=k, recall_target=_rt)
+                return np.asarray(ids)
 
             ids, qps_val, med_time = timed_search(search_fn, queries, n_warmup=1, n_runs=n_runs)
             r1 = recall_at_k(ids, gt, 1)
@@ -256,5 +139,3 @@ def run_benchmark(dataset_name: str, base_dir: Path,
     with outfile.open("w") as f:
         json.dump(output, f, indent=2)
     return str(outfile)
-
-

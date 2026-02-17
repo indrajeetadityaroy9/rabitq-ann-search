@@ -4,7 +4,6 @@
 #include "transform/fht.hpp"
 #include <array>
 #include <immintrin.h>
-#include <vector>
 #include <random>
 #include <cstring>
 
@@ -13,12 +12,13 @@ namespace cphnsw {
 class RandomHadamardRotation {
 public:
     static constexpr size_t NUM_LAYERS = 3;
+    static constexpr uint64_t DEFAULT_ROTATION_SEED = 42;
 
-    RandomHadamardRotation(size_t dim, uint64_t seed)
+    explicit RandomHadamardRotation(size_t dim)
         : original_dim_(dim)
         , padded_dim_(next_power_of_two(dim)) {
 
-        generate_signs(seed);
+        generate_signs();
     }
 
     void apply(float* x) const {
@@ -53,8 +53,8 @@ private:
         return p;
     }
 
-    void generate_signs(uint64_t seed) {
-        std::mt19937_64 rng(seed);
+    void generate_signs() {
+        std::mt19937_64 rng(DEFAULT_ROTATION_SEED);
         std::uniform_int_distribution<int> coin(0, 1);
 
         for (size_t layer = 0; layer < NUM_LAYERS; ++layer) {

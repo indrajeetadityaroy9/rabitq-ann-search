@@ -1,50 +1,31 @@
-"""Config-only evaluation entrypoint.
+"""Canonical evaluation entrypoint."""
 
-Usage:
-    python -m cphnsw.eval --config configs/benchmark.yaml
-"""
-
-import argparse
 import json
-import os
-import shutil
-import sys
 from pathlib import Path
 
 import yaml
 
-from cphnsw.bench.run_benchmark import ALGORITHM_SPECS, run_benchmark
+from cphnsw.bench.run_benchmark import run_benchmark
 from cphnsw.datasets import ALL_DATASETS
 
 
 REQUIRED_SECTIONS = ["run", "data", "eval"]
+DEFAULT_CONFIG_PATH = Path("configs/benchmark.yaml")
 
 
-def load_config(path: str) -> dict:
-    with open(path) as f:
+def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict:
+    with path.open() as f:
         cfg = yaml.safe_load(f)
 
     for section in REQUIRED_SECTIONS:
         if section not in cfg:
-            print(f"Error: missing required config section '{section}'", file=sys.stderr)
-            sys.exit(1)
+            raise ValueError(f"Missing required config section '{section}' in {path}")
 
     return cfg
 
 
-def _pin_threads(n_threads: int):
-    val = str(n_threads)
-    os.environ["OMP_NUM_THREADS"] = val
-    os.environ["MKL_NUM_THREADS"] = val
-    os.environ["OPENBLAS_NUM_THREADS"] = val
-
-
 def _extract_summary(results_dir: Path) -> list:
-    """Extract tracked metrics from per-dataset result files.
-
-    Returns list of dicts with: dataset, algorithm, build_time_min,
-    memory_gib, qps_at_95_recall_k10.
-    """
+    """Extract summary rows from per-dataset result files."""
     summary = []
     for result_file in sorted(results_dir.glob("*_results.json")):
         with open(result_file) as f:
@@ -74,11 +55,7 @@ def _extract_summary(results_dir: Path) -> list:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CP-HNSW Evaluation")
-    parser.add_argument("--config", required=True, help="Path to YAML config file")
-    args = parser.parse_args()
-
-    cfg = load_config(args.config)
+    cfg = load_config()
 
     run_cfg = cfg["run"]
     data_cfg = cfg["data"]
@@ -86,10 +63,6 @@ def main():
 
     output_dir = Path(run_cfg.get("output_dir", "results")).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    _pin_threads(eval_cfg.get("n_threads", 1))
-
-    shutil.copy2(args.config, output_dir / "config.yaml")
 
     dataset = data_cfg.get("dataset", "sift1m")
     base_dir = Path(data_cfg.get("base_dir", "data")).resolve()
@@ -99,22 +72,21 @@ def main():
     n_runs = eval_cfg.get("n_runs", 3)
 
     for ds_name in datasets:
-        print(f"Running benchmark: {ds_name}", flush=True)
+        print(json.dumps({"event": "benchmark_start", "dataset": ds_name}), flush=True)
         outfile = run_benchmark(ds_name, base_dir, k, n_runs, output_dir)
-        print(f"  -> {outfile}", flush=True)
+        print(json.dumps({"event": "benchmark_done", "dataset": ds_name, "result_file": outfile}), flush=True)
 
     summary = _extract_summary(output_dir)
-    summary_path = output_dir / "summary.json"
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
-    print(f"\nSummary written to {summary_path}", flush=True)
 
     for entry in summary:
-        qps_str = f"{entry['qps_at_95_recall_k10']:.1f}" if entry["qps_at_95_recall_k10"] else "N/A"
-        print(f"  {entry['dataset']}/{entry['algorithm']}: "
-              f"build={entry['build_time_min']:.4f}min "
-              f"mem={entry['memory_gib']:.4f}GiB "
-              f"qps@95%={qps_str}")
+        print(json.dumps({
+            "event": "summary",
+            "dataset": entry["dataset"],
+            "algorithm": entry["algorithm"],
+            "build_time_min": entry["build_time_min"],
+            "memory_gib": entry["memory_gib"],
+            "qps_at_95_recall_k10": entry["qps_at_95_recall_k10"],
+        }), flush=True)
 
 
 if __name__ == "__main__":

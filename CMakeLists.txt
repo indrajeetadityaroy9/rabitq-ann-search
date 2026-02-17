@@ -16,15 +16,6 @@ target_include_directories(cphnsw INTERFACE
 )
 target_link_libraries(cphnsw INTERFACE OpenMP::OpenMP_CXX)
 
-add_executable(benchmark apps/benchmark.cpp)
-target_link_libraries(benchmark PRIVATE cphnsw)
-
-foreach(D_VAL 128 256 512)
-    add_executable(benchmark_d${D_VAL} apps/benchmark.cpp)
-    target_compile_definitions(benchmark_d${D_VAL} PRIVATE EVAL_D=${D_VAL})
-    target_link_libraries(benchmark_d${D_VAL} PRIVATE cphnsw)
-endforeach()
-
 find_package(pybind11 QUIET)
 if(pybind11_FOUND)
     pybind11_add_module(_core src/bindings.cpp)

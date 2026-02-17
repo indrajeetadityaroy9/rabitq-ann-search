@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../core/codes.hpp"
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 
@@ -55,13 +56,23 @@ struct FastScanNeighborBlock {
     static constexpr size_t NUM_BATCHES = R / BatchSize;
 
     FastScanCodeBlock<D, BatchSize> code_blocks[NUM_BATCHES];
-    alignas(64) VertexAuxData aux[R];
+    alignas(64) float nop[R];
+    alignas(64) float ip_qo[R];
+    alignas(64) float ip_cp[R];
     alignas(64) uint16_t popcounts[R];
     alignas(64) uint32_t neighbor_ids[R];
 
     uint32_t count;
 
+    static_assert(offsetof(FastScanNeighborBlock, ip_qo) == offsetof(FastScanNeighborBlock, nop) + R * sizeof(float),
+                  "SoA arrays must be contiguous: nop -> ip_qo");
+    static_assert(offsetof(FastScanNeighborBlock, ip_cp) == offsetof(FastScanNeighborBlock, ip_qo) + R * sizeof(float),
+                  "SoA arrays must be contiguous: ip_qo -> ip_cp");
+
     FastScanNeighborBlock() : count(0) {
+        std::memset(nop, 0, sizeof(nop));
+        std::memset(ip_qo, 0, sizeof(ip_qo));
+        std::memset(ip_cp, 0, sizeof(ip_cp));
         std::memset(neighbor_ids, 0xFF, sizeof(neighbor_ids));
         std::memset(popcounts, 0, sizeof(popcounts));
     }
@@ -74,7 +85,9 @@ struct FastScanNeighborBlock {
 
         neighbor_ids[slot] = id;
         code_blocks[batch].store(idx_in_batch, code);
-        aux[slot] = aux_data;
+        nop[slot] = aux_data.nop;
+        ip_qo[slot] = aux_data.ip_qo;
+        ip_cp[slot] = aux_data.ip_cp;
         popcounts[slot] = static_cast<uint16_t>(code.popcount());
 
         if (slot >= count) count = static_cast<uint32_t>(slot + 1);
@@ -112,13 +125,23 @@ struct NbitFastScanNeighborBlock {
     static constexpr size_t BIT_WIDTH = BitWidth;
 
     NbitFastScanCodeBlock<D, BitWidth, BatchSize> code_blocks[NUM_BATCHES];
-    alignas(64) VertexAuxData aux[R];
+    alignas(64) float nop[R];
+    alignas(64) float ip_qo[R];
+    alignas(64) float ip_cp[R];
     alignas(64) uint16_t popcounts[R];
     alignas(64) uint16_t weighted_popcounts[R];
     alignas(64) uint32_t neighbor_ids[R];
     uint32_t count;
 
+    static_assert(offsetof(NbitFastScanNeighborBlock, ip_qo) == offsetof(NbitFastScanNeighborBlock, nop) + R * sizeof(float),
+                  "SoA arrays must be contiguous: nop -> ip_qo");
+    static_assert(offsetof(NbitFastScanNeighborBlock, ip_cp) == offsetof(NbitFastScanNeighborBlock, ip_qo) + R * sizeof(float),
+                  "SoA arrays must be contiguous: ip_qo -> ip_cp");
+
     NbitFastScanNeighborBlock() : count(0) {
+        std::memset(nop, 0, sizeof(nop));
+        std::memset(ip_qo, 0, sizeof(ip_qo));
+        std::memset(ip_cp, 0, sizeof(ip_cp));
         std::memset(neighbor_ids, 0xFF, sizeof(neighbor_ids));
         std::memset(popcounts, 0, sizeof(popcounts));
         std::memset(weighted_popcounts, 0, sizeof(weighted_popcounts));
@@ -131,7 +154,9 @@ struct NbitFastScanNeighborBlock {
         size_t idx_in_batch = slot % BatchSize;
         neighbor_ids[slot] = id;
         code_blocks[batch].store(idx_in_batch, code);
-        aux[slot] = aux_data;
+        nop[slot] = aux_data.nop;
+        ip_qo[slot] = aux_data.ip_qo;
+        ip_cp[slot] = aux_data.ip_cp;
         popcounts[slot] = static_cast<uint16_t>(code.msb_popcount());
         weighted_popcounts[slot] = static_cast<uint16_t>(code.weighted_popcount());
         if (slot >= count) count = static_cast<uint32_t>(slot + 1);

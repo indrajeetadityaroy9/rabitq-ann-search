@@ -9,6 +9,9 @@ import pandas as pd
 from huggingface_hub import HfApi, hf_hub_download
 
 
+DEFAULT_QUERY_SPLIT_SEED = 42
+
+
 def load_fvecs(path: str) -> np.ndarray:
     data = np.fromfile(path, dtype=np.float32)
     d = data[:1].view(np.int32)[0]
@@ -37,8 +40,8 @@ def _download_tar_dataset(repo_id: str, filename: str, dest: Path):
                 tar.extract(member, dest)
 
 
-def _split_queries(data: np.ndarray, n_queries: int = 1000, seed: int = 42):
-    rng = np.random.RandomState(seed)
+def _split_queries(data: np.ndarray, n_queries: int = 1000):
+    rng = np.random.default_rng(DEFAULT_QUERY_SPLIT_SEED)
     query_idx = rng.choice(len(data), size=n_queries, replace=False)
     mask = np.ones(len(data), dtype=bool)
     mask[query_idx] = False

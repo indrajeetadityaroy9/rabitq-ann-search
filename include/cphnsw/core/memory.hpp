@@ -83,4 +83,26 @@ inline float l2_distance_simd(const float* a, const float* b) {
     return _mm_cvtss_f32(s);
 }
 
+template <size_t D>
+inline float dot_product_simd(const float* a, const float* b) {
+    static_assert(D % 8 == 0, "D must be a multiple of 8 for AVX2");
+    __m256 sum = _mm256_setzero_ps();
+    for (size_t i = 0; i < D; i += 8) {
+        __m256 va = _mm256_loadu_ps(a + i);
+        __m256 vb = _mm256_loadu_ps(b + i);
+        sum = _mm256_fmadd_ps(va, vb, sum);
+    }
+    __m128 hi = _mm256_extractf128_ps(sum, 1);
+    __m128 lo = _mm256_castps256_ps128(sum);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    return _mm_cvtss_f32(s);
+}
+
+template <size_t D>
+inline float l2_norm_sq_simd(const float* a) {
+    return dot_product_simd<D>(a, a);
+}
+
 }  // namespace cphnsw

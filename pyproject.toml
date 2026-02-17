@@ -10,12 +10,18 @@ requires-python = ">=3.12"
 license = {text = "MIT"}
 dependencies = [
     "numpy>=1.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+benchmark = [
     "faiss-cpu>=1.7.0",
     "hnswlib>=0.7.0",
     "huggingface_hub>=0.16",
     "pandas>=1.5",
     "pyarrow>=10.0",
-    "matplotlib>=3.7",
     "psutil>=5.9",
     "pyyaml>=6.0",
 ]

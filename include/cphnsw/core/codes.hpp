@@ -45,20 +45,20 @@ struct RaBitQCode {
     static constexpr size_t NUM_WORDS = (D + 63) / 64;
 
     BinaryCodeStorage<D> signs;
-    float dist_to_centroid;
-    float ip_quantized_original;
+    float nop;
+    float ip_qo;
 
     void clear() {
         signs.clear();
-        dist_to_centroid = 0.0f;
-        ip_quantized_original = 0.0f;
+        nop = 0.0f;
+        ip_qo = 0.0f;
     }
 };
 
 struct VertexAuxData {
-    float dist_to_centroid;       // ||o_r - p_r||, edge length
-    float ip_quantized_original;  // <o_bar, o>, quantization quality for edge code
-    float ip_code_parent;         // <x_bar, P^{-1} * p_r * norm_factor>, SymphonyQG Eq 6 precomputed term
+    float nop;
+    float ip_qo;
+    float ip_cp;
 };
 
 template <size_t D>
@@ -72,7 +72,12 @@ struct RaBitQQuery {
     float coeff_popcount;
     float coeff_constant;
 
-    float error_epsilon;
+    float affine_a = 1.0f;
+    float affine_b = 0.0f;
+    float ip_qo_floor = 0.0f;
+    float resid_q99_dot = 0.0f;
+
+    float dot_slack = 0.0f;
 };
 
 
@@ -123,14 +128,14 @@ struct NbitRaBitQCode {
     static constexpr size_t BIT_WIDTH = BitWidth;
 
     NbitCodeStorage<D, BitWidth> codes;
-    float dist_to_centroid;
-    float ip_quantized_original;
+    float nop;
+    float ip_qo;
     uint16_t msb_popcount;
 
     void clear() {
         codes.clear();
-        dist_to_centroid = 0.0f;
-        ip_quantized_original = 0.0f;
+        nop = 0.0f;
+        ip_qo = 0.0f;
         msb_popcount = 0;
     }
 };

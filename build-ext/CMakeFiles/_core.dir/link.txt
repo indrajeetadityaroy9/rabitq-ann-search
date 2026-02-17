@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -arch arm64 -bundle -Wl,-headerpad_max_install_names -Xlinker -undefined -Xlinker dynamic_lookup -flto -L/opt/homebrew/opt/libomp/lib -o _core.cpython-314-darwin.so CMakeFiles/_core.dir/src/bindings.cpp.o  /opt/homebrew/opt/libomp/lib/libomp.dylib

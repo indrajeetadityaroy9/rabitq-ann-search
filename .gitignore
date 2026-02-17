@@ -41,7 +41,6 @@ data/
 results/
 checkpoints/
 *.csv
-!experiments/**/*.yaml
 
 # IDE
 .idea/
@@ -51,9 +50,8 @@ checkpoints/
 *~
 .DS_Store
 
-# Local paper downloads / conversions
-papers/arxiv_pdfs/
-papers/arxiv_md/
+# Papers (reference only, not source code)
+papers/
 
 # Misc
 *.tmp

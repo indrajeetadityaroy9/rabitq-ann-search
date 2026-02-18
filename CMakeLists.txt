@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.18)
 project(cp-hnsw VERSION 1.0.0 LANGUAGES CXX)
 
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+    message(FATAL_ERROR "CP-HNSW requires x86_64 with AVX2/FMA support.")
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -8,6 +12,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_compile_options(-Wall -Wextra -O3 -march=native -mavx2 -mfma)
 
 find_package(OpenMP REQUIRED)
+find_package(Python COMPONENTS Interpreter Development REQUIRED)
+set(PYBIND11_FINDPYTHON ON)
+find_package(pybind11 REQUIRED)
 
 add_library(cphnsw INTERFACE)
 target_include_directories(cphnsw INTERFACE
@@ -16,11 +23,8 @@ target_include_directories(cphnsw INTERFACE
 )
 target_link_libraries(cphnsw INTERFACE OpenMP::OpenMP_CXX)
 
-find_package(pybind11 QUIET)
-if(pybind11_FOUND)
-    pybind11_add_module(_core src/bindings.cpp)
-    target_link_libraries(_core PRIVATE cphnsw)
-endif()
+pybind11_add_module(_core src/bindings.cpp)
+target_link_libraries(_core PRIVATE cphnsw)
 
 install(TARGETS cphnsw EXPORT cphnsw-targets)
 install(DIRECTORY include/cphnsw/ DESTINATION include/cphnsw)

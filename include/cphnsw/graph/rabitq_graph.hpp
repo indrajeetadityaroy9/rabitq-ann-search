@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cstring>
 #include <type_traits>
+#include <limits>
 
 namespace cphnsw {
 
@@ -108,7 +109,6 @@ public:
 
     size_t size() const { return search_data_.size(); }
     bool empty() const { return search_data_.empty(); }
-    size_t dim() const { return dim_; }
 
     NodeId entry_point() const {
         return entry_point_.load(std::memory_order_acquire);
@@ -119,25 +119,16 @@ public:
     }
 
     const CodeType& get_code(NodeId id) const { return search_data_[id].code; }
-    CodeType& get_code(NodeId id) { return search_data_[id].code; }
 
     const float* get_vector(NodeId id) const { return raw_vectors_[id].data(); }
 
     float get_norm_sq(NodeId id) const { return norm_sq_[id]; }
 
+    bool is_alive(NodeId id) const { return id < search_data_.size(); }
+
     void prefetch_norm(NodeId id) const {
         if (id < norm_sq_.size()) {
             prefetch_t<1>(&norm_sq_[id]);
-        }
-    }
-
-    void recompute_norms() {
-        norm_sq_.resize(raw_vectors_.size());
-        for (size_t i = 0; i < raw_vectors_.size(); ++i) {
-            float nsq = 0.0f;
-            const float* v = raw_vectors_[i].data();
-            for (size_t j = 0; j < dim_; ++j) nsq += v[j] * v[j];
-            norm_sq_[i] = nsq;
         }
     }
 
@@ -173,6 +164,7 @@ public:
 
     std::vector<double> compute_centroid() const {
         size_t n = raw_vectors_.size();
+        if (n == 0) return std::vector<double>(dim_, 0.0);
         std::vector<double> centroid(dim_, 0.0);
         for (size_t i = 0; i < n; ++i) {
             const float* v = raw_vectors_[i].data();
@@ -180,7 +172,7 @@ public:
                 centroid[j] += v[j];
             }
         }
-        double inv_n = 1.0 / n;
+        double inv_n = 1.0 / static_cast<double>(n);
         for (size_t j = 0; j < dim_; ++j) centroid[j] *= inv_n;
         return centroid;
     }
@@ -314,13 +306,13 @@ public:
             std::partial_sort(dists.begin(), dists.begin() + top_k, dists.end());
         }
 
-        NodeId best = dists[0].id;
-        size_t best_degree = search_data_[best].neighbors.size();
+        NodeId best = INVALID_NODE;
+        size_t best_degree = 0;
 
-        for (size_t i = 1; i < top_k && i < n; ++i) {
+        for (size_t i = 0; i < top_k && i < n; ++i) {
             NodeId cand = dists[i].id;
             size_t deg = search_data_[cand].neighbors.size();
-            if (deg > best_degree) {
+            if (best == INVALID_NODE || deg > best_degree) {
                 best_degree = deg;
                 best = cand;
             }

@@ -50,6 +50,7 @@ checkpoints/
 
 # Papers (reference only, not source code)
 papers/
+analysis/
 
 # Misc
 *.tmp
@@ -58,6 +59,7 @@ papers/
 *.log
 .coverage
 .pytest_cache/
+.venv/
 
 # Secrets
 .env

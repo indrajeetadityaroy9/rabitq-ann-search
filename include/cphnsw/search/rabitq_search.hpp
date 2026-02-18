@@ -1,7 +1,6 @@
 #pragma once
 
 #include "../core/codes.hpp"
-#include "../core/adaptive_defaults.hpp"
 #include "../core/constants.hpp"
 #include "../distance/fastscan_kernel.hpp"
 #include "../distance/fastscan_layout.hpp"
@@ -12,6 +11,7 @@
 #include <queue>
 #include <algorithm>
 #include <limits>
+#include <stdexcept>
 
 namespace cphnsw {
 
@@ -22,9 +22,7 @@ public:
         data_.reserve(capacity + 1);
     }
 
-    bool empty() const { return data_.empty(); }
     size_t size() const { return data_.size(); }
-    const T& top() const { return data_.front(); }
 
     void push(const T& val) {
         if (data_.size() < capacity_) {
@@ -35,11 +33,6 @@ public:
             data_.back() = val;
             std::push_heap(data_.begin(), data_.end());
         }
-    }
-
-    void pop() {
-        std::pop_heap(data_.begin(), data_.end());
-        data_.pop_back();
     }
 
     std::vector<T> extract_sorted() {
@@ -78,14 +71,10 @@ std::vector<SearchResult> search(
     const float* slack_levels = nullptr,
     int num_slack_levels = 0)
 {
-    if (graph.empty()) return {};
-    if (k == 0) k = constants::kDefaultK;
-    if (ef_cap == 0) {
-        ef_cap = adaptive_defaults::ef_cap(graph.size(), k, gamma);
+    if (entry == INVALID_NODE || !graph.is_alive(entry)) {
+        throw std::runtime_error("Search failed: invalid entry node.");
     }
-
-    NodeId ep = (entry != INVALID_NODE) ? entry : graph.entry_point();
-    if (ep == INVALID_NODE) return {};
+    NodeId ep = entry;
 
     uint64_t query_id = visited.new_query();
 
@@ -147,6 +136,9 @@ std::vector<SearchResult> search(
         }
 
         visited.check_and_mark_visited(current.id, query_id);
+        if (!graph.is_alive(current.id)) {
+            throw std::runtime_error("Search failed: dead current node encountered.");
+        }
 
         float exact_dist = std::max(query_norm_sq + graph.get_norm_sq(current.id)
                            - 2.0f * dot_product_simd<D>(raw_query, graph.get_vector(current.id)), 0.0f);
@@ -228,12 +220,17 @@ std::vector<SearchResult> search(
         size_t prefetch_count = std::min(n_neighbors, constants::kPrefetchNeighbors);
         for (size_t i = 0; i < prefetch_count; ++i) {
             NodeId nid = nb.neighbor_ids[i];
-            if (nid != INVALID_NODE) visited.prefetch_estimated(nid);
+            if (nid == INVALID_NODE) {
+                throw std::runtime_error("Search failed: invalid neighbor id in prefetch window.");
+            }
+            visited.prefetch_estimated(nid);
         }
 
         for (size_t i = 0; i < n_neighbors; ++i) {
             NodeId neighbor_id = nb.neighbor_ids[i];
-            if (neighbor_id == INVALID_NODE) continue;
+            if (neighbor_id == INVALID_NODE || !graph.is_alive(neighbor_id)) {
+                throw std::runtime_error("Search failed: invalid neighbor id encountered.");
+            }
             if (visited.check_and_mark_estimated(neighbor_id, query_id)) continue;
 
             if (warmup) {

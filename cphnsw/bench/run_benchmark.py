@@ -2,7 +2,6 @@
 
 import gc
 import json
-import os
 import time
 from pathlib import Path
 
@@ -11,7 +10,7 @@ import numpy as np
 import psutil
 
 from cphnsw.datasets import load_dataset
-from cphnsw.metrics import recall_at_k
+from cphnsw.paths import resolve_project_path
 
 ADR_K = 10                # depth for average distance ratio evaluation
 ADR_EPS = 1e-10           # floor for ADR denominator to avoid division by zero
@@ -19,21 +18,11 @@ US_PER_SEC = 1e6          # microseconds per second
 BYTES_PER_MB = 1024 ** 2  # bytes-to-megabytes divisor
 
 
-def timed_search(search_fn, queries: np.ndarray, n_warmup: int = 1, n_runs: int = 3):
-    for _ in range(n_warmup):
-        search_fn(queries)
-
-    times = []
-    t0 = time.perf_counter()
-    result = search_fn(queries)
-    times.append(time.perf_counter() - t0)
-    for _ in range(n_runs - 1):
-        t0 = time.perf_counter()
-        search_fn(queries)
-        times.append(time.perf_counter() - t0)
-
-    median_time = float(np.median(times))
-    return result, len(queries) / median_time, median_time
+def recall_at_k(results: np.ndarray, ground_truth: np.ndarray, k: int) -> float:
+    res = results[:, :k]
+    gt = ground_truth[:, :k]
+    hits = np.any(res[:, :, None] == gt[:, None, :], axis=2)
+    return float(hits.sum(axis=1).mean()) / k
 
 CPHNSW_SPECS = [
     {
@@ -58,7 +47,10 @@ CPHNSW_SPECS = [
 
 def run_benchmark(dataset_name: str, base_dir: Path,
                   k: int, n_runs: int, output_dir: Path):
-    ds = load_dataset(dataset_name, base_dir=str(base_dir))
+    resolved_base_dir = resolve_project_path(base_dir)
+    resolved_output_dir = resolve_project_path(output_dir)
+
+    ds = load_dataset(dataset_name, base_dir=resolved_base_dir)
     base = ds["base"]
     queries = ds["queries"]
     gt = ds["groundtruth"].astype(np.int64)
@@ -74,16 +66,16 @@ def run_benchmark(dataset_name: str, base_dir: Path,
         algorithm = spec["algorithm"]
 
         gc.collect()
-        rss_before = psutil.Process(os.getpid()).memory_info().rss / BYTES_PER_MB
+        rss_before = psutil.Process().memory_info().rss / BYTES_PER_MB
         t0 = time.perf_counter()
 
-        index = cphnsw.Index(dim=dim, bits=spec["bits"])
-        index.add(base)
+        index = cphnsw.CPIndex(dim=dim, bits=spec["bits"])
+        index.build(base)
         index.finalize()
 
         build_time = time.perf_counter() - t0
         gc.collect()
-        rss_after = psutil.Process(os.getpid()).memory_info().rss / BYTES_PER_MB
+        rss_after = psutil.Process().memory_info().rss / BYTES_PER_MB
         mem_mb = max(0.0, rss_after - rss_before)
 
         sweep = []
@@ -92,7 +84,18 @@ def run_benchmark(dataset_name: str, base_dir: Path,
                 ids, _ = index.search_batch(batch, k=k, recall_target=_rt)
                 return np.asarray(ids)
 
-            ids, qps_val, med_time = timed_search(search_fn, queries, n_warmup=1, n_runs=n_runs)
+            search_fn(queries)
+            times = []
+            t0 = time.perf_counter()
+            ids = search_fn(queries)
+            times.append(time.perf_counter() - t0)
+            for _ in range(n_runs - 1):
+                t0 = time.perf_counter()
+                search_fn(queries)
+                times.append(time.perf_counter() - t0)
+            med_time = float(np.median(times))
+            qps_val = len(queries) / med_time
+
             r1 = recall_at_k(ids, gt, 1)
             r10 = recall_at_k(ids, gt, min(k, 10))
             r100 = recall_at_k(ids, gt, min(k, 100))
@@ -133,13 +136,12 @@ def run_benchmark(dataset_name: str, base_dir: Path,
             "metric": "l2",
             "k": k,
             "n_runs": n_runs,
-            "base_dir": str(base_dir),
+            "base_dir": str(resolved_base_dir),
         },
         "results": results,
     }
 
-    output_dir.mkdir(parents=True, exist_ok=False)
-    outfile = output_dir / f"{dataset_name}_results.json"
+    outfile = resolved_output_dir / f"{dataset_name}_results.json"
     with outfile.open("w") as f:
         json.dump(output, f, indent=2)
     return str(outfile)

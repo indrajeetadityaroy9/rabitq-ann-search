@@ -4,14 +4,17 @@ import subprocess
 from pathlib import Path
 
 import pybind11
-from setuptools import Extension, find_packages, setup
+from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 class CMakeExtension(Extension):
     def __init__(self, name, sourcedir=""):
         super().__init__(name, sources=[])
-        self.sourcedir = str(Path(sourcedir).resolve())
+        self.sourcedir = str((PROJECT_ROOT / Path(sourcedir)).resolve())
 
 
 class CMakeBuild(build_ext):
@@ -39,7 +42,8 @@ class CMakeBuild(build_ext):
 
 
 setup(
+    name="cphnsw",
+    version="0.1.0",
     ext_modules=[CMakeExtension("cphnsw._core")],
     cmdclass={"build_ext": CMakeBuild},
-    packages=find_packages(include=["cphnsw", "cphnsw.*"]),
 )

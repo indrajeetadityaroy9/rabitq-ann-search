@@ -1,12 +1,5 @@
-"""CP-HNSW Python package."""
+"""CP-HNSW runtime API."""
 
-from cphnsw._core import Index, load
-from cphnsw.datasets import load_dataset
-from cphnsw.metrics import recall_at_k
+from cphnsw._core import CPIndex
 
-__all__ = [
-    "Index",
-    "load",
-    "load_dataset",
-    "recall_at_k",
-]
+__all__ = ["CPIndex"]

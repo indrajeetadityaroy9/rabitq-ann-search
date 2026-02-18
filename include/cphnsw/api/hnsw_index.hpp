@@ -12,7 +12,6 @@
 #include "../graph/neighbor_selection.hpp"
 #include "../search/rabitq_search.hpp"
 #include "../graph/visitation_table.hpp"
-#include "../io/serialization.hpp"
 #include "params.hpp"
 #include <vector>
 #include <random>
@@ -22,10 +21,31 @@
 #include <numeric>
 #include <cstdint>
 #include <type_traits>
+#include <mutex>
+#include <shared_mutex>
+#include <limits>
 
 #include <omp.h>
 
 namespace cphnsw {
+
+struct CalibrationSnapshot {
+    float affine_a = 1.0f;
+    float affine_b = 0.0f;
+    float ip_qo_floor = 0.0f;
+    float resid_q99_dot = 0.0f;
+    float resid_sigma = 0.0f;
+    float median_nn_dist_sq = 0.0f;
+    float calibration_corr = 0.0f;
+    uint32_t flags = 0;
+    EVTState evt;
+};
+
+struct HNSWLayerEdge {
+    NodeId node;
+    std::vector<NodeId> neighbors;
+    bool operator<(const HNSWLayerEdge& other) const { return node < other.node; }
+};
 
 template <size_t D, size_t R = 32, size_t BitWidth = 1>
 class Index {
@@ -45,7 +65,7 @@ public:
 
     explicit Index(const IndexParams& params)
         : params_(params)
-        , encoder_(params.dim, params.effective_seed())
+        , encoder_(params.dim, constants::kDefaultRotationSeed)
         , graph_(params.dim)
         , mL_(1.0 / std::log(static_cast<double>(M_UPPER)))
         , rng_(constants::kDefaultLayerSeed)
@@ -53,80 +73,55 @@ public:
         if (params.dim == 0) throw std::invalid_argument("dim must be > 0");
     }
 
-    Index(const IndexParams& params, Graph&& graph, const HNSWLayerSnapshot& layer_data,
-          const CalibrationSnapshot& cal = CalibrationSnapshot(),
-          uint64_t rotation_seed = constants::kDefaultRotationSeed)
-        : params_(params)
-        , encoder_(params.dim, rotation_seed)
-        , graph_(std::move(graph))
-        , finalized_(true)
-        , mL_(1.0 / std::log(static_cast<double>(M_UPPER)))
-        , rng_(constants::kDefaultLayerSeed)
-        , max_level_(layer_data.max_level)
-        , entry_point_(layer_data.entry_point)
-        , upper_tau_(layer_data.upper_tau)
-        , node_levels_(layer_data.node_levels)
-    {
-        if (params.dim == 0) throw std::invalid_argument("dim must be > 0");
-        upper_layers_ = layer_data.upper_layers;
-        calibration_ = cal;
-    }
-
-    void add_batch(const float* vecs, size_t num_vecs) {
-        if (num_vecs == 0) return;
-
-        graph_.reserve(graph_.size() + num_vecs);
-
-        std::vector<CodeType> codes(num_vecs);
-        encoder_.encode_batch(vecs, num_vecs, codes.data());
-
-        for (size_t i = 0; i < num_vecs; ++i) {
-            graph_.add_node(codes[i], vecs + i * params_.dim);
-        }
-
-        needs_build_ = true;
+    void build(const float* vecs, size_t num_vecs) {
+        std::unique_lock<std::shared_mutex> lock(index_mutex_);
+        graph_ = Graph(params_.dim);
+        calibration_ = CalibrationSnapshot();
+        finalized_ = false;
+        needs_build_ = false;
+        max_level_ = 0;
+        entry_point_ = INVALID_NODE;
+        upper_tau_ = 0.0f;
+        node_levels_.clear();
+        upper_layers_.clear();
+        add_batch_internal(vecs, num_vecs);
     }
 
     void finalize() {
+        std::unique_lock<std::shared_mutex> lock(index_mutex_);
         size_t n = graph_.size();
-        if (n == 0 || !needs_build_) { finalized_ = true; return; }
+        if (n == 0) {
+            throw std::runtime_error("Cannot finalize an empty index.");
+        }
+        if (!needs_build_) {
+            throw std::runtime_error("Finalize called without a pending build.");
+        }
 
         assign_layers(n);
 
         build_upper_layers();
 
-        // Reuse prior residual scale if present; default to neutral scale.
-        float resid_sigma = calibration_.resid_sigma > 0
-            ? calibration_.resid_sigma : 1.0f;
+        // Graph optimization uses fixed neutral residual scale.
+        float resid_sigma = 1.0f;
         auto perm = graph_refinement::optimize_graph_adaptive(
             graph_, encoder_, resid_sigma);
 
         // Re-map upper-layer graph after BFS permutation.
-        if (!perm.old_to_new.empty()) {
-            for (auto& layer : upper_layers_) {
-                for (auto& edge : layer) {
-                    if (edge.node < perm.old_to_new.size()) {
-                        edge.node = perm.old_to_new[edge.node];
-                    }
-                    for (auto& nb : edge.neighbors) {
-                        if (nb < perm.old_to_new.size()) {
-                            nb = perm.old_to_new[nb];
-                        }
-                    }
+        for (auto& layer : upper_layers_) {
+            for (auto& edge : layer) {
+                edge.node = perm.old_to_new[edge.node];
+                for (auto& nb : edge.neighbors) {
+                    nb = perm.old_to_new[nb];
                 }
-                std::sort(layer.begin(), layer.end());
             }
-            if (entry_point_ != INVALID_NODE && entry_point_ < perm.old_to_new.size()) {
-                entry_point_ = perm.old_to_new[entry_point_];
-            }
-            if (!node_levels_.empty()) {
-                std::vector<int> new_levels(node_levels_.size());
-                for (size_t i = 0; i < node_levels_.size(); ++i) {
-                    new_levels[perm.old_to_new[i]] = node_levels_[i];
-                }
-                node_levels_ = std::move(new_levels);
-            }
+            std::sort(layer.begin(), layer.end());
         }
+        entry_point_ = perm.old_to_new[entry_point_];
+        std::vector<int> new_levels(node_levels_.size());
+        for (size_t i = 0; i < node_levels_.size(); ++i) {
+            new_levels[perm.old_to_new[i]] = node_levels_[i];
+        }
+        node_levels_ = std::move(new_levels);
 
         calibrate_estimator(constants::kDefaultCalibSamples);
 
@@ -136,9 +131,12 @@ public:
 
     std::vector<SearchResult> search(
         const float* query,
-        const SearchParams& params = SearchParams()) const
+        const SearchRequest& request = SearchRequest()) const
     {
-        if (graph_.empty()) return {};
+        std::shared_lock<std::shared_mutex> lock(index_mutex_);
+        if (graph_.empty()) {
+            throw std::runtime_error("Search requested on an empty index.");
+        }
         if (!calibration_.flags || !calibration_.evt.fitted) {
             throw std::runtime_error(
                 "Index is not calibrated with EVT-CRC. Rebuild with finalize().");
@@ -149,9 +147,13 @@ public:
         encoded.affine_b = calibration_.affine_b;
         encoded.ip_qo_floor = calibration_.ip_qo_floor;
         encoded.resid_q99_dot = calibration_.resid_q99_dot;
+
+        float target_recall = std::clamp(
+            request.target_recall, constants::kMinRecallTarget, constants::kMaxRecallTarget);
+        size_t k = std::max<size_t>(request.k, 1);
+
         float dot_slack_levels[constants::kMaxSlackArray];
-        float delta = 1.0f - std::clamp(params.recall_target,
-            constants::kMinRecallTarget, constants::kMaxRecallTarget);
+        float delta = 1.0f - target_recall;
         float delta_prune = constants::kPruneRiskFrac * delta;
         float delta_term = (1.0f - constants::kPruneRiskFrac) * delta;
 
@@ -163,11 +165,8 @@ public:
         }
         encoded.dot_slack = dot_slack_levels[0];
 
-        // Distance-ratio termination: gamma controls how far past the current
-        // k-th nearest we explore. Derived from EVT quantile normalized by
-        // median nearest-neighbor distance.
         float alpha_term = delta_term / static_cast<float>(
-            std::max(params.k * constants::kAlphaTermKMult, size_t(1)));
+            std::max(k * constants::kAlphaTermKMult, size_t(1)));
         float dot_slack_term = evt_crc::evt_quantile(
             alpha_term, calibration_.evt, calibration_.resid_q99_dot);
         float dist_slack = constants::kSlackMultiplier * calibration_.evt.nop_p95 * dot_slack_term;
@@ -176,44 +175,33 @@ public:
             constants::kGammaMin, constants::kGammaMax);
 
         size_t ef_cap = static_cast<size_t>(
-            adaptive_defaults::ef_cap(graph_.size(), params.k, gamma));
-        ef_cap = std::clamp(ef_cap, params.k * constants::kEfMinMultiplier, constants::kEfMaxCap);
+            adaptive_defaults::ef_cap(graph_.size(), k, gamma));
+        ef_cap = std::clamp(ef_cap, k * constants::kEfMinMultiplier, constants::kEfMaxCap);
 
         thread_local TwoLevelVisitationTable visited(0);
         if (visited.capacity() < graph_.size()) {
             visited.resize(graph_.size() + adaptive_defaults::visitation_headroom(graph_.size()));
         }
 
-        NodeId ep = INVALID_NODE;
-        if (max_level_ > 0 && entry_point_ != INVALID_NODE) {
+        NodeId ep = graph_.entry_point();
+        if (max_level_ > 0) {
             ep = entry_point_;
             for (int level = max_level_; level >= 1; --level) {
                 ep = greedy_search_layer(query, ep, level);
             }
         }
+        if (ep == INVALID_NODE || !graph_.is_alive(ep)) {
+            throw std::runtime_error("Search failed: invalid entry point after finalize.");
+        }
 
         return rabitq_search::search<D, R, BitWidth>(
-            encoded, query, graph_, params.k, gamma, visited, ef_cap, ep,
+            encoded, query, graph_, k, gamma, visited, ef_cap, ep,
             dot_slack_levels, evt_L);
-    }
-
-    HNSWLayerSnapshot get_layer_snapshot() const {
-        HNSWLayerSnapshot snap;
-        snap.max_level = max_level_;
-        snap.entry_point = entry_point_;
-        snap.upper_tau = upper_tau_;
-        snap.node_levels = node_levels_;
-        snap.upper_layers = upper_layers_;
-        return snap;
     }
 
     size_t size() const { return graph_.size(); }
     size_t dim() const { return params_.dim; }
     bool is_finalized() const { return finalized_; }
-    const Graph& graph() const { return graph_; }
-    uint64_t rotation_seed() const { return encoder_.rotation_seed(); }
-
-    const CalibrationSnapshot& get_calibration_snapshot() const { return calibration_; }
 
 private:
     IndexParams params_;
@@ -234,6 +222,7 @@ private:
     std::vector<int> node_levels_;
 
     std::vector<std::vector<HNSWLayerEdge>> upper_layers_;
+    mutable std::shared_mutex index_mutex_;
 
     HNSWLayerEdge* find_edge(int level, NodeId node) {
         auto& layer = upper_layers_[level - 1];
@@ -259,6 +248,24 @@ private:
         return *layer.insert(it, HNSWLayerEdge{node, {}});
     }
 
+    void add_batch_internal(const float* vecs, size_t num_vecs) {
+        if (num_vecs == 0) {
+            throw std::invalid_argument("build requires at least one vector.");
+        }
+
+        graph_.reserve(graph_.size() + num_vecs);
+
+        std::vector<CodeType> codes(num_vecs);
+        encoder_.encode_batch(vecs, num_vecs, codes.data());
+
+        for (size_t i = 0; i < num_vecs; ++i) {
+            graph_.add_node(codes[i], vecs + i * params_.dim);
+        }
+
+        needs_build_ = true;
+        finalized_ = false;
+    }
+
     void assign_layers(size_t n) {
         node_levels_.resize(n);
         std::uniform_real_distribution<double> dist(0.0, 1.0);
@@ -271,7 +278,7 @@ private:
             if (r < constants::kMinLayerRandom) r = constants::kMinLayerRandom;
             int level = static_cast<int>(-std::log(r) * mL_);
             node_levels_[i] = level;
-            if (level > max_level_) {
+            if (entry_point_ == INVALID_NODE || level > max_level_) {
                 max_level_ = level;
                 entry_point_ = static_cast<NodeId>(i);
             }
@@ -383,7 +390,9 @@ private:
     std::vector<NeighborCandidate> search_upper_layer(
         const float* query, NodeId ep, int level, size_t ef) const
     {
-        if (ep == INVALID_NODE) return {};
+        if (ep == INVALID_NODE) {
+            throw std::runtime_error("Upper-layer search failed: invalid entry.");
+        }
 
         MinHeap candidates;
         MaxHeap nearest;
@@ -466,13 +475,16 @@ private:
             throw std::runtime_error("Calibration requires at least 50 nodes.");
         }
 
+        std::vector<NodeId> sample_ids(n);
+        for (size_t i = 0; i < n; ++i) {
+            sample_ids[i] = static_cast<NodeId>(i);
+        }
+
         num_samples = std::min(num_samples, n);
 
         // Mix DB and synthetic queries for calibration coverage.
         std::mt19937 rng(static_cast<uint32_t>(constants::kDefaultLayerSeed + constants::kDefaultCalibrationSeed));
-        std::vector<size_t> indices(n);
-        std::iota(indices.begin(), indices.end(), 0);
-        std::shuffle(indices.begin(), indices.end(), rng);
+        std::shuffle(sample_ids.begin(), sample_ids.end(), rng);
 
         size_t n_db = std::min(num_samples, n);
         size_t n_synth = std::min(num_samples / 2, n);
@@ -480,14 +492,14 @@ private:
         std::vector<float> dim_var(D, 0.0f);
         size_t var_sample = std::min(n, constants::kVarEstSamples);
         for (size_t i = 0; i < var_sample; ++i) {
-            const float* v = graph_.get_vector(static_cast<NodeId>(indices[i]));
+            const float* v = graph_.get_vector(sample_ids[i]);
             for (size_t d = 0; d < D; ++d) {
                 dim_var[d] += v[d] * v[d];
             }
         }
         std::vector<float> dim_mean(D, 0.0f);
         for (size_t i = 0; i < var_sample; ++i) {
-            const float* v = graph_.get_vector(static_cast<NodeId>(indices[i]));
+            const float* v = graph_.get_vector(sample_ids[i]);
             for (size_t d = 0; d < D; ++d) {
                 dim_mean[d] += v[d];
             }
@@ -513,17 +525,23 @@ private:
         nop_samples.reserve(num_samples * 4);
 
         auto process_query = [&](const float* query_vec) {
-            NodeId ep = (entry_point_ != INVALID_NODE) ? entry_point_ : graph_.entry_point();
-            if (ep == INVALID_NODE) return;
+            NodeId ep = entry_point_;
+            if (ep == INVALID_NODE) {
+                throw std::runtime_error("Calibration failed: invalid upper-layer entry point.");
+            }
 
             const auto& nb = graph_.get_neighbors(ep);
-            if (nb.size() == 0) return;
+            if (nb.size() == 0) {
+                throw std::runtime_error("Calibration failed: entry point has no neighbors.");
+            }
 
             float best_dist = l2_distance_simd<D>(query_vec, graph_.get_vector(ep));
             NodeId parent = ep;
             for (size_t i = 0; i < nb.size(); ++i) {
                 NodeId nid = nb.neighbor_ids[i];
-                if (nid == INVALID_NODE) continue;
+                if (nid == INVALID_NODE) {
+                    throw std::runtime_error("Calibration failed: encountered invalid neighbor in entry layer.");
+                }
                 float d = l2_distance_simd<D>(query_vec, graph_.get_vector(nid));
                 if (d < best_dist) {
                     best_dist = d;
@@ -533,7 +551,9 @@ private:
             nn_dists_sq.push_back(best_dist);
 
             const auto& pnb = graph_.get_neighbors(parent);
-            if (pnb.size() == 0) return;
+            if (pnb.size() == 0) {
+                throw std::runtime_error("Calibration failed: chosen parent has no neighbors.");
+            }
 
             QueryType encoded = encoder_.encode_query_raw(query_vec);
 
@@ -558,13 +578,14 @@ private:
                 for (size_t j = 0; j < batch_count; ++j) {
                     size_t ni = batch_start + j;
                     NodeId neighbor = pnb.neighbor_ids[ni];
-                    if (neighbor == INVALID_NODE) continue;
+                    if (neighbor == INVALID_NODE) {
+                        throw std::runtime_error("Calibration failed: invalid neighbor in parent block.");
+                    }
 
                     float ip_qo = pnb.ip_qo[ni];
                     ip_qo_values.push_back(ip_qo);
 
-                    float nop = pnb.nop[ni];
-                    if (nop < constants::kNearZeroSq) continue;
+                    float nop = std::max(pnb.nop[ni], constants::kNearZeroSq);
                     nop_samples.push_back(nop);
 
                     float A = encoded.coeff_fastscan;
@@ -583,7 +604,7 @@ private:
                     }
 
                     float ip_corrected = ip_approx - pnb.ip_cp[ni];
-                    if (std::abs(ip_qo) < constants::kIpQualityEps) continue;
+                    float ip_qo_denom = std::max(std::abs(ip_qo), constants::kIpQualityEps);
 
                     const float* p_vec = graph_.get_vector(parent);
                     const float* o_vec = graph_.get_vector(neighbor);
@@ -594,21 +615,21 @@ private:
                     true_ip /= nop;
 
                     per_sample_ip_corrected.push_back(ip_corrected);
-                    per_sample_ip_qo.push_back(ip_qo);
+                    per_sample_ip_qo.push_back(ip_qo_denom);
                     truths.push_back(true_ip);
                 }
             }
         };
 
         for (size_t i = 0; i < n_db; ++i) {
-            const float* v = graph_.get_vector(static_cast<NodeId>(indices[i]));
+            const float* v = graph_.get_vector(sample_ids[i]);
             process_query(v);
         }
 
         std::normal_distribution<float> normal_dist(0.0f, 1.0f);
         std::vector<float> synth_query(D);
         for (size_t i = 0; i < n_synth; ++i) {
-            const float* base = graph_.get_vector(static_cast<NodeId>(indices[i % n]));
+            const float* base = graph_.get_vector(sample_ids[i % n]);
             for (size_t d = 0; d < D; ++d) {
                 synth_query[d] = base[d] + normal_dist(rng) * std::sqrt(dim_var[d]);
             }
@@ -720,10 +741,11 @@ private:
         calibration_.calibration_corr = (denom_corr > constants::kNearZeroSq)
             ? static_cast<float>(cov_et / denom_corr) : 0.0f;
 
-        if (!nn_dists_sq.empty()) {
-            std::sort(nn_dists_sq.begin(), nn_dists_sq.end());
-            calibration_.median_nn_dist_sq = nn_dists_sq[nn_dists_sq.size() / 2];
+        if (nn_dists_sq.empty()) {
+            throw std::runtime_error("Calibration failed: no nearest-neighbor distance samples.");
         }
+        std::sort(nn_dists_sq.begin(), nn_dists_sq.end());
+        calibration_.median_nn_dist_sq = nn_dists_sq[nn_dists_sq.size() / 2];
 
         calibration_.flags = 1u;
 

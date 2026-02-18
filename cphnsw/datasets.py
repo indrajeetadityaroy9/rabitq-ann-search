@@ -4,17 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-
-def load_fvecs(path: str) -> np.ndarray:
-    data = np.fromfile(path, dtype=np.float32)
-    d = data[:1].view(np.int32)[0]
-    return data.reshape(-1, d + 1)[:, 1:].copy()
-
-
-def load_ivecs(path: str) -> np.ndarray:
-    data = np.fromfile(path, dtype=np.int32)
-    k = int(data[0])
-    return data.reshape(-1, k + 1)[:, 1:].copy()
+from cphnsw.paths import resolve_project_path
 
 
 FVECS_DATASETS = {
@@ -35,14 +25,22 @@ NPY_DATASETS = {"openai1536", "msmarco10m"}
 ALL_DATASETS = list(FVECS_DATASETS.keys()) + sorted(NPY_DATASETS)
 
 
-def load_dataset(name: str, base_dir: str = "data/") -> dict:
-    base_path = Path(base_dir) / name
+def load_dataset(name: str, base_dir: Path | str) -> dict:
+    base_path = resolve_project_path(base_dir) / name
 
     if name in FVECS_DATASETS:
         files = FVECS_DATASETS[name]
-        base = load_fvecs(base_path / files["base"])
-        queries = load_fvecs(base_path / files["queries"])
-        groundtruth = load_ivecs(base_path / files["groundtruth"])
+        base_raw = np.fromfile(base_path / files["base"], dtype=np.float32)
+        base_dim = base_raw[:1].view(np.int32)[0]
+        base = base_raw.reshape(-1, base_dim + 1)[:, 1:].copy()
+
+        query_raw = np.fromfile(base_path / files["queries"], dtype=np.float32)
+        query_dim = query_raw[:1].view(np.int32)[0]
+        queries = query_raw.reshape(-1, query_dim + 1)[:, 1:].copy()
+
+        gt_raw = np.fromfile(base_path / files["groundtruth"], dtype=np.int32)
+        gt_k = int(gt_raw[0])
+        groundtruth = gt_raw.reshape(-1, gt_k + 1)[:, 1:].copy()
     elif name in NPY_DATASETS:
         base = np.load(base_path / "base.npy").astype(np.float32)
         queries = np.load(base_path / "queries.npy").astype(np.float32)

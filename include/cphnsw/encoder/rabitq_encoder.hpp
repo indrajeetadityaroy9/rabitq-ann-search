@@ -79,8 +79,6 @@ public:
         return encode_query_raw_impl(vec, buf.data(), q_bar_u.data());
     }
 
-    uint64_t rotation_seed() const { return rotation_.seed(); }
-
     void rotate_raw_vector(const float* vec, float* out) const {
         rotation_.apply_copy(vec, out);
         for (size_t i = 0; i < padded_dim_; ++i) {

@@ -2,6 +2,7 @@
 
 #include "../core/codes.hpp"
 #include "../core/adaptive_defaults.hpp"
+#include "../core/constants.hpp"
 #include "../distance/fastscan_kernel.hpp"
 #include "../distance/fastscan_layout.hpp"
 #include "../graph/rabitq_graph.hpp"
@@ -70,7 +71,7 @@ std::vector<SearchResult> search(
     const float* raw_query,
     const RaBitQGraph<D, R, BitWidth>& graph,
     size_t k,
-    float term_slack_sq,
+    float gamma,
     TwoLevelVisitationTable& visited,
     size_t ef_cap = 0,
     NodeId entry = INVALID_NODE,
@@ -78,10 +79,9 @@ std::vector<SearchResult> search(
     int num_slack_levels = 0)
 {
     if (graph.empty()) return {};
-    if (k == 0) k = adaptive_defaults::default_k();
+    if (k == 0) k = constants::kDefaultK;
     if (ef_cap == 0) {
-        float slack_factor = std::sqrt(std::max(term_slack_sq, 0.01f));
-        ef_cap = adaptive_defaults::ef_cap(graph.size(), k, slack_factor);
+        ef_cap = adaptive_defaults::ef_cap(graph.size(), k, gamma);
     }
 
     NodeId ep = (entry != INVALID_NODE) ? entry : graph.entry_point();
@@ -93,15 +93,16 @@ std::vector<SearchResult> search(
                        std::greater<BeamEntry>> beam;
     BoundedMaxHeap<SearchResult> nn(k);
 
-    // Global minimum lower bound enables safe bound-based termination.
-    float frontier_min_lb = 0.0f;
+    // Per-query adaptive gamma: track estimation quality to tighten/widen.
+    float gamma_q = gamma;  // effective gamma, adjusted per-query
+    double ratio_sum = 0.0, ratio_sq_sum = 0.0;
+    size_t ratio_count = 0;
 
-    float query_norm_sq = l2_norm_sq_simd<D>(raw_query);
+    float query_norm_sq = dot_product_simd<D>(raw_query, raw_query);
 
     float ep_est = std::max(query_norm_sq + graph.get_norm_sq(ep)
                    - 2.0f * dot_product_simd<D>(raw_query, graph.get_vector(ep)), 0.0f);
     beam.push({ep_est, 0.0f, ep});
-    frontier_min_lb = std::min(frontier_min_lb, 0.0f);
     visited.check_and_mark_estimated(ep, query_id);
 
     alignas(64) uint32_t fastscan_sums[R];
@@ -124,7 +125,10 @@ std::vector<SearchResult> search(
         }
         if (!found) break;
 
-        if (nn.size() >= k && frontier_min_lb > nn.worst_distance() + term_slack_sq) break;
+        // Distance-ratio termination: if the best unexplored candidate is
+        // gamma times worse than the current k-th nearest, further exploration
+        // is unlikely to improve results.
+        if (nn.size() >= k && current.est_distance >= gamma_q * nn.worst_distance()) break;
 
         if (nn.size() >= k && current.lower_bound > nn.worst_distance()) continue;
 
@@ -160,7 +164,7 @@ std::vector<SearchResult> search(
             ++slack_batch_count;
         }
 
-        constexpr size_t BATCH = 32;
+        constexpr size_t BATCH = constants::kFastScanBatch;
         size_t num_batches = (R + BATCH - 1) / BATCH;
 
         for (size_t batch = 0; batch < num_batches; ++batch) {
@@ -181,7 +185,7 @@ std::vector<SearchResult> search(
             } else {
                 fastscan::compute_msb_only_inner_products<D, BitWidth>(
                     query.lut, nb.code_blocks[batch], msb_sums + batch_start);
-                fastscan::convert_msb_to_lower_bounds<D>(
+                fastscan::convert_msb_to_lower_bounds<D, BitWidth>(
                     query, msb_sums + batch_start,
                     nb.nop + batch_start, nb.ip_qo + batch_start,
                     nb.ip_cp + batch_start, nb.popcounts + batch_start,
@@ -221,7 +225,7 @@ std::vector<SearchResult> search(
         // Warmup uses exact distances until the top-k heap is full.
         bool warmup = (nn.size() < k);
 
-        size_t prefetch_count = std::min(n_neighbors, size_t(8));
+        size_t prefetch_count = std::min(n_neighbors, constants::kPrefetchNeighbors);
         for (size_t i = 0; i < prefetch_count; ++i) {
             NodeId nid = nb.neighbor_ids[i];
             if (nid != INVALID_NODE) visited.prefetch_estimated(nid);
@@ -237,7 +241,6 @@ std::vector<SearchResult> search(
                               - 2.0f * dot_product_simd<D>(raw_query, graph.get_vector(neighbor_id)), 0.0f);
                 nn.push({neighbor_id, exact});
                 beam.push({exact, exact, neighbor_id});
-                frontier_min_lb = std::min(frontier_min_lb, exact);
                 graph.prefetch_vertex(neighbor_id);
                 continue;
             }
@@ -251,30 +254,41 @@ std::vector<SearchResult> search(
                               - 2.0f * dot_product_simd<D>(raw_query, graph.get_vector(neighbor_id)), 0.0f);
                 nn.push({neighbor_id, exact});
                 beam.push({exact, lower, neighbor_id});
-                frontier_min_lb = std::min(frontier_min_lb, lower);
+
+                // Track estimation ratio for adaptive gamma.
+                if (exact > constants::kNearZeroSq) {
+                    double r = est_dist / exact;
+                    ratio_sum += r;
+                    ratio_sq_sum += r * r;
+                    ++ratio_count;
+                    if (ratio_count >= constants::kAdaptiveGammaWarmup) {
+                        double r_mean = ratio_sum / ratio_count;
+                        double r_var = ratio_sq_sum / ratio_count - r_mean * r_mean;
+                        double r_std = std::sqrt(std::max(r_var, 0.0));
+                        // Tighten gamma if estimates are accurate, widen if noisy.
+                        gamma_q = std::clamp(
+                            gamma * static_cast<float>(1.0 + constants::kAdaptiveGammaBeta * r_std),
+                            constants::kAdaptiveGammaMin, constants::kAdaptiveGammaMax);
+                    }
+                }
             } else {
                 beam.push({est_dist, lower, neighbor_id});
-                frontier_min_lb = std::min(frontier_min_lb, lower);
             }
             graph.prefetch_vertex(neighbor_id);
         }
 
-        size_t trim_trigger = static_cast<size_t>(ef_cap * adaptive_defaults::beam_trim_trigger_ratio());
+        size_t trim_trigger = static_cast<size_t>(ef_cap * constants::kBeamTrimTrigger);
         if (beam.size() > trim_trigger) {
             std::priority_queue<BeamEntry, std::vector<BeamEntry>,
                                std::greater<BeamEntry>> new_beam;
-            size_t keep = static_cast<size_t>(ef_cap * adaptive_defaults::beam_trim_keep_ratio());
+            size_t keep = static_cast<size_t>(ef_cap * constants::kBeamTrimKeep);
             size_t kept = 0;
-            float new_min_lb = std::numeric_limits<float>::max();
             while (!beam.empty() && kept < keep) {
-                const auto& entry = beam.top();
-                new_min_lb = std::min(new_min_lb, entry.lower_bound);
-                new_beam.push(entry);
+                new_beam.push(beam.top());
                 beam.pop();
                 kept++;
             }
             beam = std::move(new_beam);
-            frontier_min_lb = new_min_lb;
         }
     }
 

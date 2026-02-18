@@ -2,6 +2,7 @@
 
 #include "../graph/rabitq_graph.hpp"
 #include "../core/evt_crc.hpp"
+#include "../core/constants.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -11,14 +12,18 @@
 
 namespace cphnsw {
 
+static constexpr uint32_t SERIALIZATION_VERSION = 2;
+
 struct SerializationHeader {
     char magic[8] = {'R','B','Q','G','R','P','H', '\0'};
+    uint32_t version = SERIALIZATION_VERSION;
     uint32_t dims;
     uint32_t degree;
     uint32_t bit_width;
     uint64_t num_nodes;
     uint32_t entry_point;
     uint32_t original_dim;
+    uint64_t rotation_seed = constants::kDefaultRotationSeed;
 };
 
 struct CalibrationSnapshot {
@@ -36,6 +41,7 @@ struct CalibrationSnapshot {
 struct HNSWLayerEdge {
     NodeId node;
     std::vector<NodeId> neighbors;
+    bool operator<(const HNSWLayerEdge& other) const { return node < other.node; }
 };
 
 struct HNSWLayerSnapshot {
@@ -54,7 +60,8 @@ public:
 
     static void save(const std::string& path, const Graph& graph,
                      const HNSWLayerSnapshot& hnsw_data,
-                     const CalibrationSnapshot& cal = CalibrationSnapshot()) {
+                     const CalibrationSnapshot& cal = CalibrationSnapshot(),
+                     uint64_t rotation_seed = constants::kDefaultRotationSeed) {
         FILE* f = std::fopen(path.c_str(), "wb");
         if (!f) throw std::runtime_error("Cannot open file for writing: " + path);
 
@@ -65,6 +72,7 @@ public:
         header.num_nodes = graph.size();
         header.entry_point = graph.entry_point();
         header.original_dim = static_cast<uint32_t>(graph.dim());
+        header.rotation_seed = rotation_seed;
 
         std::fwrite(&header, sizeof(header), 1, f);
 
@@ -108,6 +116,7 @@ public:
         Graph graph;
         HNSWLayerSnapshot hnsw_data;
         CalibrationSnapshot calibration;
+        uint64_t rotation_seed = constants::kDefaultRotationSeed;
     };
 
     static LoadResult load(const std::string& path) {
@@ -119,10 +128,15 @@ public:
             std::fclose(f);
             throw std::runtime_error("Failed to read header");
         }
-
         if (std::memcmp(header.magic, "RBQGRPH", 7) != 0) {
             std::fclose(f);
             throw std::runtime_error("Invalid magic number");
+        }
+        if (header.version != SERIALIZATION_VERSION) {
+            std::fclose(f);
+            throw std::runtime_error("Unsupported serialization version: " +
+                std::to_string(header.version) + " (expected " +
+                std::to_string(SERIALIZATION_VERSION) + ")");
         }
 
         if (header.dims != D || header.degree != R || header.bit_width != BitWidth) {
@@ -189,7 +203,7 @@ public:
 
         graph.recompute_norms();
 
-        return {std::move(graph), std::move(hnsw_data), cal};
+        return {std::move(graph), std::move(hnsw_data), cal, header.rotation_seed};
     }
 
 private:

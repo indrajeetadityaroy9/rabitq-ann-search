@@ -1,5 +1,6 @@
 # Build artifacts
 build/
+build-ext/
 cmake-build-*/
 *.o
 *.a
@@ -7,9 +8,6 @@ cmake-build-*/
 *.dylib
 
 # Python
-.venv/
-venv/
-env/
 __pycache__/
 *.py[cod]
 *$py.class

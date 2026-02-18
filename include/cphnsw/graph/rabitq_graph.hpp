@@ -3,7 +3,7 @@
 #include "../core/types.hpp"
 #include "../core/codes.hpp"
 #include "../core/memory.hpp"
-#include "../core/adaptive_defaults.hpp"
+#include "../core/constants.hpp"
 #include "../distance/fastscan_layout.hpp"
 #include "neighbor_selection.hpp"
 #include <vector>
@@ -149,13 +149,9 @@ public:
         return search_data_[id].neighbors;
     }
 
-    size_t neighbor_count(NodeId id) const {
-        return (id < search_data_.size()) ? search_data_[id].neighbors.size() : 0;
-    }
-
     static constexpr size_t PREFETCH_LINES =
-        (sizeof(SearchDataType) / CACHE_LINE_SIZE < adaptive_defaults::prefetch_line_cap())
-            ? (sizeof(SearchDataType) / CACHE_LINE_SIZE) : adaptive_defaults::prefetch_line_cap();
+        (sizeof(SearchDataType) / CACHE_LINE_SIZE < constants::kPrefetchLineCap)
+            ? (sizeof(SearchDataType) / CACHE_LINE_SIZE) : constants::kPrefetchLineCap;
 
     void prefetch_vertex(NodeId id) const {
         if (id >= search_data_.size()) return;
@@ -169,30 +165,13 @@ public:
         if (id >= raw_vectors_.size()) return;
         const char* base = reinterpret_cast<const char*>(raw_vectors_[id].data());
         constexpr size_t VEC_LINES = (D * sizeof(float) + CACHE_LINE_SIZE - 1) / CACHE_LINE_SIZE;
-        constexpr size_t MAX_VEC_LINES = (VEC_LINES < 4) ? VEC_LINES : 4;
+        constexpr size_t MAX_VEC_LINES = (VEC_LINES < constants::kMaxVecPrefetchLines) ? VEC_LINES : constants::kMaxVecPrefetchLines;
         for (size_t line = 0; line < MAX_VEC_LINES; ++line) {
             prefetch_t<1>(base + line * CACHE_LINE_SIZE);
         }
     }
 
-    float average_degree() const {
-        if (search_data_.empty()) return 0.0f;
-        size_t total = 0;
-        for (const auto& sd : search_data_) total += sd.neighbors.size();
-        return static_cast<float>(total) / search_data_.size();
-    }
-
-    size_t max_degree() const {
-        size_t m = 0;
-        for (const auto& sd : search_data_) {
-            if (sd.neighbors.size() > m) m = sd.neighbors.size();
-        }
-        return m;
-    }
-
-    NodeId find_medoid() const {
-        if (empty()) return INVALID_NODE;
-
+    std::vector<double> compute_centroid() const {
         size_t n = raw_vectors_.size();
         std::vector<double> centroid(dim_, 0.0);
         for (size_t i = 0; i < n; ++i) {
@@ -203,6 +182,14 @@ public:
         }
         double inv_n = 1.0 / n;
         for (size_t j = 0; j < dim_; ++j) centroid[j] *= inv_n;
+        return centroid;
+    }
+
+    NodeId find_medoid() const {
+        if (empty()) return INVALID_NODE;
+
+        size_t n = raw_vectors_.size();
+        auto centroid = compute_centroid();
 
         NodeId best = 0;
         double best_dist = std::numeric_limits<double>::max();
@@ -303,16 +290,7 @@ public:
         if (empty()) return INVALID_NODE;
 
         size_t n = raw_vectors_.size();
-
-        std::vector<double> centroid(dim_, 0.0);
-        for (size_t i = 0; i < n; ++i) {
-            const float* v = raw_vectors_[i].data();
-            for (size_t j = 0; j < dim_; ++j) {
-                centroid[j] += v[j];
-            }
-        }
-        double inv_n = 1.0 / n;
-        for (size_t j = 0; j < dim_; ++j) centroid[j] *= inv_n;
+        auto centroid = compute_centroid();
 
         struct CentroidDist {
             NodeId id;

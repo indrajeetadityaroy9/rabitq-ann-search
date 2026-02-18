@@ -3,6 +3,8 @@
 #include <pybind11/stl.h>
 #include <cphnsw/api/hnsw_index.hpp>
 #include <cphnsw/core/adaptive_defaults.hpp>
+#include <cphnsw/core/constants.hpp>
+#include <cphnsw/core/util.hpp>
 #include <cphnsw/io/serialization.hpp>
 
 #include <cstdio>
@@ -48,10 +50,11 @@ public:
 
     PyIndexWrapper(size_t dim,
                    Graph&& graph, const HNSWLayerSnapshot& layer_data,
-                   const CalibrationSnapshot& cal = CalibrationSnapshot()) {
+                   const CalibrationSnapshot& cal = CalibrationSnapshot(),
+                   uint64_t rotation_seed = constants::kDefaultRotationSeed) {
         IndexParams params;
         params.dim = dim;
-        index_ = std::make_unique<IndexType>(params, std::move(graph), layer_data, cal);
+        index_ = std::make_unique<IndexType>(params, std::move(graph), layer_data, cal, rotation_seed);
     }
 
     void add_batch(const float* vecs, size_t n) override { index_->add_batch(vecs, n); }
@@ -68,21 +71,22 @@ public:
     void save(const std::string& path) const override {
         auto snap = index_->get_layer_snapshot();
         auto cal = index_->get_calibration_snapshot();
-        IndexSerializer<D, 32, BitWidth>::save(path, index_->graph(), snap, cal);
+        IndexSerializer<D, 32, BitWidth>::save(path, index_->graph(), snap, cal,
+                                                index_->rotation_seed());
     }
 
     py::dict calibration_info() const override {
-        py::dict info;
-        info["affine_a"] = index_->calibration_affine_a();
-        info["affine_b"] = index_->calibration_affine_b();
-        info["ip_qo_floor"] = index_->calibration_ip_qo_floor();
-        info["resid_sigma"] = index_->calibration_resid_sigma();
-        info["resid_q99_dot"] = index_->calibration_resid_q99_dot();
-        info["median_nn_dist_sq"] = index_->calibration_median_nn_dist_sq();
-        info["calibration_corr"] = index_->calibration_corr();
-        info["calibrated"] = index_->calibration_calibrated();
-
         auto cal = index_->get_calibration_snapshot();
+        py::dict info;
+        info["affine_a"] = cal.affine_a;
+        info["affine_b"] = cal.affine_b;
+        info["ip_qo_floor"] = cal.ip_qo_floor;
+        info["resid_sigma"] = cal.resid_sigma;
+        info["resid_q99_dot"] = cal.resid_q99_dot;
+        info["median_nn_dist_sq"] = cal.median_nn_dist_sq;
+        info["calibration_corr"] = cal.calibration_corr;
+        info["calibrated"] = (cal.flags & 1u) != 0;
+
         py::dict evt;
         evt["fitted"] = cal.evt.fitted;
         evt["u"] = cal.evt.u;
@@ -93,6 +97,7 @@ public:
         evt["n_resid"] = cal.evt.n_resid;
         evt["n_tail"] = cal.evt.n_tail;
         info["evt"] = evt;
+        info["rotation_seed"] = index_->rotation_seed();
 
         return info;
     }
@@ -102,17 +107,11 @@ private:
 };
 
 
-static size_t padded_dim(size_t dim) {
-    size_t p = 1;
-    while (p < dim) p *= 2;
-    return p;
-}
-
 template <size_t BitWidth>
 static std::unique_ptr<PyIndexBase> create_index_with_bits(
     size_t dim)
 {
-    size_t pd = padded_dim(dim);
+    size_t pd = next_power_of_two(dim);
 
     #define CASE_DIM(DIM) \
         case DIM: return std::make_unique<PyIndexWrapper<DIM, BitWidth>>(dim);
@@ -159,7 +158,8 @@ static std::unique_ptr<PyIndexBase> load_index_with_bits(
         case DIM: { \
             auto result = IndexSerializer<DIM, 32, BitWidth>::load(path); \
             return std::make_unique<PyIndexWrapper<DIM, BitWidth>>( \
-                original_dim, std::move(result.graph), result.hnsw_data, result.calibration); \
+                original_dim, std::move(result.graph), result.hnsw_data, \
+                result.calibration, result.rotation_seed); \
         }
 
     switch (pd) {
@@ -194,6 +194,11 @@ static std::unique_ptr<PyIndexBase> load_index(
 
     if (std::memcmp(header.magic, "RBQGRPH", 7) != 0) {
         throw std::runtime_error("Invalid file format");
+    }
+    if (header.version != SERIALIZATION_VERSION) {
+        throw std::runtime_error("Unsupported serialization version: " +
+            std::to_string(header.version) + " (expected " +
+            std::to_string(SERIALIZATION_VERSION) + ")");
     }
 
     size_t original_dim = header.original_dim;
@@ -278,7 +283,7 @@ PYBIND11_MODULE(_core, m) {
                 dist_ptr[i] = results[i].distance;
             }
             return std::make_pair(ids, distances);
-        }, py::arg("query"), py::arg("k") = 10, py::arg("recall_target") = 0.95f,
+        }, py::arg("query"), py::arg("k") = constants::kDefaultK, py::arg("recall_target") = constants::kDefaultRecall,
            "Search for k nearest neighbors. Returns (ids, distances) arrays.\n"
            "recall_target controls the quality/speed tradeoff (default 0.95).")
 
@@ -320,8 +325,8 @@ PYBIND11_MODULE(_core, m) {
                 }
             }
             return std::make_pair(ids, distances);
-        }, py::arg("queries"), py::arg("k") = 10,
-           py::arg("recall_target") = 0.95f,
+        }, py::arg("queries"), py::arg("k") = constants::kDefaultK,
+           py::arg("recall_target") = constants::kDefaultRecall,
            "Batch search for k nearest neighbors (OpenMP parallel). Returns (ids, distances) as (n,k) arrays.")
 
         .def_property_readonly("size", &PyIndexBase::size,

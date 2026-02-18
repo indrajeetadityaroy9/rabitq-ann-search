@@ -1,6 +1,8 @@
 #pragma once
 
 #include "../core/memory.hpp"
+#include "../core/constants.hpp"
+#include "../core/util.hpp"
 #include "transform/fht.hpp"
 #include <array>
 #include <immintrin.h>
@@ -12,14 +14,16 @@ namespace cphnsw {
 class RandomHadamardRotation {
 public:
     static constexpr size_t NUM_LAYERS = 3;
-    static constexpr uint64_t DEFAULT_ROTATION_SEED = 42;
 
-    explicit RandomHadamardRotation(size_t dim)
+    explicit RandomHadamardRotation(size_t dim, uint64_t seed = constants::kDefaultRotationSeed)
         : original_dim_(dim)
-        , padded_dim_(next_power_of_two(dim)) {
+        , padded_dim_(next_power_of_two(dim))
+        , seed_(seed) {
 
         generate_signs();
     }
+
+    uint64_t seed() const { return seed_; }
 
     void apply(float* x) const {
         apply_diagonal_simd(x, signs_float_[0].data());
@@ -45,16 +49,11 @@ public:
 private:
     size_t original_dim_;
     size_t padded_dim_;
+    uint64_t seed_;
     std::array<AlignedVector<float>, NUM_LAYERS> signs_float_;
 
-    static size_t next_power_of_two(size_t n) {
-        size_t p = 1;
-        while (p < n) p *= 2;
-        return p;
-    }
-
     void generate_signs() {
-        std::mt19937_64 rng(DEFAULT_ROTATION_SEED);
+        std::mt19937_64 rng(seed_);
         std::uniform_int_distribution<int> coin(0, 1);
 
         for (size_t layer = 0; layer < NUM_LAYERS; ++layer) {

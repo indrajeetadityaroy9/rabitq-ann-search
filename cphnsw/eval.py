@@ -12,6 +12,10 @@ from cphnsw.datasets import ALL_DATASETS
 REQUIRED_SECTIONS = ["run", "data", "eval"]
 DEFAULT_CONFIG_PATH = Path("configs/benchmark.yaml")
 
+SECS_PER_MIN = 60.0
+MB_PER_GIB = 1024.0
+SUMMARY_RECALL_THRESH = 0.95  # recall@10 threshold for QPS summary
+
 
 def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict:
     with path.open() as f:
@@ -34,12 +38,12 @@ def _extract_summary(results_dir: Path) -> list:
         dataset = data["metadata"]["dataset"]
 
         for algo in data["results"]:
-            build_min = algo["build_time_s"] / 60.0
-            mem_gib = algo["memory_mb"] / 1024.0
+            build_min = algo["build_time_s"] / SECS_PER_MIN
+            mem_gib = algo["memory_mb"] / MB_PER_GIB
 
             qps_95 = None
             for point in algo["sweep"]:
-                if point.get("recall_at_10", 0) >= 0.95:
+                if point["recall_at_10"] >= SUMMARY_RECALL_THRESH:
                     qps_95 = point["qps"]
                     break
 
@@ -61,15 +65,15 @@ def main():
     data_cfg = cfg["data"]
     eval_cfg = cfg["eval"]
 
-    output_dir = Path(run_cfg.get("output_dir", "results")).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = Path(run_cfg["output_dir"]).resolve()
+    output_dir.mkdir(parents=True, exist_ok=False)
 
-    dataset = data_cfg.get("dataset", "sift1m")
-    base_dir = Path(data_cfg.get("base_dir", "data")).resolve()
+    dataset = data_cfg["dataset"]
+    base_dir = Path(data_cfg["base_dir"]).resolve()
     datasets = ALL_DATASETS if dataset == "all" else [dataset]
 
-    k = eval_cfg.get("k", 100)
-    n_runs = eval_cfg.get("n_runs", 3)
+    k = eval_cfg["k"]
+    n_runs = eval_cfg["n_runs"]
 
     for ds_name in datasets:
         print(json.dumps({"event": "benchmark_start", "dataset": ds_name}), flush=True)

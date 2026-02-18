@@ -13,16 +13,6 @@
 
 namespace cphnsw {
 
-template <size_t D>
-struct EncoderWorkspace {
-    AlignedVector<float> buf;
-    std::vector<float> centered;
-    AlignedVector<uint8_t> q_bar_u;
-
-    explicit EncoderWorkspace(size_t padded_dim, size_t dim)
-        : buf(padded_dim), centered(dim), q_bar_u(padded_dim) {}
-};
-
 template <typename Derived, size_t D>
 class RaBitQEncoderBase {
 public:
@@ -30,9 +20,10 @@ public:
 
     static constexpr size_t NUM_SUB_SEGMENTS = (D + 3) / 4;
 
-    explicit RaBitQEncoderBase(size_t dim)
+    explicit RaBitQEncoderBase(size_t dim,
+        uint64_t rotation_seed = constants::kDefaultRotationSeed)
         : dim_(dim)
-        , rotation_(dim)
+        , rotation_(dim, rotation_seed)
         , padded_dim_(rotation_.padded_dim())
         , centroid_(dim, 0.0f)
         , has_centroid_(false) {
@@ -81,11 +72,14 @@ public:
     }
 
     QueryType encode_query_raw(const float* vec) const {
-        thread_local EncoderWorkspace<D> ws(padded_dim_, dim_);
-        ws.buf.resize(padded_dim_);
-        ws.q_bar_u.resize(padded_dim_);
-        return encode_query_raw_impl(vec, ws.buf.data(), ws.q_bar_u.data());
+        thread_local AlignedVector<float> buf(padded_dim_);
+        thread_local AlignedVector<uint8_t> q_bar_u(padded_dim_);
+        buf.resize(padded_dim_);
+        q_bar_u.resize(padded_dim_);
+        return encode_query_raw_impl(vec, buf.data(), q_bar_u.data());
     }
+
+    uint64_t rotation_seed() const { return rotation_.seed(); }
 
     void rotate_raw_vector(const float* vec, float* out) const {
         rotation_.apply_copy(vec, out);
@@ -113,8 +107,8 @@ public:
             if (buf[i] > vmax) vmax = buf[i];
         }
 
-        float delta = (vmax - vl) / 15.0f;
-        if (delta < adaptive_defaults::division_epsilon()) delta = adaptive_defaults::division_epsilon();
+        float delta = (vmax - vl) / constants::kLutLevels;
+        if (delta < constants::kDivisionEps) delta = constants::kDivisionEps;
         float inv_delta = 1.0f / delta;
 
         float sum_qu = 0.0f;
@@ -122,7 +116,7 @@ public:
             float val = (buf[i] - vl) * inv_delta;
             int u = static_cast<int>(val + 0.5f);
             if (u < 0) u = 0;
-            if (u > 15) u = 15;
+            if (u > static_cast<int>(constants::kLutLevels)) u = static_cast<int>(constants::kLutLevels);
             q_bar_u[i] = static_cast<uint8_t>(u);
             sum_qu += static_cast<float>(u);
         }
@@ -170,7 +164,7 @@ public:
             float nop = std::sqrt(nop_sq);
             aux.nop = nop;
 
-            if (nop < adaptive_defaults::norm_epsilon(D)) {
+            if (nop < constants::norm_epsilon(D)) {
                 aux.ip_qo = 0.0f;
                 aux.ip_cp = 0.0f;
                 return aux;
@@ -254,7 +248,7 @@ public:
         float norm = std::sqrt(norm_sq);
         code.nop = norm;
 
-        if (norm < adaptive_defaults::norm_epsilon(D)) {
+        if (norm < constants::norm_epsilon(D)) {
             code.ip_qo = 0.0f;
             return code;
         }
@@ -322,7 +316,7 @@ public:
         float nop = std::sqrt(nop_sq);
         result.aux.nop = nop;
 
-        if (nop < adaptive_defaults::norm_epsilon(D)) {
+        if (nop < constants::norm_epsilon(D)) {
             result.aux.ip_qo = 0.0f;
             result.aux.ip_cp = 0.0f;
             return result;
@@ -343,8 +337,8 @@ public:
             if (rotated[i] > buf_max) buf_max = rotated[i];
         }
         float delta = (buf_max - buf_min) / K;
-        if (delta < adaptive_defaults::coordinate_epsilon(D))
-            delta = adaptive_defaults::coordinate_epsilon(D);
+        if (delta < constants::coordinate_epsilon(D))
+            delta = constants::coordinate_epsilon(D);
         float inv_delta = 1.0f / delta;
 
         thread_local std::vector<int> pr_codes;
@@ -362,7 +356,8 @@ public:
             norm_c_sq += c * c;
         }
 
-        constexpr size_t max_iters = adaptive_defaults::caq_max_iterations();
+        const size_t max_iters = adaptive_defaults::caq_max_iterations(D);
+        float prev_cos_sq = 0.0f;
         for (size_t iter = 0; iter < max_iters; ++iter) {
             bool changed = false;
             for (size_t i = 0; i < pd; ++i) {
@@ -392,6 +387,10 @@ public:
                 }
             }
             if (!changed) break;
+            // Early exit when cosine quality improvement is negligible.
+            float cos_sq = (norm_c_sq > 0.0f) ? (dot_co * dot_co / norm_c_sq) : 0.0f;
+            if (iter > 0 && (cos_sq - prev_cos_sq) < constants::kCaqEarlyExitTol) break;
+            prev_cos_sq = cos_sq;
         }
 
         float ip_qo = 0.0f, ip_cp = 0.0f;
@@ -420,7 +419,7 @@ public:
         float norm = std::sqrt(norm_sq);
         code.nop = norm;
 
-        if (norm < adaptive_defaults::norm_epsilon(D)) {
+        if (norm < constants::norm_epsilon(D)) {
             code.ip_qo = 0.0f;
             code.msb_popcount = 0;
             return code;
@@ -446,8 +445,8 @@ public:
             if (buf[i] > buf_max) buf_max = buf[i];
         }
         float delta = (buf_max - buf_min) / K;
-        if (delta < adaptive_defaults::coordinate_epsilon(D))
-            delta = adaptive_defaults::coordinate_epsilon(D);
+        if (delta < constants::coordinate_epsilon(D))
+            delta = constants::coordinate_epsilon(D);
         float inv_delta = 1.0f / delta;
 
         for (size_t i = 0; i < pd; ++i) {
@@ -461,7 +460,8 @@ public:
             norm_c_sq += c * c;
         }
 
-        constexpr size_t max_iters = adaptive_defaults::caq_max_iterations();
+        const size_t max_iters = adaptive_defaults::caq_max_iterations(D);
+        float prev_cos_sq = 0.0f;
         for (size_t iter = 0; iter < max_iters; ++iter) {
             bool changed = false;
             for (size_t i = 0; i < pd; ++i) {
@@ -497,6 +497,9 @@ public:
                 }
             }
             if (!changed) break;
+            float cos_sq = (norm_c_sq > 0.0f) ? (dot_co * dot_co / norm_c_sq) : 0.0f;
+            if (iter > 0 && (cos_sq - prev_cos_sq) < constants::kCaqEarlyExitTol) break;
+            prev_cos_sq = cos_sq;
         }
 
         float ip_qo = 0.0f;

@@ -13,19 +13,24 @@ import psutil
 from cphnsw.datasets import load_dataset
 from cphnsw.metrics import recall_at_k
 
+ADR_K = 10                # depth for average distance ratio evaluation
+ADR_EPS = 1e-10           # floor for ADR denominator to avoid division by zero
+US_PER_SEC = 1e6          # microseconds per second
+BYTES_PER_MB = 1024 ** 2  # bytes-to-megabytes divisor
+
 
 def timed_search(search_fn, queries: np.ndarray, n_warmup: int = 1, n_runs: int = 3):
     for _ in range(n_warmup):
         search_fn(queries)
 
     times = []
-    result = None
-    for _ in range(n_runs):
+    t0 = time.perf_counter()
+    result = search_fn(queries)
+    times.append(time.perf_counter() - t0)
+    for _ in range(n_runs - 1):
         t0 = time.perf_counter()
-        ids = search_fn(queries)
+        search_fn(queries)
         times.append(time.perf_counter() - t0)
-        if result is None:
-            result = ids
 
     median_time = float(np.median(times))
     return result, len(queries) / median_time, median_time
@@ -59,7 +64,7 @@ def run_benchmark(dataset_name: str, base_dir: Path,
     gt = ds["groundtruth"].astype(np.int64)
     dim = ds["dim"]
 
-    adr_k = min(k, 10)
+    adr_k = min(k, ADR_K)
     gt_ids = gt[:, :adr_k].astype(np.int64)
     gt_dists = np.sum((base[gt_ids] - queries[:, None, :]) ** 2, axis=2)
 
@@ -68,9 +73,8 @@ def run_benchmark(dataset_name: str, base_dir: Path,
     for spec in CPHNSW_SPECS:
         algorithm = spec["algorithm"]
 
-        index = None
         gc.collect()
-        rss_before = psutil.Process(os.getpid()).memory_info().rss / (1024 ** 2)
+        rss_before = psutil.Process(os.getpid()).memory_info().rss / BYTES_PER_MB
         t0 = time.perf_counter()
 
         index = cphnsw.Index(dim=dim, bits=spec["bits"])
@@ -79,7 +83,7 @@ def run_benchmark(dataset_name: str, base_dir: Path,
 
         build_time = time.perf_counter() - t0
         gc.collect()
-        rss_after = psutil.Process(os.getpid()).memory_info().rss / (1024 ** 2)
+        rss_after = psutil.Process(os.getpid()).memory_info().rss / BYTES_PER_MB
         mem_mb = max(0.0, rss_after - rss_before)
 
         sweep = []
@@ -92,11 +96,11 @@ def run_benchmark(dataset_name: str, base_dir: Path,
             r1 = recall_at_k(ids, gt, 1)
             r10 = recall_at_k(ids, gt, min(k, 10))
             r100 = recall_at_k(ids, gt, min(k, 100))
-            lat_us = med_time / len(queries) * 1e6
+            lat_us = med_time / len(queries) * US_PER_SEC
 
             res_ids = ids[:, :adr_k].astype(np.int64)
             res_dists = np.sum((base[res_ids] - queries[:, None, :]) ** 2, axis=2)
-            adr = float(np.mean(res_dists / np.maximum(gt_dists, 1e-10)))
+            adr = float(np.mean(res_dists / np.maximum(gt_dists, ADR_EPS)))
 
             sweep.append({
                 "param_name": spec["param_name"],
@@ -116,7 +120,7 @@ def run_benchmark(dataset_name: str, base_dir: Path,
             "sweep": sweep,
         })
 
-        index = None
+        del index
         gc.collect()
 
     output = {
@@ -134,7 +138,7 @@ def run_benchmark(dataset_name: str, base_dir: Path,
         "results": results,
     }
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=False)
     outfile = output_dir / f"{dataset_name}_results.json"
     with outfile.open("w") as f:
         json.dump(output, f, indent=2)

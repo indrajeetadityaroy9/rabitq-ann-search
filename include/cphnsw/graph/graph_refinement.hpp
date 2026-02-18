@@ -3,6 +3,7 @@
 #include "../core/codes.hpp"
 #include "../core/memory.hpp"
 #include "../core/adaptive_defaults.hpp"
+#include "../core/constants.hpp"
 #include "../distance/fastscan_layout.hpp"
 #include "../encoder/rabitq_encoder.hpp"
 #include "rabitq_graph.hpp"
@@ -20,8 +21,6 @@
 
 namespace cphnsw {
 namespace graph_refinement {
-
-static constexpr uint64_t DEFAULT_GRAPH_SEED = 42;
 
 struct WorkingNeighbor {
     NodeId id = INVALID_NODE;
@@ -90,7 +89,7 @@ void init_working_random(
     #pragma omp parallel num_threads(actual_threads)
     {
         int tid = omp_get_thread_num();
-        std::mt19937 rng(static_cast<uint32_t>(DEFAULT_GRAPH_SEED + static_cast<uint64_t>(tid)));
+        std::mt19937 rng(static_cast<uint32_t>(constants::kDefaultGraphSeed + static_cast<uint64_t>(tid)));
 
         #pragma omp for schedule(static)
         for (size_t i = 0; i < n; ++i) {
@@ -290,7 +289,7 @@ AlphaTauResult derive_alpha_tau_from_working(
     if (sample_size == 0) sample_size = adaptive_defaults::alpha_sample_size(n);
 
     size_t actual_sample = std::min(sample_size, n);
-    std::mt19937 rng(static_cast<uint32_t>(DEFAULT_GRAPH_SEED + 1));
+    std::mt19937 rng(static_cast<uint32_t>(constants::kDefaultGraphSeed + 1));
     std::vector<size_t> sample_indices(n);
     std::iota(sample_indices.begin(), sample_indices.end(), 0);
     std::shuffle(sample_indices.begin(), sample_indices.end(), rng);
@@ -332,22 +331,22 @@ AlphaTauResult derive_alpha_tau_from_working(
     std::sort(inter_neighbor_dists.begin(), inter_neighbor_dists.end());
 
     float d_med = neighbor_dists[neighbor_dists.size() / 2];
-    float d_inter = inter_neighbor_dists[inter_neighbor_dists.size() / adaptive_defaults::alpha_percentile_divisor()];
+    float d_inter = inter_neighbor_dists[inter_neighbor_dists.size() / constants::kAlphaPercentileDiv];
 
     float alpha;
-    if (d_inter < adaptive_defaults::norm_epsilon(D)) {
+    if (d_inter < constants::norm_epsilon(D)) {
         alpha = adaptive_defaults::alpha_default(D);
     } else {
         alpha = std::max(1.0f, d_med / d_inter);
-        alpha = std::min(alpha, adaptive_defaults::alpha_ceiling());
-        if (alpha < adaptive_defaults::alpha_floor_threshold()) alpha = adaptive_defaults::alpha_default(D);
+        alpha = std::min(alpha, constants::kAlphaCeiling);
+        if (alpha < constants::kAlphaFloor) alpha = adaptive_defaults::alpha_default(D);
     }
 
     float tau = 0.0f;
     if (!nn_dists.empty()) {
         std::sort(nn_dists.begin(), nn_dists.end());
         size_t p10_idx = nn_dists.size() / 10;
-        tau = nn_dists[p10_idx] * adaptive_defaults::tau_scaling_factor();
+        tau = nn_dists[p10_idx] * constants::kTauScale;
     }
 
     return {alpha, tau};
@@ -454,8 +453,10 @@ optimize_graph_adaptive(RaBitQGraph<D, R, BitWidth>& graph, const EncType& encod
         prune_and_write<D, R, BitWidth>(graph, encoder, u, candidates, alpha, tau, error_tolerance, resid_sigma);
     }
 
-    { std::vector<std::vector<WorkingNeighbor>>().swap(working); }
-    { std::vector<std::vector<uint8_t>>().swap(new_flags); }
+    working.clear();
+    working.shrink_to_fit();
+    new_flags.clear();
+    new_flags.shrink_to_fit();
 
     run_reverse_edge_pass<D, R, BitWidth>(graph, encoder, alpha, tau, error_tolerance, actual_threads, omp_chunk, resid_sigma);
 

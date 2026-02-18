@@ -1,7 +1,7 @@
 #pragma once
 
 #include "../core/types.hpp"
-#include "../core/adaptive_defaults.hpp"
+#include "../core/constants.hpp"
 #include <vector>
 #include <algorithm>
 #include <cmath>
@@ -42,11 +42,10 @@ std::vector<NeighborCandidate> select_neighbors_alpha_cng(
 
     float local_alpha = alpha * std::sqrt(
         static_cast<float>(candidates.size()) / static_cast<float>(R));
-    local_alpha = std::clamp(local_alpha, 1.0f, adaptive_defaults::alpha_max_cap());
+    local_alpha = std::clamp(local_alpha, 1.0f, constants::kAlphaMaxCap);
 
     std::vector<NeighborCandidate> selected;
     selected.reserve(R);
-    std::vector<bool> used(candidates.size(), false);
 
     for (size_t i = 0; i < candidates.size() && selected.size() < R; ++i) {
         bool should_add = true;
@@ -66,19 +65,18 @@ std::vector<NeighborCandidate> select_neighbors_alpha_cng(
         }
         if (should_add) {
             selected.push_back(candidates[i]);
-            used[i] = true;
         }
     }
 
     if (selected.size() < R) {
-        std::vector<size_t> backfill_indices;
-        for (size_t i = 0; i < candidates.size(); ++i) {
-            if (!used[i]) backfill_indices.push_back(i);
-        }
-
-        for (size_t idx : backfill_indices) {
-            if (selected.size() >= R) break;
-            selected.push_back(candidates[idx]);
+        for (size_t i = 0; i < candidates.size() && selected.size() < R; ++i) {
+            bool already_selected = false;
+            for (const auto& s : selected) {
+                if (s.id == candidates[i].id) { already_selected = true; break; }
+            }
+            if (!already_selected) {
+                selected.push_back(candidates[i]);
+            }
         }
     }
 

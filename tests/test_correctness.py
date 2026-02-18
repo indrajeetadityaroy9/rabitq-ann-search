@@ -8,6 +8,11 @@ import numpy as np
 
 from .conftest import SMALL_DIM, SMALL_K, SMALL_N, SMALL_NQUERY, brute_force_knn
 
+TEST_RECALL_TARGET = 0.95       # recall_target passed to search in tests
+MIN_RECALL_THRESHOLD = 0.7      # minimum acceptable mean recall
+MIN_RECALL_AFTER_REORDER = 0.6  # minimum acceptable recall post-BFS reorder
+TRANSLATION_SCALE = 10.0        # magnitude of translation shift
+
 
 def _compute_recall(result_ids, gt_ids, k):
     hits = len(set(result_ids[:k]) & set(gt_ids[:k]))
@@ -19,7 +24,7 @@ class TestTranslationInvariance:
         rng = np.random.default_rng()
         base = rng.standard_normal((SMALL_N, SMALL_DIM), dtype=np.float32)
         queries = rng.standard_normal((SMALL_NQUERY, SMALL_DIM), dtype=np.float32)
-        t = rng.standard_normal(SMALL_DIM, dtype=np.float32) * 10.0
+        t = rng.standard_normal(SMALL_DIM, dtype=np.float32) * TRANSLATION_SCALE
 
         idx1 = cphnsw.Index(dim=SMALL_DIM)
         idx1.add(base)
@@ -27,7 +32,7 @@ class TestTranslationInvariance:
 
         results1 = []
         for i in range(SMALL_NQUERY):
-            ids, dists = idx1.search(queries[i], k=SMALL_K, recall_target=0.95)
+            ids, dists = idx1.search(queries[i], k=SMALL_K, recall_target=TEST_RECALL_TARGET)
             results1.append((ids.copy(), dists.copy()))
 
         base_shifted = base + t
@@ -39,7 +44,7 @@ class TestTranslationInvariance:
 
         results2 = []
         for i in range(SMALL_NQUERY):
-            ids, dists = idx2.search(queries_shifted[i], k=SMALL_K, recall_target=0.95)
+            ids, dists = idx2.search(queries_shifted[i], k=SMALL_K, recall_target=TEST_RECALL_TARGET)
             results2.append((ids.copy(), dists.copy()))
 
         for i in range(SMALL_NQUERY):
@@ -63,7 +68,7 @@ class TestSerializationRoundTrip:
 
         results_before = []
         for i in range(SMALL_NQUERY):
-            ids, dists = idx1.search(queries[i], k=SMALL_K, recall_target=0.95)
+            ids, dists = idx1.search(queries[i], k=SMALL_K, recall_target=TEST_RECALL_TARGET)
             results_before.append((ids.copy(), dists.copy()))
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -74,7 +79,7 @@ class TestSerializationRoundTrip:
 
         results_after = []
         for i in range(SMALL_NQUERY):
-            ids, dists = idx2.search(queries[i], k=SMALL_K, recall_target=0.95)
+            ids, dists = idx2.search(queries[i], k=SMALL_K, recall_target=TEST_RECALL_TARGET)
             results_after.append((ids.copy(), dists.copy()))
 
         for i in range(SMALL_NQUERY):
@@ -121,11 +126,11 @@ class TestBasicFunctionality:
 
         recalls = []
         for i in range(SMALL_NQUERY):
-            ids, _ = idx.search(query_vectors[i], k=SMALL_K, recall_target=0.95)
+            ids, _ = idx.search(query_vectors[i], k=SMALL_K, recall_target=TEST_RECALL_TARGET)
             recalls.append(_compute_recall(ids, gt_ids[i], SMALL_K))
 
         mean_recall = np.mean(recalls)
-        assert mean_recall > 0.7, f"Mean recall too low: {mean_recall:.4f}"
+        assert mean_recall > MIN_RECALL_THRESHOLD, f"Mean recall too low: {mean_recall:.4f}"
 
     def test_batch_search(self, built_index, query_vectors):
         idx, _ = built_index
@@ -158,9 +163,9 @@ class TestBFSReorderInvariance:
 
         recalls = []
         for i in range(SMALL_NQUERY):
-            ids, _ = idx.search(queries[i], k=SMALL_K, recall_target=0.95)
+            ids, _ = idx.search(queries[i], k=SMALL_K, recall_target=TEST_RECALL_TARGET)
             hits = len(set(ids[:SMALL_K]) & set(gt_ids[i][:SMALL_K]))
             recalls.append(hits / SMALL_K)
 
         mean_recall = np.mean(recalls)
-        assert mean_recall > 0.6, f"Mean recall too low after reorder: {mean_recall:.4f}"
+        assert mean_recall > MIN_RECALL_AFTER_REORDER, f"Mean recall too low after reorder: {mean_recall:.4f}"

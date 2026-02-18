@@ -100,9 +100,4 @@ inline float dot_product_simd(const float* a, const float* b) {
     return _mm_cvtss_f32(s);
 }
 
-template <size_t D>
-inline float l2_norm_sq_simd(const float* a) {
-    return dot_product_simd<D>(a, a);
-}
-
 }  // namespace cphnsw

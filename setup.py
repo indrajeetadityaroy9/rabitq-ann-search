@@ -26,7 +26,7 @@ class CMakeBuild(build_ext):
         ]
 
         build_temp = Path(self.build_temp) / ext.name
-        build_temp.mkdir(parents=True, exist_ok=True)
+        build_temp.mkdir(parents=True, exist_ok=False)
 
         subprocess.run(
             ["cmake", ext.sourcedir, *cmake_args],

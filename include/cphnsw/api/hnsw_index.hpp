@@ -42,42 +42,34 @@ public:
     static constexpr size_t BIT_WIDTH = BitWidth;
 
     static constexpr size_t M_UPPER = adaptive_defaults::upper_layer_degree(R, D);
-    static constexpr uint64_t DEFAULT_LAYER_SEED = 42;
-    static constexpr uint64_t DEFAULT_CALIBRATION_SEED = 99999;
-    static constexpr size_t DEFAULT_CALIBRATION_SAMPLES = 2000;
 
     explicit Index(const IndexParams& params)
         : params_(params)
-        , encoder_(params.dim)
+        , encoder_(params.dim, params.effective_seed())
         , graph_(params.dim)
         , mL_(1.0 / std::log(static_cast<double>(M_UPPER)))
-        , rng_(DEFAULT_LAYER_SEED)
+        , rng_(constants::kDefaultLayerSeed)
     {
         if (params.dim == 0) throw std::invalid_argument("dim must be > 0");
     }
 
     Index(const IndexParams& params, Graph&& graph, const HNSWLayerSnapshot& layer_data,
-          const CalibrationSnapshot& cal = CalibrationSnapshot())
+          const CalibrationSnapshot& cal = CalibrationSnapshot(),
+          uint64_t rotation_seed = constants::kDefaultRotationSeed)
         : params_(params)
-        , encoder_(params.dim)
+        , encoder_(params.dim, rotation_seed)
         , graph_(std::move(graph))
         , finalized_(true)
         , mL_(1.0 / std::log(static_cast<double>(M_UPPER)))
-        , rng_(DEFAULT_LAYER_SEED)
+        , rng_(constants::kDefaultLayerSeed)
         , max_level_(layer_data.max_level)
         , entry_point_(layer_data.entry_point)
         , upper_tau_(layer_data.upper_tau)
         , node_levels_(layer_data.node_levels)
     {
         if (params.dim == 0) throw std::invalid_argument("dim must be > 0");
-        upper_layers_.resize(layer_data.upper_layers.size());
-        for (size_t l = 0; l < layer_data.upper_layers.size(); ++l) {
-            upper_layers_[l].reserve(layer_data.upper_layers[l].size());
-            for (const auto& ext_edge : layer_data.upper_layers[l]) {
-                upper_layers_[l].push_back(UpperLayerEdge{ext_edge.node, ext_edge.neighbors});
-            }
-        }
-        set_calibration_snapshot(cal);
+        upper_layers_ = layer_data.upper_layers;
+        calibration_ = cal;
     }
 
     void add_batch(const float* vecs, size_t num_vecs) {
@@ -136,7 +128,7 @@ public:
             }
         }
 
-        calibrate_estimator(DEFAULT_CALIBRATION_SAMPLES);
+        calibrate_estimator(constants::kDefaultCalibSamples);
 
         needs_build_ = false;
         finalized_ = true;
@@ -147,24 +139,23 @@ public:
         const SearchParams& params = SearchParams()) const
     {
         if (graph_.empty()) return {};
-        if (!calibration_.calibrated || !calibration_.evt.fitted) {
+        if (!calibration_.flags || !calibration_.evt.fitted) {
             throw std::runtime_error(
                 "Index is not calibrated with EVT-CRC. Rebuild with finalize().");
         }
 
-        constexpr float kPruneRiskFrac = 0.7f;
-        constexpr int kSlackLevels = 16;
         QueryType encoded = encoder_.encode_query_raw(query);
         encoded.affine_a = calibration_.affine_a;
         encoded.affine_b = calibration_.affine_b;
         encoded.ip_qo_floor = calibration_.ip_qo_floor;
         encoded.resid_q99_dot = calibration_.resid_q99_dot;
-        float dot_slack_levels[32];
-        float delta = 1.0f - std::clamp(params.recall_target, 0.5f, 0.9999f);
-        float delta_prune = kPruneRiskFrac * delta;
-        float delta_term = (1.0f - kPruneRiskFrac) * delta;
+        float dot_slack_levels[constants::kMaxSlackArray];
+        float delta = 1.0f - std::clamp(params.recall_target,
+            constants::kMinRecallTarget, constants::kMaxRecallTarget);
+        float delta_prune = constants::kPruneRiskFrac * delta;
+        float delta_term = (1.0f - constants::kPruneRiskFrac) * delta;
 
-        int evt_L = std::clamp(kSlackLevels, 1, 32);
+        int evt_L = std::clamp(constants::kSlackLevels, 1, constants::kMaxSlackArray);
         for (int i = 1; i <= evt_L; ++i) {
             float alpha_i = evt_crc::alpha_spend(i, delta_prune);
             dot_slack_levels[i - 1] = evt_crc::evt_quantile(
@@ -172,16 +163,21 @@ public:
         }
         encoded.dot_slack = dot_slack_levels[0];
 
+        // Distance-ratio termination: gamma controls how far past the current
+        // k-th nearest we explore. Derived from EVT quantile normalized by
+        // median nearest-neighbor distance.
         float alpha_term = delta_term / static_cast<float>(
-            std::max(params.k * 4, size_t(1)));
+            std::max(params.k * constants::kAlphaTermKMult, size_t(1)));
         float dot_slack_term = evt_crc::evt_quantile(
             alpha_term, calibration_.evt, calibration_.resid_q99_dot);
-        float term_slack_sq = 2.0f * calibration_.evt.nop_p95 * dot_slack_term;
+        float dist_slack = constants::kSlackMultiplier * calibration_.evt.nop_p95 * dot_slack_term;
+        float ref_dist = std::max(calibration_.median_nn_dist_sq, constants::kMinSlackSq);
+        float gamma = std::clamp(1.0f + dist_slack / ref_dist,
+            constants::kGammaMin, constants::kGammaMax);
 
-        float slack_factor = std::sqrt(std::max(term_slack_sq, 0.01f));
         size_t ef_cap = static_cast<size_t>(
-            adaptive_defaults::ef_cap(graph_.size(), params.k, slack_factor));
-        ef_cap = std::clamp(ef_cap, params.k * 4, size_t(8192));
+            adaptive_defaults::ef_cap(graph_.size(), params.k, gamma));
+        ef_cap = std::clamp(ef_cap, params.k * constants::kEfMinMultiplier, constants::kEfMaxCap);
 
         thread_local TwoLevelVisitationTable visited(0);
         if (visited.capacity() < graph_.size()) {
@@ -197,7 +193,7 @@ public:
         }
 
         return rabitq_search::search<D, R, BitWidth>(
-            encoded, query, graph_, params.k, term_slack_sq, visited, ef_cap, ep,
+            encoded, query, graph_, params.k, gamma, visited, ef_cap, ep,
             dot_slack_levels, evt_L);
     }
 
@@ -207,13 +203,7 @@ public:
         snap.entry_point = entry_point_;
         snap.upper_tau = upper_tau_;
         snap.node_levels = node_levels_;
-        snap.upper_layers.resize(upper_layers_.size());
-        for (size_t l = 0; l < upper_layers_.size(); ++l) {
-            snap.upper_layers[l].reserve(upper_layers_[l].size());
-            for (const auto& edge : upper_layers_[l]) {
-                snap.upper_layers[l].push_back(HNSWLayerEdge{edge.node, edge.neighbors});
-            }
-        }
+        snap.upper_layers = upper_layers_;
         return snap;
     }
 
@@ -221,41 +211,9 @@ public:
     size_t dim() const { return params_.dim; }
     bool is_finalized() const { return finalized_; }
     const Graph& graph() const { return graph_; }
+    uint64_t rotation_seed() const { return encoder_.rotation_seed(); }
 
-    float calibration_affine_a() const { return calibration_.affine_a; }
-    float calibration_affine_b() const { return calibration_.affine_b; }
-    float calibration_ip_qo_floor() const { return calibration_.ip_qo_floor; }
-    float calibration_resid_sigma() const { return calibration_.resid_sigma; }
-    float calibration_resid_q99_dot() const { return calibration_.resid_q99_dot; }
-    float calibration_median_nn_dist_sq() const { return calibration_.median_nn_dist_sq; }
-    float calibration_corr() const { return calibration_.calibration_corr; }
-    bool calibration_calibrated() const { return calibration_.calibrated; }
-
-    CalibrationSnapshot get_calibration_snapshot() const {
-        CalibrationSnapshot snap;
-        snap.affine_a = calibration_.affine_a;
-        snap.affine_b = calibration_.affine_b;
-        snap.ip_qo_floor = calibration_.ip_qo_floor;
-        snap.resid_q99_dot = calibration_.resid_q99_dot;
-        snap.resid_sigma = calibration_.resid_sigma;
-        snap.median_nn_dist_sq = calibration_.median_nn_dist_sq;
-        snap.calibration_corr = calibration_.calibration_corr;
-        snap.flags = calibration_.calibrated ? 1u : 0u;
-        snap.evt = calibration_.evt;
-        return snap;
-    }
-
-    void set_calibration_snapshot(const CalibrationSnapshot& snap) {
-        calibration_.affine_a = snap.affine_a;
-        calibration_.affine_b = snap.affine_b;
-        calibration_.ip_qo_floor = snap.ip_qo_floor;
-        calibration_.resid_q99_dot = snap.resid_q99_dot;
-        calibration_.resid_sigma = snap.resid_sigma;
-        calibration_.median_nn_dist_sq = snap.median_nn_dist_sq;
-        calibration_.calibration_corr = snap.calibration_corr;
-        calibration_.calibrated = (snap.flags & 1u) != 0;
-        calibration_.evt = snap.evt;
-    }
+    const CalibrationSnapshot& get_calibration_snapshot() const { return calibration_; }
 
 private:
     IndexParams params_;
@@ -264,18 +222,7 @@ private:
     bool finalized_ = false;
     bool needs_build_ = false;
 
-    struct CalibrationState {
-        float affine_a = 1.0f;
-        float affine_b = 0.0f;
-        float ip_qo_floor = 0.0f;
-        float resid_sigma = 0.0f;
-        float resid_q99_dot = 0.0f;
-        float median_nn_dist_sq = 0.0f;
-        float calibration_corr = 0.0f;
-        bool calibrated = false;
-        EVTState evt;
-    };
-    CalibrationState calibration_;
+    CalibrationSnapshot calibration_;
 
     double mL_;
     std::mt19937_64 rng_;
@@ -286,35 +233,30 @@ private:
 
     std::vector<int> node_levels_;
 
-    struct UpperLayerEdge {
-        NodeId node;
-        std::vector<NodeId> neighbors;
-        bool operator<(const UpperLayerEdge& other) const { return node < other.node; }
-    };
-    std::vector<std::vector<UpperLayerEdge>> upper_layers_;
+    std::vector<std::vector<HNSWLayerEdge>> upper_layers_;
 
-    UpperLayerEdge* find_edge(int level, NodeId node) {
+    HNSWLayerEdge* find_edge(int level, NodeId node) {
         auto& layer = upper_layers_[level - 1];
-        UpperLayerEdge target{node, {}};
+        HNSWLayerEdge target{node, {}};
         auto it = std::lower_bound(layer.begin(), layer.end(), target);
         if (it != layer.end() && it->node == node) return &(*it);
         return nullptr;
     }
 
-    const UpperLayerEdge* find_edge(int level, NodeId node) const {
+    const HNSWLayerEdge* find_edge(int level, NodeId node) const {
         const auto& layer = upper_layers_[level - 1];
-        UpperLayerEdge target{node, {}};
+        HNSWLayerEdge target{node, {}};
         auto it = std::lower_bound(layer.begin(), layer.end(), target);
         if (it != layer.end() && it->node == node) return &(*it);
         return nullptr;
     }
 
-    UpperLayerEdge& get_or_create_edge(int level, NodeId node) {
+    HNSWLayerEdge& get_or_create_edge(int level, NodeId node) {
         auto& layer = upper_layers_[level - 1];
-        UpperLayerEdge target{node, {}};
+        HNSWLayerEdge target{node, {}};
         auto it = std::lower_bound(layer.begin(), layer.end(), target);
         if (it != layer.end() && it->node == node) return *it;
-        return *layer.insert(it, UpperLayerEdge{node, {}});
+        return *layer.insert(it, HNSWLayerEdge{node, {}});
     }
 
     void assign_layers(size_t n) {
@@ -326,7 +268,7 @@ private:
 
         for (size_t i = 0; i < n; ++i) {
             double r = dist(rng_);
-            if (r < 1e-15) r = 1e-15;
+            if (r < constants::kMinLayerRandom) r = constants::kMinLayerRandom;
             int level = static_cast<int>(-std::log(r) * mL_);
             node_levels_[i] = level;
             if (level > max_level_) {
@@ -347,15 +289,15 @@ private:
                   [this](NodeId a, NodeId b) { return node_levels_[a] > node_levels_[b]; });
 
         std::vector<float> upper_nn_dists;
-        for (size_t idx = 0; idx < n && upper_nn_dists.size() < 200; ++idx) {
+        for (size_t idx = 0; idx < n && upper_nn_dists.size() < constants::kUpperLayerDistSamples; ++idx) {
             NodeId node = insertion_order[idx];
             if (node_levels_[node] == 0) break;
             float best = std::numeric_limits<float>::max();
-            for (size_t jdx = 0; jdx < n && jdx < 500; ++jdx) {
+            for (size_t jdx = 0; jdx < n && jdx < constants::kUpperLayerNnLimit; ++jdx) {
                 NodeId other = insertion_order[jdx];
                 if (other == node) continue;
                 if (node_levels_[other] == 0) break;
-                float d = exact_distance(graph_.get_vector(node), graph_.get_vector(other));
+                float d = l2_distance_simd<D>(graph_.get_vector(node), graph_.get_vector(other));
                 if (d < best) best = d;
             }
             if (best < std::numeric_limits<float>::max()) {
@@ -364,8 +306,8 @@ private:
         }
         if (!upper_nn_dists.empty()) {
             std::sort(upper_nn_dists.begin(), upper_nn_dists.end());
-            size_t p10 = upper_nn_dists.size() / 10;
-            upper_tau_ = upper_nn_dists[p10] * adaptive_defaults::tau_scaling_factor();
+            size_t p10 = upper_nn_dists.size() / constants::kTauPercentileDiv;
+            upper_tau_ = upper_nn_dists[p10] * constants::kTauScale;
         }
 
         for (size_t idx = 0; idx < n; ++idx) {
@@ -384,10 +326,10 @@ private:
                     graph_.get_vector(node), ep, level, upper_ef);
 
                 auto dist_fn = [this](NodeId a, NodeId b) {
-                    return exact_distance(graph_.get_vector(a), graph_.get_vector(b));
+                    return l2_distance_simd<D>(graph_.get_vector(a), graph_.get_vector(b));
                 };
                 auto selected = select_neighbors_alpha_cng(
-                    std::move(candidates), M_UPPER, dist_fn, zero_error,
+                    std::move(candidates), M_UPPER, dist_fn, [](NodeId) { return 0.0f; },
                     adaptive_defaults::alpha_default(D), upper_tau_);
 
                 auto& node_neighbors = get_or_create_edge(level, node).neighbors;
@@ -416,7 +358,7 @@ private:
     NodeId greedy_search_layer(const float* query, NodeId ep, int level) const {
         if (ep == INVALID_NODE) return INVALID_NODE;
 
-        float best_dist = exact_distance(query, graph_.get_vector(ep));
+        float best_dist = l2_distance_simd<D>(query, graph_.get_vector(ep));
         NodeId best_id = ep;
         bool improved = true;
 
@@ -426,7 +368,7 @@ private:
             if (!edge) break;
             const auto& neighbors = edge->neighbors;
             for (NodeId nb : neighbors) {
-                float d = exact_distance(query, graph_.get_vector(nb));
+                float d = l2_distance_simd<D>(query, graph_.get_vector(nb));
                 if (d < best_dist) {
                     best_dist = d;
                     best_id = nb;
@@ -446,7 +388,7 @@ private:
         MinHeap candidates;
         MaxHeap nearest;
 
-        float ep_dist = exact_distance(query, graph_.get_vector(ep));
+        float ep_dist = l2_distance_simd<D>(query, graph_.get_vector(ep));
         candidates.push({ep, ep_dist});
         nearest.push({ep, ep_dist});
 
@@ -471,7 +413,7 @@ private:
             for (NodeId nb : neighbors) {
                 if (visited_table.check_and_mark(nb, qid)) continue;
 
-                float d = exact_distance(query, graph_.get_vector(nb));
+                float d = l2_distance_simd<D>(query, graph_.get_vector(nb));
 
                 if (nearest.size() < ef || d < nearest.top().distance) {
                     candidates.push({nb, d});
@@ -501,15 +443,15 @@ private:
         std::vector<NeighborCandidate> candidates;
         candidates.reserve(nb.size());
         for (NodeId id : nb) {
-            float d = exact_distance(vec, graph_.get_vector(id));
+            float d = l2_distance_simd<D>(vec, graph_.get_vector(id));
             candidates.push_back({id, d});
         }
 
         auto dist_fn = [this](NodeId a, NodeId b) {
-            return exact_distance(graph_.get_vector(a), graph_.get_vector(b));
+            return l2_distance_simd<D>(graph_.get_vector(a), graph_.get_vector(b));
         };
         auto selected = select_neighbors_alpha_cng(
-            std::move(candidates), M_UPPER, dist_fn, zero_error,
+            std::move(candidates), M_UPPER, dist_fn, [](NodeId) { return 0.0f; },
             adaptive_defaults::alpha_default(D), upper_tau_);
         nb.clear();
         nb.reserve(selected.size());
@@ -519,18 +461,15 @@ private:
     }
 
     void calibrate_estimator(size_t num_samples) {
-        constexpr float kEvtThresholdQ = 0.90f;
-        constexpr size_t kEvtMinTail = 64;
-        constexpr float kEdgeNopQuantile = 0.95f;
         size_t n = graph_.size();
-        if (n < 50) {
+        if (n < constants::kMinCalibNodes) {
             throw std::runtime_error("Calibration requires at least 50 nodes.");
         }
 
         num_samples = std::min(num_samples, n);
 
         // Mix DB and synthetic queries for calibration coverage.
-        std::mt19937 rng(static_cast<uint32_t>(DEFAULT_LAYER_SEED + DEFAULT_CALIBRATION_SEED));
+        std::mt19937 rng(static_cast<uint32_t>(constants::kDefaultLayerSeed + constants::kDefaultCalibrationSeed));
         std::vector<size_t> indices(n);
         std::iota(indices.begin(), indices.end(), 0);
         std::shuffle(indices.begin(), indices.end(), rng);
@@ -539,7 +478,7 @@ private:
         size_t n_synth = std::min(num_samples / 2, n);
 
         std::vector<float> dim_var(D, 0.0f);
-        size_t var_sample = std::min(n, size_t(500));
+        size_t var_sample = std::min(n, constants::kVarEstSamples);
         for (size_t i = 0; i < var_sample; ++i) {
             const float* v = graph_.get_vector(static_cast<NodeId>(indices[i]));
             for (size_t d = 0; d < D; ++d) {
@@ -556,7 +495,7 @@ private:
         for (size_t d = 0; d < D; ++d) {
             dim_mean[d] /= static_cast<float>(var_sample);
             dim_var[d] = dim_var[d] / static_cast<float>(var_sample) - dim_mean[d] * dim_mean[d];
-            if (dim_var[d] < 1e-12f) dim_var[d] = 1e-12f;
+            if (dim_var[d] < constants::kNearZeroSq) dim_var[d] = constants::kNearZeroSq;
         }
 
         std::vector<float> ip_qo_values;
@@ -600,17 +539,17 @@ private:
 
             float dist_qp_sq = l2_distance_simd<D>(query_vec, graph_.get_vector(parent));
 
-            size_t num_batches = (pnb.size() + 31) / 32;
+            size_t num_batches = (pnb.size() + constants::kFastScanBatch - 1) / constants::kFastScanBatch;
             for (size_t batch = 0; batch < num_batches; ++batch) {
-                size_t batch_start = batch * 32;
-                size_t batch_count = std::min(size_t(32), pnb.size() - batch_start);
+                size_t batch_start = batch * constants::kFastScanBatch;
+                size_t batch_count = std::min(constants::kFastScanBatch, pnb.size() - batch_start);
 
-                alignas(64) uint32_t fastscan_sums[32];
+                alignas(64) uint32_t fastscan_sums[constants::kFastScanBatch];
                 if constexpr (BitWidth == 1) {
                     fastscan::compute_inner_products(
                         encoded.lut, pnb.code_blocks[batch], fastscan_sums);
                 } else {
-                    alignas(64) uint32_t msb_sums[32];
+                    alignas(64) uint32_t msb_sums[constants::kFastScanBatch];
                     fastscan::compute_nbit_inner_products<D, BitWidth>(
                         encoded.lut, pnb.code_blocks[batch],
                         fastscan_sums, msb_sums);
@@ -625,7 +564,7 @@ private:
                     ip_qo_values.push_back(ip_qo);
 
                     float nop = pnb.nop[ni];
-                    if (nop < 1e-12f) continue;
+                    if (nop < constants::kNearZeroSq) continue;
                     nop_samples.push_back(nop);
 
                     float A = encoded.coeff_fastscan;
@@ -644,7 +583,7 @@ private:
                     }
 
                     float ip_corrected = ip_approx - pnb.ip_cp[ni];
-                    if (std::abs(ip_qo) < adaptive_defaults::ip_quality_epsilon()) continue;
+                    if (std::abs(ip_qo) < constants::kIpQualityEps) continue;
 
                     const float* p_vec = graph_.get_vector(parent);
                     const float* o_vec = graph_.get_vector(neighbor);
@@ -680,7 +619,7 @@ private:
             throw std::runtime_error("Calibration failed: no ip_qo samples.");
         }
         std::sort(ip_qo_values.begin(), ip_qo_values.end());
-        size_t p5_idx = ip_qo_values.size() * 5 / 100;
+        size_t p5_idx = ip_qo_values.size() * constants::kIpQoFloorPct / 100;
         calibration_.ip_qo_floor = ip_qo_values[p5_idx];
 
         std::vector<float> floored_estimates;
@@ -690,11 +629,12 @@ private:
             floored_estimates.push_back(per_sample_ip_corrected[i] / floored_qo);
         }
 
-        if (floored_estimates.size() < 20) {
+        if (floored_estimates.size() < constants::kMinAffineSamples) {
             throw std::runtime_error("Calibration failed: too few estimator/target pairs.");
         }
 
-        // Affine fit: T ~= aE + b.
+        // Huber IRLS affine fit: T ~= aE + b.
+        // Step 1: OLS seed.
         size_t np = floored_estimates.size();
         double sum_e = 0, sum_t = 0, sum_ee = 0, sum_et = 0;
         for (size_t i = 0; i < np; ++i) {
@@ -710,12 +650,56 @@ private:
         double var_e = sum_ee / np - mean_e * mean_e;
         double cov_et = sum_et / np - mean_e * mean_t;
 
-        if (var_e > 1e-12) {
-            calibration_.affine_a = static_cast<float>(cov_et / var_e);
-            calibration_.affine_b = static_cast<float>(mean_t - (cov_et / var_e) * mean_e);
+        double a = 1.0, b = 0.0;
+        if (var_e > constants::kNearZeroSq) {
+            a = cov_et / var_e;
+            b = mean_t - a * mean_e;
         }
 
+        // Step 2: IRLS with Huber weights.
         std::vector<float> abs_residuals(np);
+        for (int iter = 0; iter < constants::kHuberMaxIter; ++iter) {
+            // Compute residuals and MAD.
+            for (size_t i = 0; i < np; ++i) {
+                float r = truths[i] - static_cast<float>(a * floored_estimates[i] + b);
+                abs_residuals[i] = std::abs(r);
+            }
+            std::sort(abs_residuals.begin(), abs_residuals.end());
+            float mad = abs_residuals[np / 2];
+            float huber_delta = constants::kHuberDeltaScale * constants::kMadNormFactor * mad;
+            if (huber_delta < constants::kNearZeroSq) break;
+
+            // Weighted least squares with Huber weights.
+            double wsum_e = 0, wsum_t = 0, wsum_ee = 0, wsum_et = 0, wsum = 0;
+            for (size_t i = 0; i < np; ++i) {
+                float r = truths[i] - static_cast<float>(a * floored_estimates[i] + b);
+                float ar = std::abs(r);
+                float w = (ar <= huber_delta) ? 1.0f : huber_delta / ar;
+                double wd = w;
+                double e = floored_estimates[i];
+                double t = truths[i];
+                wsum += wd;
+                wsum_e += wd * e;
+                wsum_t += wd * t;
+                wsum_ee += wd * e * e;
+                wsum_et += wd * e * t;
+            }
+            double wm_e = wsum_e / wsum;
+            double wm_t = wsum_t / wsum;
+            double wvar = wsum_ee / wsum - wm_e * wm_e;
+            double wcov = wsum_et / wsum - wm_e * wm_t;
+            if (wvar > constants::kNearZeroSq) {
+                a = wcov / wvar;
+                b = wm_t - a * wm_e;
+            }
+        }
+
+        // Clamp affine_a to prevent extreme values.
+        calibration_.affine_a = std::clamp(static_cast<float>(a),
+            constants::kAffineAMin, constants::kAffineAMax);
+        calibration_.affine_b = static_cast<float>(b);
+
+        // Final residual statistics.
         double sum_r2 = 0;
         for (size_t i = 0; i < np; ++i) {
             float predicted = calibration_.affine_a * floored_estimates[i] + calibration_.affine_b;
@@ -725,7 +709,7 @@ private:
         }
         calibration_.resid_sigma = static_cast<float>(std::sqrt(sum_r2 / np));
         std::sort(abs_residuals.begin(), abs_residuals.end());
-        calibration_.resid_q99_dot = abs_residuals[np * 99 / 100];
+        calibration_.resid_q99_dot = abs_residuals[np * constants::kResidQuantilePct / 100];
 
         double sum_tt = 0;
         for (size_t i = 0; i < np; ++i) {
@@ -733,7 +717,7 @@ private:
         }
         double var_t = sum_tt / np - mean_t * mean_t;
         double denom_corr = std::sqrt(var_e * var_t);
-        calibration_.calibration_corr = (denom_corr > 1e-12)
+        calibration_.calibration_corr = (denom_corr > constants::kNearZeroSq)
             ? static_cast<float>(cov_et / denom_corr) : 0.0f;
 
         if (!nn_dists_sq.empty()) {
@@ -741,18 +725,18 @@ private:
             calibration_.median_nn_dist_sq = nn_dists_sq[nn_dists_sq.size() / 2];
         }
 
-        calibration_.calibrated = true;
+        calibration_.flags = 1u;
 
         // Fit EVT tail on |residual| for risk-to-slack conversion.
         calibration_.evt = evt_crc::fit_gpd(
-            abs_residuals.data(), np, kEvtThresholdQ, kEvtMinTail);
+            abs_residuals.data(), np, constants::kEvtThresholdQ, constants::kEvtMinTail);
 
         if (nop_samples.empty()) {
             throw std::runtime_error("Calibration failed: no nop samples for EVT.");
         }
         std::sort(nop_samples.begin(), nop_samples.end());
         size_t p95_idx = static_cast<size_t>(
-            static_cast<float>(nop_samples.size()) * kEdgeNopQuantile);
+            static_cast<float>(nop_samples.size()) * constants::kEdgeNopQuantile);
         p95_idx = std::min(p95_idx, nop_samples.size() - 1);
         calibration_.evt.nop_p95 = nop_samples[p95_idx];
 
@@ -760,12 +744,6 @@ private:
             throw std::runtime_error("Calibration failed: EVT-CRC fit did not converge.");
         }
 
-    }
-
-    static float zero_error(NodeId) { return 0.0f; }
-
-    static float exact_distance(const float* a, const float* b) {
-        return l2_distance_simd<D>(a, b);
     }
 };
 

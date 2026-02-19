@@ -8,7 +8,6 @@
 #include "../encoder/rabitq_encoder.hpp"
 #include "rabitq_graph.hpp"
 #include "neighbor_selection.hpp"
-#include "../api/params.hpp"
 #include <vector>
 #include <algorithm>
 #include <numeric>
@@ -29,8 +28,21 @@ struct WorkingNeighbor {
 
 
 template <size_t D, size_t R, size_t BitWidth, typename EncType>
-void write_neighbors(RaBitQGraph<D, R, BitWidth>& graph, const EncType& encoder,
-                     NodeId node, const std::vector<NeighborCandidate>& selected) {
+void prune_and_write(RaBitQGraph<D, R, BitWidth>& graph, const EncType& encoder,
+                     NodeId node, std::vector<NeighborCandidate>& candidates,
+                     float alpha, float tau, float error_tolerance = 0.0f,
+                     float alpha_max = 0.0f) {
+    auto dist_fn = [&](NodeId a, NodeId b) -> float {
+        return l2_distance_simd<D>(graph.get_vector(a), graph.get_vector(b));
+    };
+    auto error_fn = [&](NodeId nid) -> float {
+        const auto& code = graph.get_code(nid);
+        return error_tolerance * code.nop;
+    };
+
+    auto selected = select_neighbors_alpha_cng(
+        std::move(candidates), R, dist_fn, error_fn, alpha, tau, alpha_max);
+
     auto& nb = graph.get_neighbors(node);
     nb.count = 0;
     const float* vec_node = graph.get_vector(node);
@@ -43,10 +55,9 @@ void write_neighbors(RaBitQGraph<D, R, BitWidth>& graph, const EncType& encoder,
         const float* vec_v = graph.get_vector(v);
 
         if constexpr (BitWidth == 1) {
-            const auto& code_v = graph.get_code(v);
             BinaryCodeStorage<EncType::DIMS> pr_code;
             VertexAuxData aux = encoder.compute_neighbor_aux(
-                code_v, vec_node, vec_v, rotated_parent, &pr_code);
+                vec_node, vec_v, rotated_parent, pr_code);
             nb.set_neighbor(j, v, pr_code, aux);
         } else {
             auto nbit_result = encoder.compute_neighbor_aux_nbit(
@@ -54,27 +65,6 @@ void write_neighbors(RaBitQGraph<D, R, BitWidth>& graph, const EncType& encoder,
             nb.set_neighbor(j, v, nbit_result.code, nbit_result.aux);
         }
     }
-}
-
-
-template <size_t D, size_t R, size_t BitWidth, typename EncType>
-void prune_and_write(RaBitQGraph<D, R, BitWidth>& graph, const EncType& encoder,
-                     NodeId node, std::vector<NeighborCandidate>& candidates,
-                     float alpha, float tau, float error_tolerance = 0.0f,
-                     float resid_sigma = 1.0f) {
-    auto dist_fn = [&](NodeId a, NodeId b) -> float {
-        return l2_distance_simd<D>(graph.get_vector(a), graph.get_vector(b));
-    };
-    auto error_fn = [&](NodeId nid) -> float {
-        if (error_tolerance <= 0.0f) return 0.0f;
-        const auto& code = graph.get_code(nid);
-        return error_tolerance * resid_sigma * code.nop;
-    };
-
-    auto selected = select_neighbors_alpha_cng(
-        std::move(candidates), R, dist_fn, error_fn, alpha, tau);
-
-    write_neighbors<D, R, BitWidth>(graph, encoder, node, selected);
 }
 
 
@@ -100,8 +90,12 @@ void init_working_random(
             std::uniform_int_distribution<size_t> dist(0, n - 1);
 
             std::vector<WorkingNeighbor> candidates;
-            size_t pool_size = adaptive_defaults::random_init_pool(R, n);
-            size_t max_attempts = adaptive_defaults::random_init_attempts(R, n);
+            // Coupon-collector bound for random init pool
+            size_t pool_size = std::min(
+                static_cast<size_t>(static_cast<double>(R) *
+                    std::ceil(std::log(std::max(static_cast<double>(n) / static_cast<double>(R), 2.0)))),
+                n - 1);
+            size_t max_attempts = std::min(pool_size + pool_size / 2, n);
             candidates.reserve(pool_size);
             for (size_t j = 0; j < max_attempts && candidates.size() < pool_size; ++j) {
                 NodeId v = static_cast<NodeId>(dist(rng));
@@ -246,17 +240,13 @@ size_t nndescent_join_pass(
                 if (wl.size() < R) {
                     wl.push_back({w, d});
                     new_flags[i].push_back(1);
-                    for (size_t p = wl.size() - 1; p > 0 && wl[p].distance < wl[p-1].distance; --p) {
-                        std::swap(wl[p], wl[p-1]);
-                        std::swap(new_flags[i][p], new_flags[i][p-1]);
-                    }
                 } else {
                     wl.back() = {w, d};
                     new_flags[i].back() = 1;
-                    for (size_t p = wl.size() - 1; p > 0 && wl[p].distance < wl[p-1].distance; --p) {
-                        std::swap(wl[p], wl[p-1]);
-                        std::swap(new_flags[i][p], new_flags[i][p-1]);
-                    }
+                }
+                for (size_t p = wl.size() - 1; p > 0 && wl[p].distance < wl[p-1].distance; --p) {
+                    std::swap(wl[p], wl[p-1]);
+                    std::swap(new_flags[i][p], new_flags[i][p-1]);
                 }
 
                 worst = (wl.size() >= R) ? wl.back().distance : std::numeric_limits<float>::max();
@@ -273,20 +263,16 @@ size_t nndescent_join_pass(
 }
 
 
-struct AlphaTauResult {
-    float alpha;
-    float tau;
-};
-
+// Populates GraphStats with neighbor distance distribution, alpha, tau, alpha_max
 template <size_t D, size_t R, size_t BitWidth>
-AlphaTauResult derive_alpha_tau_from_working(
+GraphStats derive_graph_stats(
     const RaBitQGraph<D, R, BitWidth>& graph,
     const std::vector<std::vector<WorkingNeighbor>>& working,
-    size_t sample_size = 0)
+    size_t sample_size)
 {
+    GraphStats stats;
     size_t n = working.size();
-    if (n == 0) return {adaptive_defaults::alpha_default(D), 0.0f};
-    if (sample_size == 0) sample_size = adaptive_defaults::alpha_sample_size(n);
+    if (n == 0) return stats;
 
     size_t actual_sample = std::min(sample_size, n);
     std::mt19937 rng(static_cast<uint32_t>(constants::kDefaultGraphSeed + 1));
@@ -302,6 +288,18 @@ AlphaTauResult derive_alpha_tau_from_working(
     inter_neighbor_dists.reserve(actual_sample * R);
     nn_dists.reserve(actual_sample);
 
+    // Degree statistics (from full working set, not just sample)
+    float total_degree = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        total_degree += static_cast<float>(working[i].size());
+    }
+    stats.avg_degree = total_degree / static_cast<float>(std::max(n, size_t(1)));
+
+    // Inter-neighbor limit: 2·√R, floored at 4 for ≥6 pairs
+    size_t inter_limit_val = std::clamp(
+        static_cast<size_t>(2.0 * std::sqrt(static_cast<double>(R))),
+        size_t(4), static_cast<size_t>(R));
+
     for (size_t idx : sample_indices) {
         const auto& wl = working[idx];
         for (const auto& nb : wl) {
@@ -312,7 +310,7 @@ AlphaTauResult derive_alpha_tau_from_working(
         if (!wl.empty() && wl[0].id != INVALID_NODE) {
             nn_dists.push_back(wl[0].distance);
         }
-        size_t inter_limit = std::min(wl.size(), adaptive_defaults::alpha_inter_limit(R));
+        size_t inter_limit = std::min(wl.size(), inter_limit_val);
         for (size_t j = 0; j < inter_limit; ++j) {
             for (size_t k = j + 1; k < inter_limit; ++k) {
                 if (wl[j].id == INVALID_NODE || wl[k].id == INVALID_NODE) continue;
@@ -323,33 +321,65 @@ AlphaTauResult derive_alpha_tau_from_working(
         }
     }
 
-    if (neighbor_dists.empty() || inter_neighbor_dists.empty()) {
-        return {adaptive_defaults::alpha_default(D), 0.0f};
+    if (neighbor_dists.empty() || inter_neighbor_dists.empty() || nn_dists.empty()) {
+        stats.alpha = 1.0f;
+        stats.tau = 0.0f;
+        stats.alpha_max = 4.0f;
+        return stats;
     }
 
     std::sort(neighbor_dists.begin(), neighbor_dists.end());
     std::sort(inter_neighbor_dists.begin(), inter_neighbor_dists.end());
+    std::sort(nn_dists.begin(), nn_dists.end());
 
-    float d_med = neighbor_dists[neighbor_dists.size() / 2];
-    float d_inter = inter_neighbor_dists[inter_neighbor_dists.size() / constants::kAlphaPercentileDiv];
+    // Neighbor distance statistics
+    size_t nd_n = neighbor_dists.size();
+    float neighbor_dist_median = neighbor_dists[nd_n / 2];
+    float nd_q1 = neighbor_dists[nd_n / 4];
+    float nd_q3 = neighbor_dists[3 * nd_n / 4];
+    float neighbor_q3_over_q1 = (nd_q1 > constants::norm_epsilon(D))
+        ? nd_q3 / nd_q1 : 2.0f;
 
-    float alpha;
+    // Neighbor distance CV
+    float nd_mean = 0.0f;
+    for (float d : neighbor_dists) nd_mean += d;
+    nd_mean /= static_cast<float>(nd_n);
+    float nd_var = 0.0f;
+    for (float d : neighbor_dists) nd_var += (d - nd_mean) * (d - nd_mean);
+    nd_var /= static_cast<float>(nd_n);
+    float neighbor_dist_cv = (nd_mean > constants::norm_epsilon(D))
+        ? std::sqrt(nd_var) / nd_mean : 0.2f;
+
+    // NN distance MAD-sigma (robust standard deviation)
+    float nn_median = nn_dists[nn_dists.size() / 2];
+    std::vector<float> nn_abs_devs(nn_dists.size());
+    for (size_t i = 0; i < nn_dists.size(); ++i)
+        nn_abs_devs[i] = std::abs(nn_dists[i] - nn_median);
+    std::sort(nn_abs_devs.begin(), nn_abs_devs.end());
+    float nn_mad = nn_abs_devs[nn_abs_devs.size() / 2];
+    float nn_dist_mad_sigma = constants::kMadNormFactor * nn_mad;
+
+    // Alpha: ratio of median neighbor dist to inter-neighbor density
+    float d_inter = inter_neighbor_dists[inter_neighbor_dists.size() / 4];
+
     if (d_inter < constants::norm_epsilon(D)) {
-        alpha = adaptive_defaults::alpha_default(D);
+        stats.alpha = 1.0f + neighbor_dist_cv;
     } else {
-        alpha = std::max(1.0f, d_med / d_inter);
-        alpha = std::min(alpha, constants::kAlphaCeiling);
-        if (alpha < constants::kAlphaFloor) alpha = adaptive_defaults::alpha_default(D);
+        stats.alpha = neighbor_dist_median / d_inter;
     }
 
-    float tau = 0.0f;
-    if (!nn_dists.empty()) {
-        std::sort(nn_dists.begin(), nn_dists.end());
-        size_t p10_idx = nn_dists.size() / 10;
-        tau = nn_dists[p10_idx] * constants::kTauScale;
-    }
+    // Alpha clamp: Q3/Q1 ratio of neighbor distances (inherent spread),
+    // capped at 5.0 (pruning at 5x nearest distance is effectively no pruning)
+    stats.alpha_max = std::min(neighbor_q3_over_q1, 5.0f);
+    stats.alpha = std::clamp(stats.alpha, 1.0f, stats.alpha_max);
 
-    return {alpha, tau};
+    // Select_neighbors alpha_max: 2·alpha (sqrt scaling cannot more than double base)
+    stats.alpha_max = std::max(stats.alpha_max, 2.0f * stats.alpha);
+
+    // Tau: one robust standard deviation of NN distances
+    stats.tau = nn_dist_mad_sigma;
+
+    return stats;
 }
 
 
@@ -357,7 +387,7 @@ template <size_t D, size_t R, size_t BitWidth, typename EncType>
 void run_reverse_edge_pass(RaBitQGraph<D, R, BitWidth>& graph, const EncType& encoder,
                            float alpha, float tau, float error_tolerance,
                            size_t actual_threads, size_t omp_chunk,
-                           float resid_sigma = 1.0f) {
+                           float alpha_max = 0.0f) {
     size_t n = graph.size();
 
     std::vector<std::vector<NeighborCandidate>> reverse_cands(n);
@@ -394,29 +424,32 @@ void run_reverse_edge_pass(RaBitQGraph<D, R, BitWidth>& graph, const EncType& en
             all.push_back(cand);
         }
 
-        prune_and_write<D, R, BitWidth>(graph, encoder, v, all, alpha, tau, error_tolerance, resid_sigma);
+        prune_and_write<D, R, BitWidth>(graph, encoder, v, all, alpha, tau, error_tolerance, alpha_max);
     }
 }
 
 
+template <size_t D, size_t R, size_t BitWidth>
+struct GraphOptimizeResult {
+    typename RaBitQGraph<D, R, BitWidth>::Permutation perm;
+    GraphStats stats;
+};
+
 template <size_t D, size_t R, size_t BitWidth, typename EncType>
-typename RaBitQGraph<D, R, BitWidth>::Permutation
-optimize_graph_adaptive(RaBitQGraph<D, R, BitWidth>& graph, const EncType& encoder,
-                        float resid_sigma = 1.0f) {
+GraphOptimizeResult<D, R, BitWidth>
+optimize_graph_adaptive(RaBitQGraph<D, R, BitWidth>& graph, const EncType& encoder) {
     using Permutation = typename RaBitQGraph<D, R, BitWidth>::Permutation;
     size_t n = graph.size();
-    if (n == 0) return Permutation{};
+    if (n == 0) return {Permutation{}, GraphStats{}};
 
     size_t actual_threads = static_cast<size_t>(omp_get_max_threads());
-    float error_tolerance = adaptive_defaults::error_tolerance(D);
+    // Error tolerance ∝ 1/√D: RaBitQ per-coordinate quantization error is O(1/√D)
+    // by CLT averaging over D independent coordinate errors.
+    float error_tolerance = 1.0f / std::sqrt(static_cast<float>(D));
     size_t omp_chunk = adaptive_defaults::omp_chunk_size(n, actual_threads);
 
-    float delta = adaptive_defaults::nndescent_delta(n, R);
-    size_t delta_threshold = std::max<size_t>(1,
-        static_cast<size_t>(delta * static_cast<float>(n) * static_cast<float>(R)));
-    size_t max_iters = adaptive_defaults::nndescent_max_iters(n);
-
-    NodeId entry_point = graph.find_medoid();
+    auto centroid = graph.compute_centroid();
+    NodeId entry_point = graph.find_nearest_to_centroid(centroid);
     graph.set_entry_point(entry_point);
 
     std::vector<std::vector<WorkingNeighbor>> working(n);
@@ -428,17 +461,66 @@ optimize_graph_adaptive(RaBitQGraph<D, R, BitWidth>& graph, const EncType& encod
         new_flags[i].assign(working[i].size(), 1);
     }
 
-    for (size_t round = 0; round < max_iters; ++round) {
-        size_t updates = nndescent_join_pass<D, R, BitWidth>(graph, working, new_flags, actual_threads, omp_chunk);
+    // Adaptive NNDescent convergence: derive parameters from initial rounds
+    size_t total_edges = std::max(n * R, size_t(1));
 
-        if (updates <= delta_threshold) {
-            break;
-        }
+    // Phase 1: Run 2 unconditional rounds to measure convergence behavior
+    size_t updates_0 = nndescent_join_pass<D, R, BitWidth>(
+        graph, working, new_flags, actual_threads, omp_chunk);
+    float rate_0 = static_cast<float>(updates_0) / static_cast<float>(total_edges);
+
+    size_t updates_1 = nndescent_join_pass<D, R, BitWidth>(
+        graph, working, new_flags, actual_threads, omp_chunk);
+    float rate_1 = static_cast<float>(updates_1) / static_cast<float>(total_edges);
+
+    // EMA alpha from observed decay: faster decay → more responsive smoothing.
+    // Bounds [0.2, 0.8] define EMA window range [1.5, 9 rounds].
+    float decay_ratio = (rate_0 > constants::eps::kSmall) ? rate_1 / rate_0 : 0.5f;
+    float ema_alpha = std::clamp(1.0f - decay_ratio, 0.2f, 0.8f);
+
+    // Converge threshold: fewer than 1 expected update per edge relative to initial
+    float converge_rate = std::max(
+        rate_0 / static_cast<float>(total_edges),
+        1.0f / static_cast<float>(total_edges));
+
+    // Min rounds from geometric decay extrapolation
+    size_t min_rounds;
+    if (decay_ratio > 0.0f && decay_ratio < 1.0f && rate_0 > converge_rate) {
+        min_rounds = static_cast<size_t>(std::ceil(
+            std::log(converge_rate / rate_0) / std::log(decay_ratio)));
+        min_rounds = std::clamp(min_rounds, size_t(2),
+            static_cast<size_t>(std::sqrt(std::log2(
+                static_cast<float>(std::max(n, size_t(64)))))));
+    } else {
+        min_rounds = 2;
     }
 
-    AlphaTauResult alpha_tau = derive_alpha_tau_from_working<D, R, BitWidth>(graph, working, 0);
-    float alpha = alpha_tau.alpha;
-    float tau = alpha_tau.tau;
+    // Hard cap: 3x expected convergence time
+    size_t hard_cap = std::clamp(min_rounds * 3, size_t(10),
+        std::min(n, std::max(size_t(500), isqrt(n))));
+
+    // Phase 2: Continue with adaptive parameters
+    float ema_rate = ema_alpha * rate_1 + (1.0f - ema_alpha) * rate_0;
+    size_t total_rounds = 2;
+
+    for (size_t round = 2; round < hard_cap; ++round) {
+        size_t updates = nndescent_join_pass<D, R, BitWidth>(
+            graph, working, new_flags, actual_threads, omp_chunk);
+        float rate = static_cast<float>(updates) / static_cast<float>(total_edges);
+
+        ema_rate = ema_alpha * rate + (1.0f - ema_alpha) * ema_rate;
+        total_rounds = round + 1;
+
+        if (round >= min_rounds && ema_rate < converge_rate) break;
+    }
+
+    // Compute full graph statistics from working neighbor lists
+    size_t alpha_sample = static_cast<size_t>(std::sqrt(static_cast<double>(n)));
+    GraphStats stats = derive_graph_stats<D, R, BitWidth>(graph, working, alpha_sample);
+
+    float alpha = stats.alpha;
+    float tau = stats.tau;
+    float alpha_max = stats.alpha_max;
 
     #pragma omp parallel for schedule(dynamic, omp_chunk) num_threads(actual_threads)
     for (size_t i = 0; i < n; ++i) {
@@ -450,7 +532,8 @@ optimize_graph_adaptive(RaBitQGraph<D, R, BitWidth>& graph, const EncType& encod
                 candidates.push_back({nb.id, nb.distance});
             }
         }
-        prune_and_write<D, R, BitWidth>(graph, encoder, u, candidates, alpha, tau, error_tolerance, resid_sigma);
+        prune_and_write<D, R, BitWidth>(graph, encoder, u, candidates,
+            alpha, tau, error_tolerance, alpha_max);
     }
 
     working.clear();
@@ -458,15 +541,16 @@ optimize_graph_adaptive(RaBitQGraph<D, R, BitWidth>& graph, const EncType& encod
     new_flags.clear();
     new_flags.shrink_to_fit();
 
-    run_reverse_edge_pass<D, R, BitWidth>(graph, encoder, alpha, tau, error_tolerance, actual_threads, omp_chunk, resid_sigma);
+    run_reverse_edge_pass<D, R, BitWidth>(graph, encoder, alpha, tau,
+        error_tolerance, actual_threads, omp_chunk, alpha_max);
 
-    NodeId hub = graph.find_hub_entry();
+    NodeId hub = graph.find_hub_entry(centroid);
     graph.set_entry_point(hub);
 
     auto perm = graph.reorder_bfs(hub);
 
-    return perm;
+    return {perm, stats};
 }
 
-}  // namespace graph_refinement
-}  // namespace cphnsw
+}
+}

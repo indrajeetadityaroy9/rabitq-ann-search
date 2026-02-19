@@ -28,4 +28,4 @@ using MinHeap = std::priority_queue<SearchResult, std::vector<SearchResult>,
 using MaxHeap = std::priority_queue<SearchResult, std::vector<SearchResult>,
                                      std::less<SearchResult>>;
 
-}  // namespace cphnsw
+}

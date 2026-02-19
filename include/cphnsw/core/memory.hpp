@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <new>
 #include <vector>
+
 #include <immintrin.h>
 
 namespace cphnsw {
@@ -36,7 +37,6 @@ public:
     AlignedAllocator(const AlignedAllocator<U, Alignment>&) noexcept {}
 
     pointer allocate(size_type n) {
-        if (n == 0) return nullptr;
         size_t bytes = n * sizeof(T);
         bytes = ((bytes + Alignment - 1) / Alignment) * Alignment;
         void* ptr = std::aligned_alloc(Alignment, bytes);
@@ -45,18 +45,13 @@ public:
     }
 
     void deallocate(pointer p, size_type) noexcept {
-        if (p) std::free(p);
+        std::free(p);
     }
 
-    template <typename U, size_t A>
-    bool operator==(const AlignedAllocator<U, A>&) const noexcept {
-        return Alignment == A;
-    }
-
-    template <typename U, size_t A>
-    bool operator!=(const AlignedAllocator<U, A>&) const noexcept {
-        return Alignment != A;
-    }
+    template <typename U>
+    bool operator==(const AlignedAllocator<U, Alignment>&) const noexcept { return true; }
+    template <typename U>
+    bool operator!=(const AlignedAllocator<U, Alignment>&) const noexcept { return false; }
 };
 
 template <typename T, size_t Alignment = SIMD_ALIGNMENT>
@@ -100,4 +95,4 @@ inline float dot_product_simd(const float* a, const float* b) {
     return _mm_cvtss_f32(s);
 }
 
-}  // namespace cphnsw
+}

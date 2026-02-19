@@ -10,4 +10,4 @@ inline size_t next_power_of_two(size_t n) {
     return p;
 }
 
-}  // namespace cphnsw
+}

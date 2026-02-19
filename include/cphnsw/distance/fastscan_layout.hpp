@@ -11,7 +11,7 @@ template <size_t D, size_t BatchSize = 32>
 struct FastScanCodeBlock {
     static constexpr size_t DIMS = D;
     static constexpr size_t BATCH_SIZE = BatchSize;
-    static constexpr size_t NUM_SUB_SEGMENTS = (D + 3) / 4;
+    static constexpr size_t NUM_SUB_SEGMENTS = num_sub_segments<D>;
     static constexpr size_t NUM_SUB_PAIRS = (NUM_SUB_SEGMENTS + 1) / 2;
 
     alignas(64) uint8_t packed[NUM_SUB_PAIRS][BatchSize];
@@ -64,11 +64,6 @@ struct FastScanNeighborBlock {
 
     uint32_t count;
 
-    static_assert(offsetof(FastScanNeighborBlock, ip_qo) == offsetof(FastScanNeighborBlock, nop) + R * sizeof(float),
-                  "SoA arrays must be contiguous: nop -> ip_qo");
-    static_assert(offsetof(FastScanNeighborBlock, ip_cp) == offsetof(FastScanNeighborBlock, ip_qo) + R * sizeof(float),
-                  "SoA arrays must be contiguous: ip_qo -> ip_cp");
-
     FastScanNeighborBlock() : count(0) {
         std::memset(nop, 0, sizeof(nop));
         std::memset(ip_qo, 0, sizeof(ip_qo));
@@ -94,7 +89,6 @@ struct FastScanNeighborBlock {
     }
 
     size_t size() const { return count; }
-    bool empty() const { return count == 0; }
 };
 
 template <size_t D, size_t BitWidth, size_t BatchSize = 32>
@@ -133,11 +127,6 @@ struct NbitFastScanNeighborBlock {
     alignas(64) uint32_t neighbor_ids[R];
     uint32_t count;
 
-    static_assert(offsetof(NbitFastScanNeighborBlock, ip_qo) == offsetof(NbitFastScanNeighborBlock, nop) + R * sizeof(float),
-                  "SoA arrays must be contiguous: nop -> ip_qo");
-    static_assert(offsetof(NbitFastScanNeighborBlock, ip_cp) == offsetof(NbitFastScanNeighborBlock, ip_qo) + R * sizeof(float),
-                  "SoA arrays must be contiguous: ip_qo -> ip_cp");
-
     NbitFastScanNeighborBlock() : count(0) {
         std::memset(nop, 0, sizeof(nop));
         std::memset(ip_qo, 0, sizeof(ip_qo));
@@ -163,7 +152,6 @@ struct NbitFastScanNeighborBlock {
     }
 
     size_t size() const { return count; }
-    bool empty() const { return count == 0; }
 };
 
-}  // namespace cphnsw
+}

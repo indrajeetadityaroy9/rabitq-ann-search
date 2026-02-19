@@ -1,30 +1,27 @@
 #pragma once
 
 #include <cstddef>
+
 #include <immintrin.h>
 
 namespace cphnsw {
 
-inline void fht_scalar(float* vec, size_t len) {
-    for (size_t h = 1; h < len; h *= 2) {
-        for (size_t i = 0; i < len; i += h * 2) {
-            for (size_t j = i; j < i + h; ++j) {
-                float x = vec[j];
-                float y = vec[j + h];
-                vec[j] = x + y;
-                vec[j + h] = x - y;
-            }
-        }
-    }
-}
-
+// Unnormalized Walsh-Hadamard Transform (WHT) butterfly.
+//
+// This transform is NOT unitary: a single call on input of length `len`
+// scales the L2-norm by sqrt(len), because for the unnormalized WHT
+// ||WHT(x)||_2 = sqrt(len) * ||x||_2 (Parseval identity).
+//
+// Normalization is intentionally deferred: RaBitQEncoderBase applies three
+// consecutive passes via RandomHadamardRotation::apply(), accumulating a
+// total scale factor of sqrt(D)^3 = D * sqrt(D). The combined normalization
+// norm_factor_ = 1 / (D * sqrt(D)) is applied once after all three passes,
+// avoiding three separate per-pass division loops.
+//
+// Do NOT add per-call normalization here without updating norm_factor_ in
+// rabitq_encoder.hpp.
 inline void fht(float* vec, size_t len) {
     constexpr size_t SIMD_WIDTH = 8;
-
-    if (len < SIMD_WIDTH) {
-        fht_scalar(vec, len);
-        return;
-    }
 
     for (size_t i = 0; i < len; i += SIMD_WIDTH) {
         __m256 v = _mm256_loadu_ps(&vec[i]);
@@ -59,4 +56,4 @@ inline void fht(float* vec, size_t len) {
     }
 }
 
-}  // namespace cphnsw
+}

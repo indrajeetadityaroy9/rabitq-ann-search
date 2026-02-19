@@ -30,7 +30,10 @@ public:
     virtual bool is_finalized() const = 0;
 
     virtual std::vector<SearchResult>
-    search_raw(const float* query, const SearchRequest& request) const = 0;
+    search_raw(const float* query, size_t k) const = 0;
+
+    virtual void save(const std::string& path) const = 0;
+    virtual void load(const std::string& path) = 0;
 };
 
 template <size_t D, size_t BitWidth>
@@ -39,9 +42,7 @@ public:
     using IndexType = Index<D, 32, BitWidth>;
 
     explicit PyIndexWrapper(size_t dim) {
-        IndexParams params;
-        params.dim = dim;
-        index_ = std::make_unique<IndexType>(params);
+        index_ = std::make_unique<IndexType>(dim);
     }
 
     void build(const float* vecs, size_t n) override {
@@ -57,8 +58,16 @@ public:
     bool is_finalized() const override { return index_->is_finalized(); }
 
     std::vector<SearchResult>
-    search_raw(const float* query, const SearchRequest& request) const override {
-        return index_->search(query, request);
+    search_raw(const float* query, size_t k) const override {
+        return index_->search(query, k);
+    }
+
+    void save(const std::string& path) const override {
+        index_->save(path);
+    }
+
+    void load(const std::string& path) override {
+        index_->load(path);
     }
 
 private:
@@ -103,13 +112,6 @@ static std::unique_ptr<PyIndexBase> create_index(size_t dim, size_t bits) {
     }
 }
 
-static SearchRequest make_search_request(size_t k, float recall_target) {
-    SearchRequest req;
-    req.k = k;
-    req.target_recall = recall_target;
-    return req;
-}
-
 PYBIND11_MODULE(_core, m) {
     m.doc() = "Calibration-Parameterless HNSW (CP-HNSW)";
 
@@ -143,24 +145,22 @@ PYBIND11_MODULE(_core, m) {
 
         .def("search", [](const PyIndexBase& self,
                           py::array_t<float, py::array::c_style | py::array::forcecast> query,
-                          size_t k,
-                          float recall_target) {
+                          size_t k) {
             auto buf = query.request();
             if (buf.ndim != 1 || static_cast<size_t>(buf.shape[0]) != self.dim()) {
                 throw std::invalid_argument("query must be 1D and match index dimension");
             }
 
             const float* ptr = static_cast<const float*>(buf.ptr);
-            SearchRequest request = make_search_request(k, recall_target);
 
             std::vector<SearchResult> results;
             {
                 py::gil_scoped_release release;
-                results = self.search_raw(ptr, request);
+                results = self.search_raw(ptr, k);
             }
 
             const size_t n = results.size();
-            py::array_t<uint32_t> ids(n);
+            py::array_t<int64_t> ids(n);
             py::array_t<float> distances(n);
             auto* ids_ptr = ids.mutable_data();
             auto* dist_ptr = distances.mutable_data();
@@ -172,13 +172,11 @@ PYBIND11_MODULE(_core, m) {
         },
         py::arg("query"),
         py::arg("k") = constants::kDefaultK,
-        py::arg("recall_target") = constants::kDefaultRecall,
         "Search for nearest neighbors.")
 
         .def("search_batch", [](const PyIndexBase& self,
                                 py::array_t<float, py::array::c_style | py::array::forcecast> queries,
-                                size_t k,
-                                float recall_target) {
+                                size_t k) {
             auto buf = queries.request();
             if (buf.ndim != 2 || static_cast<size_t>(buf.shape[1]) != self.dim()) {
                 throw std::invalid_argument("queries must be a (n, dim) array");
@@ -187,8 +185,6 @@ PYBIND11_MODULE(_core, m) {
             const size_t n = static_cast<size_t>(buf.shape[0]);
             const float* ptr = static_cast<const float*>(buf.ptr);
             const size_t dim = self.dim();
-
-            SearchRequest request = make_search_request(k, recall_target);
 
             py::array_t<int64_t> ids({static_cast<py::ssize_t>(n), static_cast<py::ssize_t>(k)});
             py::array_t<float> distances({static_cast<py::ssize_t>(n), static_cast<py::ssize_t>(k)});
@@ -200,10 +196,9 @@ PYBIND11_MODULE(_core, m) {
                 const int actual_threads = omp_get_max_threads();
                 const size_t omp_chunk = adaptive_defaults::omp_chunk_size(
                     n, static_cast<size_t>(actual_threads));
-
 #pragma omp parallel for schedule(dynamic, omp_chunk) num_threads(actual_threads)
                 for (size_t i = 0; i < n; ++i) {
-                    auto results = self.search_raw(ptr + i * dim, request);
+                    auto results = self.search_raw(ptr + i * dim, k);
                     size_t j = 0;
                     for (; j < k && j < results.size(); ++j) {
                         ids_ptr[i * k + j] = static_cast<int64_t>(results[j].id);
@@ -220,8 +215,21 @@ PYBIND11_MODULE(_core, m) {
         },
         py::arg("queries"),
         py::arg("k") = constants::kDefaultK,
-        py::arg("recall_target") = constants::kDefaultRecall,
         "Batch search for nearest neighbors.")
+
+        .def("save", [](const PyIndexBase& self, const std::string& path) {
+            py::gil_scoped_release release;
+            self.save(path);
+        },
+        py::arg("path"),
+        "Save the finalized index to a binary file.")
+
+        .def("load", [](PyIndexBase& self, const std::string& path) {
+            py::gil_scoped_release release;
+            self.load(path);
+        },
+        py::arg("path"),
+        "Load an index from a binary file (replaces current state).")
 
         .def_property_readonly("size", &PyIndexBase::size,
                                "Total indexed nodes.")

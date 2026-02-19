@@ -2,7 +2,7 @@ run:
   output_dir: results
 
 data:
-  dataset: all          # or: sift1m, gist1m, openai1536, msmarco10m
+  dataset: all
   base_dir: data
 
 eval:

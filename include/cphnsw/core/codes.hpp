@@ -5,6 +5,9 @@
 
 namespace cphnsw {
 
+template <size_t D>
+constexpr size_t num_sub_segments = (D + 3) / 4;
+
 template <size_t Bits>
 struct alignas(64) BinaryCodeStorage {
     static constexpr size_t NUM_BITS = Bits;
@@ -46,6 +49,10 @@ struct RaBitQCode {
 
     BinaryCodeStorage<D> signs;
     float nop;
+    // L1-norm of the post-rotation, norm_factor_-scaled vector, divided by
+    // sqrt(D). Serves as the denominator in the distance estimator; the
+    // implicit ||x_bar|| factor cancels with a matching factor in the
+    // numerator (ip_corrected).
     float ip_qo;
 
     void clear() {
@@ -57,6 +64,13 @@ struct RaBitQCode {
 
 struct VertexAuxData {
     float nop;
+    // Inner product proxy between the quantized code and the rotated
+    // neighbor-offset direction. For 1-bit: ||rotated||_1 / sqrt(D).
+    // For N-bit: <c_bar, rotated> / sqrt(D) where c_bar = (2u-K)/K are
+    // UNNORMALIZED code values (not divided by ||c_bar||). This is NOT
+    // the true cosine <c_bar/||c_bar||, rotated>. The implicit ||c_bar||
+    // factor cancels in the ratio ip_corrected/ip_qo used in the distance
+    // estimator, since ip_corrected carries the same factor.
     float ip_qo;
     float ip_cp;
 };
@@ -64,7 +78,7 @@ struct VertexAuxData {
 template <size_t D>
 struct RaBitQQuery {
     static constexpr size_t DIMS = D;
-    static constexpr size_t NUM_SUB_SEGMENTS = (D + 3) / 4;
+    static constexpr size_t NUM_SUB_SEGMENTS = num_sub_segments<D>;
 
     alignas(64) uint8_t lut[NUM_SUB_SEGMENTS][16];
 
@@ -75,8 +89,6 @@ struct RaBitQQuery {
     float affine_a = 1.0f;
     float affine_b = 0.0f;
     float ip_qo_floor = 0.0f;
-    float resid_q99_dot = 0.0f;
-
     float dot_slack = 0.0f;
 };
 
@@ -129,15 +141,17 @@ struct NbitRaBitQCode {
 
     NbitCodeStorage<D, BitWidth> codes;
     float nop;
+    // Unnormalized N-bit inner product: sum((2u_i-K)/K * rotated[i]) /
+    // sqrt(D). NOT the cosine <c/||c||, rotated> — the ||c|| denominator
+    // is omitted but cancels in the ratio ip_corrected/ip_qo. See
+    // caq_quantize() in rabitq_encoder.hpp.
     float ip_qo;
-    uint16_t msb_popcount;
 
     void clear() {
         codes.clear();
         nop = 0.0f;
         ip_qo = 0.0f;
-        msb_popcount = 0;
     }
 };
 
-}  // namespace cphnsw
+}

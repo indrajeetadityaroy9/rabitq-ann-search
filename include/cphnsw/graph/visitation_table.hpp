@@ -16,20 +16,14 @@ public:
 
     VisitationTable(const VisitationTable&) = delete;
     VisitationTable& operator=(const VisitationTable&) = delete;
-
-    VisitationTable(VisitationTable&& other) noexcept
-        : epochs_(std::move(other.epochs_)),
-          capacity_(other.capacity_),
-          current_epoch_(other.current_epoch_) {
-        other.capacity_ = 0;
-    }
+    VisitationTable(VisitationTable&&) = delete;
+    VisitationTable& operator=(VisitationTable&&) = delete;
 
     uint64_t new_query() const {
         return ++current_epoch_;
     }
 
     bool check_and_mark(NodeId node_id, uint64_t query_id) const {
-        if (node_id >= capacity_) return true;
         if (epochs_[node_id] == query_id) return true;
         epochs_[node_id] = query_id;
         return false;
@@ -64,42 +58,31 @@ public:
 
     TwoLevelVisitationTable(const TwoLevelVisitationTable&) = delete;
     TwoLevelVisitationTable& operator=(const TwoLevelVisitationTable&) = delete;
-
-    TwoLevelVisitationTable(TwoLevelVisitationTable&& other) noexcept
-        : estimated_(std::move(other.estimated_)),
-          visited_(std::move(other.visited_)),
-          capacity_(other.capacity_),
-          current_epoch_(other.current_epoch_) {
-        other.capacity_ = 0;
-    }
+    TwoLevelVisitationTable(TwoLevelVisitationTable&&) = delete;
+    TwoLevelVisitationTable& operator=(TwoLevelVisitationTable&&) = delete;
 
     uint64_t new_query() const {
         return ++current_epoch_;
     }
 
     bool check_and_mark_estimated(NodeId node_id, uint64_t query_id) const {
-        if (node_id >= capacity_) return true;
         if (estimated_[node_id] == query_id) return true;
         estimated_[node_id] = query_id;
         return false;
     }
 
     bool check_and_mark_visited(NodeId node_id, uint64_t query_id) const {
-        if (node_id >= capacity_) return true;
         if (visited_[node_id] == query_id) return true;
         visited_[node_id] = query_id;
         return false;
     }
 
     bool is_visited(NodeId node_id, uint64_t query_id) const {
-        if (node_id >= capacity_) return true;
         return visited_[node_id] == query_id;
     }
 
     void prefetch_estimated(NodeId node_id) const {
-        if (node_id < capacity_) {
-            prefetch_t<0>(reinterpret_cast<const char*>(&estimated_[node_id]));
-        }
+        prefetch_t<0>(reinterpret_cast<const char*>(&estimated_[node_id]));
     }
 
     void resize(size_t new_capacity) {
@@ -124,4 +107,4 @@ private:
     mutable uint64_t current_epoch_;
 };
 
-}  // namespace cphnsw
+}

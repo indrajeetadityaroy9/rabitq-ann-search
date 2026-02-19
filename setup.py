@@ -29,7 +29,7 @@ class CMakeBuild(build_ext):
         ]
 
         build_temp = Path(self.build_temp) / ext.name
-        build_temp.mkdir(parents=True, exist_ok=False)
+        build_temp.mkdir(parents=True, exist_ok=True)
 
         subprocess.run(
             ["cmake", ext.sourcedir, *cmake_args],
@@ -42,8 +42,6 @@ class CMakeBuild(build_ext):
 
 
 setup(
-    name="cphnsw",
-    version="0.1.0",
     ext_modules=[CMakeExtension("cphnsw._core")],
     cmdclass={"build_ext": CMakeBuild},
 )

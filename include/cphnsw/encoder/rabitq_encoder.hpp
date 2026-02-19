@@ -7,7 +7,6 @@
 #include <cmath>
 #include <algorithm>
 #include <vector>
-#include <stdexcept>
 
 #include <omp.h>
 
@@ -18,20 +17,23 @@ class RaBitQEncoderBase {
 public:
     using QueryType = RaBitQQuery<D>;
 
-    static constexpr size_t NUM_SUB_SEGMENTS = (D + 3) / 4;
+    static constexpr size_t NUM_SUB_SEGMENTS = num_sub_segments<D>;
 
     explicit RaBitQEncoderBase(size_t dim,
         uint64_t rotation_seed = constants::kDefaultRotationSeed)
         : dim_(dim)
+        , rotation_seed_(rotation_seed)
         , rotation_(dim, rotation_seed)
         , padded_dim_(rotation_.padded_dim())
-        , centroid_(dim, 0.0f)
-        , has_centroid_(false) {
+        , centroid_(dim, 0.0f) {
 
-        if (padded_dim_ < D) {
-            throw std::invalid_argument("Padded dimension must be >= D");
-        }
-
+        // norm_factor_ compensates for three consecutive unnormalized WHT
+        // passes applied in RandomHadamardRotation::apply(). Each unnormalized
+        // WHT call on a vector of length D scales the L2-norm by sqrt(D) (see
+        // fht.hpp). Three passes accumulate: sqrt(D)^3 = D * sqrt(D).
+        // The diagonal sign-flip layers are unitary (norm-preserving).
+        // This single post-rotation multiply is equivalent to dividing by
+        // sqrt(D) after each of the three individual passes.
         float d_float = static_cast<float>(D);
         norm_factor_ = 1.0f / (d_float * std::sqrt(d_float));
         inv_sqrt_d_ = 1.0f / std::sqrt(d_float);
@@ -49,14 +51,11 @@ public:
         for (size_t j = 0; j < dim_; ++j) {
             centroid_[j] *= inv_n;
         }
-        has_centroid_ = true;
     }
 
     template <typename CodeType>
     void encode_batch(const float* vecs, size_t num_vecs, CodeType* codes) {
-        if (!has_centroid_ && num_vecs > 0) {
-            compute_centroid(vecs, num_vecs);
-        }
+        compute_centroid(vecs, num_vecs);
 
         #pragma omp parallel
         {
@@ -97,8 +96,6 @@ public:
     }
 
     void build_lut(const float* buf, uint8_t* q_bar_u, QueryType& query) const {
-        constexpr size_t NUM_SUB_SEGMENTS = (D + 3) / 4;
-
         float vl = buf[0], vmax = buf[0];
         for (size_t i = 1; i < padded_dim_; ++i) {
             if (buf[i] < vl) vl = buf[i];
@@ -106,7 +103,7 @@ public:
         }
 
         float delta = (vmax - vl) / constants::kLutLevels;
-        if (delta < constants::kDivisionEps) delta = constants::kDivisionEps;
+        if (delta < constants::eps::kTiny) delta = constants::eps::kTiny;
         float inv_delta = 1.0f / delta;
 
         float sum_qu = 0.0f;
@@ -138,70 +135,63 @@ public:
         query.coeff_constant = -(Df * vl + delta * sum_qu) * inv_sqrt_d_;
     }
 
-    template <typename CodeType>
     VertexAuxData compute_neighbor_aux(
-        const CodeType& neighbor_code,
         const float* parent_vec,
         const float* neighbor_vec,
         const float* rotated_parent,
-        BinaryCodeStorage<D>* out_code = nullptr) const
+        BinaryCodeStorage<D>& out_code) const
     {
         VertexAuxData aux;
+        out_code.clear();
 
-        if (out_code) {
-            out_code->clear();
+        alignas(32) float diff_op[D];
+        float nop_sq = 0.0f;
+        for (size_t i = 0; i < dim_; ++i) {
+            diff_op[i] = neighbor_vec[i] - parent_vec[i];
+            nop_sq += diff_op[i] * diff_op[i];
+        }
+        for (size_t i = dim_; i < D; ++i) diff_op[i] = 0.0f;
 
-            alignas(32) float diff_op[D];
-            float nop_sq = 0.0f;
-            for (size_t i = 0; i < dim_; ++i) {
-                diff_op[i] = neighbor_vec[i] - parent_vec[i];
-                nop_sq += diff_op[i] * diff_op[i];
-            }
-            for (size_t i = dim_; i < D; ++i) diff_op[i] = 0.0f;
+        float nop = std::sqrt(nop_sq);
+        aux.nop = nop;
 
-            float nop = std::sqrt(nop_sq);
-            aux.nop = nop;
-
-            if (nop < constants::norm_epsilon(D)) {
-                aux.ip_qo = 0.0f;
-                aux.ip_cp = 0.0f;
-                return aux;
-            }
-
-            float inv_nop = 1.0f / nop;
-            for (size_t i = 0; i < D; ++i) diff_op[i] *= inv_nop;
-
-            alignas(32) float rotated[D];
-            rotation_.apply_copy(diff_op, rotated);
-            for (size_t i = 0; i < padded_dim_; ++i) rotated[i] *= norm_factor_;
-
-            float l1_norm = 0.0f;
-            for (size_t i = 0; i < padded_dim_; ++i) {
-                out_code->set_bit(i, rotated[i] >= 0.0f);
-                l1_norm += std::abs(rotated[i]);
-            }
-
-            aux.ip_qo = l1_norm * inv_sqrt_d_;
-
-            aux.ip_cp = compute_ip_cp(*out_code, rotated_parent);
-
+        if (nop < constants::norm_epsilon(D)) {
+            aux.ip_qo = 0.0f;
+            aux.ip_cp = 0.0f;
             return aux;
         }
 
-        aux.nop = neighbor_code.nop;
-        aux.ip_qo = neighbor_code.ip_qo;
-        aux.ip_cp = 0.0f;
+        float inv_nop = 1.0f / nop;
+        for (size_t i = 0; i < D; ++i) diff_op[i] *= inv_nop;
+
+        alignas(32) float rotated[D];
+        rotation_.apply_copy(diff_op, rotated);
+        for (size_t i = 0; i < padded_dim_; ++i) rotated[i] *= norm_factor_;
+
+        float l1_norm = 0.0f;
+        for (size_t i = 0; i < padded_dim_; ++i) {
+            out_code.set_bit(i, rotated[i] >= 0.0f);
+            l1_norm += std::abs(rotated[i]);
+        }
+
+        aux.ip_qo = l1_norm * inv_sqrt_d_;
+        aux.ip_cp = compute_ip_cp(out_code, rotated_parent);
+
         return aux;
     }
 
+    uint64_t get_rotation_seed() const { return rotation_seed_; }
+    const std::vector<float>& get_centroid() const { return centroid_; }
+    void set_centroid(std::vector<float> c) { centroid_ = std::move(c); }
+
 protected:
     size_t dim_;
+    uint64_t rotation_seed_;
     RandomHadamardRotation rotation_;
     size_t padded_dim_;
     float norm_factor_;
     float inv_sqrt_d_;
     std::vector<float> centroid_;
-    bool has_centroid_;
 
 private:
     QueryType encode_query_raw_impl(const float* vec, float* buf,
@@ -229,7 +219,6 @@ public:
     using CodeType = RaBitQCode<D>;
     using QueryType = RaBitQQuery<D>;
     static constexpr size_t DIMS = D;
-    static constexpr size_t NUM_SUB_SEGMENTS = (D + 3) / 4;
 
     using Base::Base;
 
@@ -284,7 +273,6 @@ public:
     using QueryType = RaBitQQuery<D>;
     static constexpr size_t DIMS = D;
     static constexpr size_t BIT_WIDTH = BitWidth;
-    static constexpr size_t NUM_SUB_SEGMENTS = (D + 3) / 4;
     static constexpr int K_INT = (1 << BitWidth) - 1;
     static constexpr float K = static_cast<float>(K_INT);
 
@@ -295,7 +283,7 @@ public:
 
     using Base::Base;
 
-    // Parent-relative CAQ encoding keeps edge-distance formulas consistent.
+
     NbitNeighborResult compute_neighbor_aux_nbit(
         const float* parent_vec, const float* neighbor_vec,
         const float* rotated_parent) const
@@ -327,83 +315,14 @@ public:
         this->rotation_.apply_copy(diff, rotated);
         for (size_t i = 0; i < this->padded_dim_; ++i) rotated[i] *= this->norm_factor_;
 
-        const size_t pd = this->padded_dim_;
-
-        float buf_min = rotated[0], buf_max = rotated[0];
-        for (size_t i = 1; i < pd; ++i) {
-            if (rotated[i] < buf_min) buf_min = rotated[i];
-            if (rotated[i] > buf_max) buf_max = rotated[i];
-        }
-        float delta = (buf_max - buf_min) / K;
-        if (delta < constants::coordinate_epsilon(D))
-            delta = constants::coordinate_epsilon(D);
-        float inv_delta = 1.0f / delta;
-
-        thread_local std::vector<int> pr_codes;
-        pr_codes.resize(pd);
-
-        float dot_co = 0.0f, norm_c_sq = 0.0f;
-        for (size_t i = 0; i < pd; ++i) {
-            float val = (rotated[i] - buf_min) * inv_delta;
-            int u = static_cast<int>(val + 0.5f);
-            if (u < 0) u = 0;
-            if (u > K_INT) u = K_INT;
-            pr_codes[i] = u;
-            float c = (2.0f * u - K) / K;
-            dot_co += c * rotated[i];
-            norm_c_sq += c * c;
-        }
-
-        const size_t max_iters = adaptive_defaults::caq_max_iterations(D);
-        float prev_cos_sq = 0.0f;
-        for (size_t iter = 0; iter < max_iters; ++iter) {
-            bool changed = false;
-            for (size_t i = 0; i < pd; ++i) {
-                int old_u = pr_codes[i];
-                float old_c = (2.0f * old_u - K) / K;
-                float dot_without = dot_co - old_c * rotated[i];
-                float norm_without = norm_c_sq - old_c * old_c;
-                int best_u = old_u;
-                float best_dot = dot_co, best_norm = norm_c_sq;
-                for (int u = 0; u <= K_INT; ++u) {
-                    if (u == old_u) continue;
-                    float c = (2.0f * u - K) / K;
-                    float new_dot = dot_without + c * rotated[i];
-                    float new_norm = norm_without + c * c;
-                    if (new_dot * new_dot * best_norm > best_dot * best_dot * new_norm) {
-                        best_u = u;
-                        best_dot = new_dot;
-                        best_norm = new_norm;
-                    }
-                }
-                if (best_u != old_u) {
-                    float new_c = (2.0f * best_u - K) / K;
-                    dot_co = dot_without + new_c * rotated[i];
-                    norm_c_sq = norm_without + new_c * new_c;
-                    pr_codes[i] = best_u;
-                    changed = true;
-                }
-            }
-            if (!changed) break;
-            // Early exit when cosine quality improvement is negligible.
-            float cos_sq = (norm_c_sq > 0.0f) ? (dot_co * dot_co / norm_c_sq) : 0.0f;
-            if (iter > 0 && (cos_sq - prev_cos_sq) < constants::kCaqEarlyExitTol) break;
-            prev_cos_sq = cos_sq;
-        }
-
-        float ip_qo = 0.0f, ip_cp = 0.0f;
-        for (size_t i = 0; i < pd; ++i) {
-            result.code.set_value(i, static_cast<uint8_t>(pr_codes[i]));
-            float c = (2.0f * pr_codes[i] - K) / K;
-            ip_qo += c * rotated[i];
-            ip_cp += c * rotated_parent[i];
-        }
-        result.aux.ip_qo = ip_qo * this->inv_sqrt_d_;
-        result.aux.ip_cp = ip_cp * this->inv_sqrt_d_;
+        float ip_cp = 0.0f;
+        result.aux.ip_qo = caq_quantize(rotated, result.code,
+                                         rotated_parent, &ip_cp);
+        result.aux.ip_cp = ip_cp;
         return result;
     }
 
-    // Coordinate-descent CAQ maximizes cosine alignment in quantized space.
+
     CodeType encode_impl(const float* vec, float* buf, float* centered_buf) const {
         CodeType code;
         code.clear();
@@ -419,7 +338,6 @@ public:
 
         if (norm < constants::norm_epsilon(D)) {
             code.ip_qo = 0.0f;
-            code.msb_popcount = 0;
             return code;
         }
 
@@ -429,66 +347,100 @@ public:
         this->rotation_.apply_copy(centered_buf, buf);
         for (size_t i = 0; i < this->padded_dim_; ++i) buf[i] *= this->norm_factor_;
 
+        code.ip_qo = caq_quantize(buf, code.codes);
+        return code;
+    }
+
+private:
+    // CAQ (Cosine-Aligned Quantization): uniform initialization followed by
+    // coordinate-wise refinement maximizing cosine similarity between the
+    // N-bit quantized code and the rotated input vector.
+    //
+    // Returns ip_qo = <c_bar, rotated_buf> * inv_sqrt_d_, where
+    // c_bar[i] = (2*u[i] - K) / K in [-1, 1].
+    //
+    // IMPORTANT: ip_qo is NOT the true cosine <c_bar/||c_bar||, rotated_buf>
+    // because c_bar is not L2-normalized. The implicit ||c_bar|| factor
+    // cancels in the distance estimator ratio ip_corrected/ip_qo, since
+    // ip_corrected = <c_bar, query_lut_approx> * inv_sqrt_d_ - ip_cp is
+    // computed with the same unnormalized c_bar via the LUT fastscan.
+    //
+    // If rotated_parent != nullptr, also computes ip_cp into *out_ip_cp.
+    // ip_cp carries the same implicit ||c_bar|| and participates in the
+    // same cancellation.
+    float caq_quantize(const float* rotated_buf,
+                       NbitCodeStorage<D, BitWidth>& out_code,
+                       const float* rotated_parent = nullptr,
+                       float* out_ip_cp = nullptr) const {
         const size_t pd = this->padded_dim_;
 
-        thread_local std::vector<int> codes_arr;
-        codes_arr.resize(pd);
-
-        float dot_co = 0.0f;
-        float norm_c_sq = 0.0f;
-
-        float buf_min = buf[0], buf_max = buf[0];
+        float buf_min = rotated_buf[0], buf_max = rotated_buf[0];
         for (size_t i = 1; i < pd; ++i) {
-            if (buf[i] < buf_min) buf_min = buf[i];
-            if (buf[i] > buf_max) buf_max = buf[i];
+            if (rotated_buf[i] < buf_min) buf_min = rotated_buf[i];
+            if (rotated_buf[i] > buf_max) buf_max = rotated_buf[i];
         }
         float delta = (buf_max - buf_min) / K;
         if (delta < constants::coordinate_epsilon(D))
             delta = constants::coordinate_epsilon(D);
         float inv_delta = 1.0f / delta;
 
+        thread_local std::vector<int> codes_arr;
+        codes_arr.resize(pd);
+
+        float dot_co = 0.0f, norm_c_sq = 0.0f;
         for (size_t i = 0; i < pd; ++i) {
-            float val = (buf[i] - buf_min) * inv_delta;
+            float val = (rotated_buf[i] - buf_min) * inv_delta;
             int u = static_cast<int>(val + 0.5f);
             if (u < 0) u = 0;
             if (u > K_INT) u = K_INT;
             codes_arr[i] = u;
             float c = (2.0f * u - K) / K;
-            dot_co += c * buf[i];
+            dot_co += c * rotated_buf[i];
             norm_c_sq += c * c;
         }
 
-        const size_t max_iters = adaptive_defaults::caq_max_iterations(D);
+        constexpr size_t max_iters = 10;
         float prev_cos_sq = 0.0f;
         for (size_t iter = 0; iter < max_iters; ++iter) {
             bool changed = false;
             for (size_t i = 0; i < pd; ++i) {
                 int old_u = codes_arr[i];
                 float old_c = (2.0f * old_u - K) / K;
-
-                float dot_without = dot_co - old_c * buf[i];
+                float dot_without = dot_co - old_c * rotated_buf[i];
                 float norm_without = norm_c_sq - old_c * old_c;
-
                 int best_u = old_u;
-                float best_dot = dot_co;
-                float best_norm = norm_c_sq;
-
-                for (int u = 0; u <= K_INT; ++u) {
-                    if (u == old_u) continue;
-                    float c = (2.0f * u - K) / K;
-                    float new_dot = dot_without + c * buf[i];
-                    float new_norm = norm_without + c * c;
-
-                    if (new_dot * new_dot * best_norm > best_dot * best_dot * new_norm) {
-                        best_u = u;
-                        best_dot = new_dot;
-                        best_norm = new_norm;
+                float best_dot = dot_co, best_norm = norm_c_sq;
+                if constexpr (BitWidth >= 4) {
+                    // SAQ ±1 refinement: O(2) per dimension
+                    for (int delta : {-1, +1}) {
+                        int u_try = old_u + delta;
+                        if (u_try < 0 || u_try > K_INT) continue;
+                        float c = (2.0f * u_try - K) / K;
+                        float new_dot = dot_without + c * rotated_buf[i];
+                        float new_norm = norm_without + c * c;
+                        if (new_dot * new_dot * best_norm > best_dot * best_dot * new_norm) {
+                            best_u = u_try;
+                            best_dot = new_dot;
+                            best_norm = new_norm;
+                        }
+                    }
+                } else {
+                    // Exhaustive: O(K+1) per dimension — optimal for small K
+                    for (int u = 0; u <= K_INT; ++u) {
+                        if (u == old_u) continue;
+                        float c = (2.0f * u - K) / K;
+                        float new_dot = dot_without + c * rotated_buf[i];
+                        float new_norm = norm_without + c * c;
+                        if (new_dot * new_dot * best_norm > best_dot * best_dot * new_norm) {
+                            best_u = u;
+                            best_dot = new_dot;
+                            best_norm = new_norm;
+                        }
                     }
                 }
-
                 if (best_u != old_u) {
                     float new_c = (2.0f * best_u - K) / K;
-                    dot_co = dot_without + new_c * buf[i];
+                    dot_co = dot_without + new_c * rotated_buf[i];
                     norm_c_sq = norm_without + new_c * new_c;
                     codes_arr[i] = best_u;
                     changed = true;
@@ -501,16 +453,18 @@ public:
         }
 
         float ip_qo = 0.0f;
+        float ip_cp = 0.0f;
         for (size_t i = 0; i < pd; ++i) {
-            code.codes.set_value(i, static_cast<uint8_t>(codes_arr[i]));
+            out_code.set_value(i, static_cast<uint8_t>(codes_arr[i]));
             float c = (2.0f * codes_arr[i] - K) / K;
-            ip_qo += c * buf[i];
+            ip_qo += c * rotated_buf[i];
+            if (rotated_parent) ip_cp += c * rotated_parent[i];
         }
-
-        code.ip_qo = ip_qo * this->inv_sqrt_d_;
-        code.msb_popcount = static_cast<uint16_t>(code.codes.msb_popcount());
-        return code;
+        if (out_ip_cp) *out_ip_cp = ip_cp * this->inv_sqrt_d_;
+        // Unnormalized dot product scaled by inv_sqrt_d_. The omitted
+        // ||c_bar|| normalization cancels in ip_corrected/ip_qo.
+        return ip_qo * this->inv_sqrt_d_;
     }
 };
 
-}  // namespace cphnsw
+}

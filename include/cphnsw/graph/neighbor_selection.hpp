@@ -17,7 +17,7 @@ struct NeighborCandidate {
     }
 };
 
-// alpha-CNG pruning with adaptive local alpha and convergence radius tau.
+
 template <typename DistanceFn, typename ErrorFn>
 std::vector<NeighborCandidate> select_neighbors_alpha_cng(
     std::vector<NeighborCandidate> candidates,
@@ -25,7 +25,8 @@ std::vector<NeighborCandidate> select_neighbors_alpha_cng(
     DistanceFn distance_fn,
     ErrorFn error_fn,
     float alpha,
-    float tau)
+    float tau,
+    float alpha_max = 0.0f)
 {
     std::sort(candidates.begin(), candidates.end(),
               [](const auto& a, const auto& b) {
@@ -40,9 +41,12 @@ std::vector<NeighborCandidate> select_neighbors_alpha_cng(
 
     if (candidates.size() <= R) return candidates;
 
+    // If alpha_max not provided, default to 2·alpha (sqrt scaling cap)
+    if (alpha_max <= 0.0f) alpha_max = 2.0f * alpha;
+
     float local_alpha = alpha * std::sqrt(
         static_cast<float>(candidates.size()) / static_cast<float>(R));
-    local_alpha = std::clamp(local_alpha, 1.0f, constants::kAlphaMaxCap);
+    local_alpha = std::clamp(local_alpha, 1.0f, alpha_max);
 
     std::vector<NeighborCandidate> selected;
     selected.reserve(R);
@@ -83,4 +87,4 @@ std::vector<NeighborCandidate> select_neighbors_alpha_cng(
     return selected;
 }
 
-}  // namespace cphnsw
+}

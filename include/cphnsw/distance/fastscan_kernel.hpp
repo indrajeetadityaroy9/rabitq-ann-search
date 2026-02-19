@@ -6,13 +6,13 @@
 #include <cstdint>
 #include <cmath>
 #include <algorithm>
+#include <cstring>
+
 #include <immintrin.h>
 
 namespace cphnsw {
 
 namespace fastscan {
-
-constexpr size_t FLUSH_INTERVAL = constants::kFlushInterval;
 
 template <size_t D>
 inline void compute_inner_products(
@@ -59,7 +59,7 @@ inline void compute_inner_products(
 
         pairs_since_flush++;
 
-        if (pairs_since_flush >= FLUSH_INTERVAL || sp == NUM_SUB_PAIRS - 1) {
+        if (pairs_since_flush >= constants::kFlushInterval || sp == NUM_SUB_PAIRS - 1) {
             __m256i widened_lo = _mm256_cvtepu8_epi16(
                 _mm256_castsi256_si128(tmp_acc));
             acc_lo = _mm256_add_epi16(acc_lo, widened_lo);
@@ -108,8 +108,8 @@ inline void convert_to_distances_with_bounds(
     float dot_slack = query.dot_slack;
     float sqrt_dqp = std::sqrt(dist_qp_sq);
 
-    // Near-zero parent distance disables lower-bound pruning.
-    if (dist_qp_sq < constants::kNearZeroSq) {
+
+    if (dist_qp_sq < constants::eps::kSmall) {
         for (size_t i = 0; i < count; ++i) {
             float nop = nop_arr[i];
             out_dist[i] = nop * nop + dist_qp_sq;
@@ -117,6 +117,8 @@ inline void convert_to_distances_with_bounds(
         }
         return;
     }
+
+    size_t i = 0;
 
     const __m256 vA = _mm256_set1_ps(A);
     const __m256 vB = _mm256_set1_ps(B);
@@ -127,13 +129,12 @@ inline void convert_to_distances_with_bounds(
     const __m256 vdot_slack = _mm256_set1_ps(dot_slack);
     const __m256 vsqrt_dqp = _mm256_set1_ps(sqrt_dqp);
     const __m256 vdist_qp_sq = _mm256_set1_ps(dist_qp_sq);
-    const __m256 vip_thresh = _mm256_set1_ps(constants::kIpQualityEps);
+    const __m256 vip_thresh = _mm256_set1_ps(constants::eps::kMedium);
     const __m256 vzero = _mm256_setzero_ps();
     const __m256 vone = _mm256_set1_ps(1.0f);
     const __m256 vneg_one = _mm256_set1_ps(-1.0f);
     const __m256 vtwo = _mm256_set1_ps(2.0f);
 
-    size_t i = 0;
     for (; i + 8 <= count; i += 8) {
         __m256 fs = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(fastscan_sums + i)));
         __m128i pc16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(popcounts + i));
@@ -171,17 +172,18 @@ inline void convert_to_distances_with_bounds(
         _mm256_storeu_ps(out_lower + i, lower);
     }
 
+    // Scalar tail for remainder when count is not a multiple of 8
     for (; i < count; ++i) {
         float ip_approx = A * static_cast<float>(fastscan_sums[i])
                         + B * static_cast<float>(popcounts[i]) + C;
         float ip_qo_p = std::max(ip_qo_p_arr[i], ip_qo_floor);
         float ip_corrected = ip_approx - ip_cp_arr[i];
-        float ip_est = (ip_qo_p > constants::kIpQualityEps) ? ip_corrected / ip_qo_p : 0.0f;
+        float ip_est = (ip_qo_p > constants::eps::kMedium) ? ip_corrected / ip_qo_p : 0.0f;
         ip_est = affine_a * ip_est + affine_b;
         float nop = nop_arr[i];
         out_dist[i] = std::max(nop * nop + dist_qp_sq - 2.0f * nop * ip_est, 0.0f);
 
-        if (ip_qo_p <= constants::kIpQualityEps) {
+        if (ip_qo_p <= constants::eps::kMedium) {
             out_lower[i] = 0.0f;
             continue;
         }
@@ -244,7 +246,7 @@ inline void convert_nbit_to_distances_with_bounds(
     float B_msb = query.coeff_popcount;
     float sqrt_dqp = std::sqrt(dist_qp_sq);
 
-    if (dist_qp_sq < constants::kNearZeroSq) {
+    if (dist_qp_sq < constants::eps::kSmall) {
         for (size_t i = 0; i < count; ++i) {
             float nop = nop_arr[i];
             out_dist[i] = nop * nop + dist_qp_sq;
@@ -252,6 +254,8 @@ inline void convert_nbit_to_distances_with_bounds(
         }
         return;
     }
+
+    size_t i = 0;
 
     const __m256 vA_nbit = _mm256_set1_ps(A_nbit);
     const __m256 vB_nbit = _mm256_set1_ps(B_nbit);
@@ -264,13 +268,12 @@ inline void convert_nbit_to_distances_with_bounds(
     const __m256 vdot_slack = _mm256_set1_ps(dot_slack);
     const __m256 vsqrt_dqp = _mm256_set1_ps(sqrt_dqp);
     const __m256 vdist_qp_sq = _mm256_set1_ps(dist_qp_sq);
-    const __m256 vip_thresh = _mm256_set1_ps(constants::kIpQualityEps);
+    const __m256 vip_thresh = _mm256_set1_ps(constants::eps::kMedium);
     const __m256 vzero = _mm256_setzero_ps();
     const __m256 vone = _mm256_set1_ps(1.0f);
     const __m256 vneg_one = _mm256_set1_ps(-1.0f);
     const __m256 vtwo = _mm256_set1_ps(2.0f);
 
-    size_t i = 0;
     for (; i + 8 <= count; i += 8) {
         __m256 nbit_fs = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(nbit_fastscan_sums + i)));
         __m128i wpc16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(weighted_popcounts + i));
@@ -317,17 +320,18 @@ inline void convert_nbit_to_distances_with_bounds(
         _mm256_storeu_ps(out_lower + i, lower);
     }
 
+    // Scalar tail for remainder when count is not a multiple of 8
     for (; i < count; ++i) {
         float ip_approx_nbit = A_nbit * static_cast<float>(nbit_fastscan_sums[i])
                              + B_nbit * static_cast<float>(weighted_popcounts[i]) + C;
         float ip_qo_p = std::max(ip_qo_p_arr[i], ip_qo_floor);
         float ip_corrected_nbit = ip_approx_nbit - ip_cp_arr[i];
-        float ip_est_nbit = (ip_qo_p > constants::kIpQualityEps) ? ip_corrected_nbit / ip_qo_p : 0.0f;
+        float ip_est_nbit = (ip_qo_p > constants::eps::kMedium) ? ip_corrected_nbit / ip_qo_p : 0.0f;
         ip_est_nbit = affine_a * ip_est_nbit + affine_b;
         float nop = nop_arr[i];
         out_dist[i] = std::max(nop * nop + dist_qp_sq - 2.0f * nop * ip_est_nbit, 0.0f);
 
-        if (ip_qo_p <= constants::kIpQualityEps) {
+        if (ip_qo_p <= constants::eps::kMedium) {
             out_lower[i] = 0.0f;
             continue;
         }
@@ -341,9 +345,7 @@ inline void convert_nbit_to_distances_with_bounds(
     }
 }
 
-// Multi-plane lower-bound pass: uses top min(2, BitWidth) planes for tighter
-// bounds than MSB-only. For 2-bit this uses full information; for 4-bit it
-// captures ~60% of variance vs ~25% for MSB-only.
+
 template <size_t D, size_t BitWidth>
 inline void compute_msb_only_inner_products(
     const uint8_t lut[][16],
@@ -352,29 +354,20 @@ inline void compute_msb_only_inner_products(
 {
     constexpr size_t N_BOUND_PLANES = (BitWidth < 2) ? 1 : 2;
 
-    // Compute MSB plane (always needed).
     compute_inner_products<D>(lut, block.planes[0], out_msb);
 
     if constexpr (N_BOUND_PLANES >= 2 && BitWidth >= 2) {
-        // Add second-most-significant plane contribution.
         alignas(64) uint32_t plane1_sums[32];
         compute_inner_products<D>(lut, block.planes[1], plane1_sums);
 
-        // Weight MSB by 2^(B-1) and plane 1 by 2^(B-2).
-        // Scale out_msb: multiply existing by 2 (shift), add plane1.
-        // Result: out_msb[i] = 2 * msb_sum[i] + plane1_sum[i]
-        // This corresponds to top-2 weighted bits.
+
         for (size_t i = 0; i < 32; ++i) {
             out_msb[i] = 2 * out_msb[i] + plane1_sums[i];
         }
     }
 }
 
-// Lower bound conversion for multi-plane pre-filter sums.
-// When BitWidth >= 2, msb_fastscan_sums contain weighted top-2 plane sums:
-//   sum = 2 * plane0_sum + plane1_sum
-// The coefficients are scaled by 1/K_partial where K_partial = 3 (for top-2).
-// For 1-bit codes, this reduces to the original MSB-only formula.
+
 template <size_t D, size_t BitWidth = 1>
 inline void convert_msb_to_lower_bounds(
     const RaBitQQuery<D>& query,
@@ -387,8 +380,6 @@ inline void convert_msb_to_lower_bounds(
     float* out_lower,
     float dist_qp_sq)
 {
-    // For top-2 planes: K_partial = 2^1 + 2^0 = 3. Scale = 1/3.
-    // For MSB-only (1 plane): no scaling needed.
     constexpr size_t N_BOUND_PLANES = (BitWidth < 2) ? 1 : 2;
     constexpr float K_PARTIAL = (N_BOUND_PLANES >= 2) ? 3.0f : 1.0f;
     constexpr float INV_K_PARTIAL = 1.0f / K_PARTIAL;
@@ -402,7 +393,7 @@ inline void convert_msb_to_lower_bounds(
     float dot_slack = query.dot_slack;
     float sqrt_dqp = std::sqrt(dist_qp_sq);
 
-    if (dist_qp_sq < constants::kNearZeroSq) {
+    if (dist_qp_sq < constants::eps::kSmall) {
         for (size_t i = 0; i < count; ++i) {
             out_lower[i] = 0.0f;
         }
@@ -417,7 +408,7 @@ inline void convert_msb_to_lower_bounds(
         float ip_qo_p = std::max(ip_qo_p_arr[i], ip_qo_floor);
         float nop = nop_arr[i];
 
-        if (ip_qo_p <= constants::kIpQualityEps) {
+        if (ip_qo_p <= constants::eps::kMedium) {
             out_lower[i] = 0.0f;
             continue;
         }
@@ -433,6 +424,6 @@ inline void convert_msb_to_lower_bounds(
     }
 }
 
-} // namespace fastscan
+}
 
-}  // namespace cphnsw
+}

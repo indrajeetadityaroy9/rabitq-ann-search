@@ -11,7 +11,6 @@
 #include <queue>
 #include <algorithm>
 #include <limits>
-#include <stdexcept>
 
 namespace cphnsw {
 
@@ -66,14 +65,13 @@ std::vector<SearchResult> search(
     size_t k,
     float gamma,
     TwoLevelVisitationTable& visited,
-    size_t ef_cap = 0,
-    NodeId entry = INVALID_NODE,
-    const float* slack_levels = nullptr,
-    int num_slack_levels = 0)
+    NodeId entry,
+    const float* slack_levels,
+    int num_slack_levels,
+    float gamma_max,
+    float gamma_beta,
+    size_t gamma_warmup)
 {
-    if (entry == INVALID_NODE || !graph.is_alive(entry)) {
-        throw std::runtime_error("Search failed: invalid entry node.");
-    }
     NodeId ep = entry;
 
     uint64_t query_id = visited.new_query();
@@ -82,15 +80,19 @@ std::vector<SearchResult> search(
                        std::greater<BeamEntry>> beam;
     BoundedMaxHeap<SearchResult> nn(k);
 
-    // Per-query adaptive gamma: track estimation quality to tighten/widen.
-    float gamma_q = gamma;  // effective gamma, adjusted per-query
+
+    float gamma_q = gamma;
     double ratio_sum = 0.0, ratio_sq_sum = 0.0;
     size_t ratio_count = 0;
 
     float query_norm_sq = dot_product_simd<D>(raw_query, raw_query);
 
-    float ep_est = std::max(query_norm_sq + graph.get_norm_sq(ep)
-                   - 2.0f * dot_product_simd<D>(raw_query, graph.get_vector(ep)), 0.0f);
+    auto exact_l2 = [&](NodeId id) -> float {
+        return std::max(query_norm_sq + graph.get_norm_sq(id)
+               - 2.0f * dot_product_simd<D>(raw_query, graph.get_vector(id)), 0.0f);
+    };
+
+    float ep_est = exact_l2(ep);
     beam.push({ep_est, 0.0f, ep});
     visited.check_and_mark_estimated(ep, query_id);
 
@@ -114,9 +116,7 @@ std::vector<SearchResult> search(
         }
         if (!found) break;
 
-        // Distance-ratio termination: if the best unexplored candidate is
-        // gamma times worse than the current k-th nearest, further exploration
-        // is unlikely to improve results.
+
         if (nn.size() >= k && current.est_distance >= gamma_q * nn.worst_distance()) break;
 
         if (nn.size() >= k && current.lower_bound > nn.worst_distance()) continue;
@@ -125,23 +125,11 @@ std::vector<SearchResult> search(
             graph.prefetch_vertex(beam.top().id);
             graph.prefetch_vector(beam.top().id);
             graph.prefetch_norm(beam.top().id);
-            BeamEntry first_beam = beam.top();
-            beam.pop();
-            if (!beam.empty()) {
-                graph.prefetch_vertex(beam.top().id);
-                graph.prefetch_vector(beam.top().id);
-                graph.prefetch_norm(beam.top().id);
-            }
-            beam.push(first_beam);
         }
 
         visited.check_and_mark_visited(current.id, query_id);
-        if (!graph.is_alive(current.id)) {
-            throw std::runtime_error("Search failed: dead current node encountered.");
-        }
 
-        float exact_dist = std::max(query_norm_sq + graph.get_norm_sq(current.id)
-                           - 2.0f * dot_product_simd<D>(raw_query, graph.get_vector(current.id)), 0.0f);
+        float exact_dist = exact_l2(current.id);
         nn.push({current.id, exact_dist});
 
         const auto& nb = graph.get_neighbors(current.id);
@@ -163,6 +151,10 @@ std::vector<SearchResult> search(
             size_t batch_start = batch * BATCH;
             if (batch_start >= n_neighbors) break;
             size_t batch_count = std::min(BATCH, n_neighbors - batch_start);
+
+            if (batch + 1 < num_batches && (batch + 1) * BATCH < n_neighbors) {
+                prefetch_t<0>(reinterpret_cast<const char*>(&nb.code_blocks[batch + 1]));
+            }
 
             if constexpr (BitWidth == 1) {
                 fastscan::compute_inner_products(
@@ -214,30 +206,37 @@ std::vector<SearchResult> search(
             }
         }
 
-        // Warmup uses exact distances until the top-k heap is full.
+
         bool warmup = (nn.size() < k);
 
         size_t prefetch_count = std::min(n_neighbors, constants::kPrefetchNeighbors);
         for (size_t i = 0; i < prefetch_count; ++i) {
             NodeId nid = nb.neighbor_ids[i];
-            if (nid == INVALID_NODE) {
-                throw std::runtime_error("Search failed: invalid neighbor id in prefetch window.");
-            }
             visited.prefetch_estimated(nid);
         }
 
         for (size_t i = 0; i < n_neighbors; ++i) {
-            NodeId neighbor_id = nb.neighbor_ids[i];
-            if (neighbor_id == INVALID_NODE || !graph.is_alive(neighbor_id)) {
-                throw std::runtime_error("Search failed: invalid neighbor id encountered.");
+            if (i + constants::kPrefetchStride < n_neighbors) {
+                NodeId future_id = nb.neighbor_ids[i + constants::kPrefetchStride];
+                if (future_id != INVALID_NODE) {
+                    graph.prefetch_vertex(future_id);
+                }
             }
+
+            NodeId neighbor_id = nb.neighbor_ids[i];
             if (visited.check_and_mark_estimated(neighbor_id, query_id)) continue;
 
+            // DABS candidate-queue filtering threshold
+            float dabs_threshold = (nn.size() >= k)
+                ? gamma_q * nn.worst_distance()
+                : std::numeric_limits<float>::max();
+
             if (warmup) {
-                float exact = std::max(query_norm_sq + graph.get_norm_sq(neighbor_id)
-                              - 2.0f * dot_product_simd<D>(raw_query, graph.get_vector(neighbor_id)), 0.0f);
+                float exact = exact_l2(neighbor_id);
                 nn.push({neighbor_id, exact});
-                beam.push({exact, exact, neighbor_id});
+                if (exact < dabs_threshold) {
+                    beam.push({exact, exact, neighbor_id});
+                }
                 graph.prefetch_vertex(neighbor_id);
                 continue;
             }
@@ -247,50 +246,35 @@ std::vector<SearchResult> search(
             if (nn.size() >= k && lower >= nn.worst_distance()) continue;
 
             if (est_dist < nn.worst_distance()) {
-                float exact = std::max(query_norm_sq + graph.get_norm_sq(neighbor_id)
-                              - 2.0f * dot_product_simd<D>(raw_query, graph.get_vector(neighbor_id)), 0.0f);
+                float exact = exact_l2(neighbor_id);
                 nn.push({neighbor_id, exact});
-                beam.push({exact, lower, neighbor_id});
+                if (exact < dabs_threshold) {
+                    beam.push({exact, lower, neighbor_id});
+                }
 
-                // Track estimation ratio for adaptive gamma.
-                if (exact > constants::kNearZeroSq) {
+                if (exact > constants::eps::kSmall) {
                     double r = est_dist / exact;
                     ratio_sum += r;
                     ratio_sq_sum += r * r;
                     ++ratio_count;
-                    if (ratio_count >= constants::kAdaptiveGammaWarmup) {
+                    if (ratio_count >= gamma_warmup) {
                         double r_mean = ratio_sum / ratio_count;
                         double r_var = ratio_sq_sum / ratio_count - r_mean * r_mean;
                         double r_std = std::sqrt(std::max(r_var, 0.0));
-                        // Tighten gamma if estimates are accurate, widen if noisy.
                         gamma_q = std::clamp(
-                            gamma * static_cast<float>(1.0 + constants::kAdaptiveGammaBeta * r_std),
-                            constants::kAdaptiveGammaMin, constants::kAdaptiveGammaMax);
+                            gamma * static_cast<float>(1.0 + gamma_beta * r_std),
+                            gamma, gamma_max);
                     }
                 }
-            } else {
+            } else if (est_dist < dabs_threshold) {
                 beam.push({est_dist, lower, neighbor_id});
             }
             graph.prefetch_vertex(neighbor_id);
-        }
-
-        size_t trim_trigger = static_cast<size_t>(ef_cap * constants::kBeamTrimTrigger);
-        if (beam.size() > trim_trigger) {
-            std::priority_queue<BeamEntry, std::vector<BeamEntry>,
-                               std::greater<BeamEntry>> new_beam;
-            size_t keep = static_cast<size_t>(ef_cap * constants::kBeamTrimKeep);
-            size_t kept = 0;
-            while (!beam.empty() && kept < keep) {
-                new_beam.push(beam.top());
-                beam.pop();
-                kept++;
-            }
-            beam = std::move(new_beam);
         }
     }
 
     return nn.extract_sorted();
 }
 
-}  // namespace rabitq_search
-}  // namespace cphnsw
+}
+}

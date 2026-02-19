@@ -9,15 +9,13 @@
 #include <vector>
 #include <array>
 #include <queue>
-#include <mutex>
-#include <atomic>
 #include <cstring>
 #include <type_traits>
 #include <limits>
 
 namespace cphnsw {
 
-// Keep search-hot code+neighbors separate from raw vectors.
+
 template <size_t D, size_t R, size_t BitWidth = 1>
 struct alignas(64) VertexSearchData {
     using CodeType = std::conditional_t<BitWidth == 1,
@@ -45,7 +43,6 @@ public:
 
     explicit RaBitQGraph(size_t dim, size_t capacity = 1024)
         : dim_(dim) {
-        entry_point_.store(INVALID_NODE, std::memory_order_relaxed);
         search_data_.reserve(capacity);
         raw_vectors_.reserve(capacity);
         norm_sq_.reserve(capacity);
@@ -55,9 +52,8 @@ public:
         : dim_(other.dim_)
         , search_data_(std::move(other.search_data_))
         , raw_vectors_(std::move(other.raw_vectors_))
-        , norm_sq_(std::move(other.norm_sq_)) {
-        entry_point_.store(other.entry_point_.load(std::memory_order_relaxed),
-                           std::memory_order_relaxed);
+        , norm_sq_(std::move(other.norm_sq_))
+        , entry_point_(other.entry_point_) {
     }
 
     RaBitQGraph& operator=(RaBitQGraph&& other) noexcept {
@@ -66,8 +62,7 @@ public:
             search_data_ = std::move(other.search_data_);
             raw_vectors_ = std::move(other.raw_vectors_);
             norm_sq_ = std::move(other.norm_sq_);
-            entry_point_.store(other.entry_point_.load(std::memory_order_relaxed),
-                               std::memory_order_relaxed);
+            entry_point_ = other.entry_point_;
         }
         return *this;
     }
@@ -76,8 +71,6 @@ public:
     RaBitQGraph& operator=(const RaBitQGraph&) = delete;
 
     NodeId add_node(const CodeType& code, const float* vec) {
-        std::lock_guard<std::mutex> lock(graph_mutex_);
-
         NodeId id = static_cast<NodeId>(search_data_.size());
         search_data_.emplace_back();
         search_data_.back().code = code;
@@ -93,10 +86,7 @@ public:
         for (size_t j = 0; j < dim_; ++j) nsq += stored[j] * stored[j];
         norm_sq_.push_back(nsq);
 
-        NodeId expected = INVALID_NODE;
-        entry_point_.compare_exchange_strong(
-            expected, id,
-            std::memory_order_release, std::memory_order_relaxed);
+        if (entry_point_ == INVALID_NODE) entry_point_ = id;
 
         return id;
     }
@@ -110,12 +100,31 @@ public:
     size_t size() const { return search_data_.size(); }
     bool empty() const { return search_data_.empty(); }
 
-    NodeId entry_point() const {
-        return entry_point_.load(std::memory_order_acquire);
+    NodeId entry_point() const { return entry_point_; }
+
+    void set_entry_point(NodeId id) { entry_point_ = id; }
+
+    // Serialization accessors
+    const std::vector<SearchDataType, AlignedAllocator<SearchDataType>>& get_search_data() const {
+        return search_data_;
+    }
+    const std::vector<RawVector>& get_raw_vectors() const {
+        return raw_vectors_;
+    }
+    const AlignedVector<float>& get_norm_sq() const {
+        return norm_sq_;
     }
 
-    void set_entry_point(NodeId id) {
-        entry_point_.store(id, std::memory_order_release);
+    void restore_from_serialized(
+        std::vector<SearchDataType, AlignedAllocator<SearchDataType>> sd,
+        std::vector<RawVector> rv,
+        AlignedVector<float> ns,
+        NodeId ep)
+    {
+        search_data_ = std::move(sd);
+        raw_vectors_ = std::move(rv);
+        norm_sq_ = std::move(ns);
+        entry_point_ = ep;
     }
 
     const CodeType& get_code(NodeId id) const { return search_data_[id].code; }
@@ -127,9 +136,7 @@ public:
     bool is_alive(NodeId id) const { return id < search_data_.size(); }
 
     void prefetch_norm(NodeId id) const {
-        if (id < norm_sq_.size()) {
-            prefetch_t<1>(&norm_sq_[id]);
-        }
+        prefetch_t<1>(&norm_sq_[id]);
     }
 
     const NeighborBlockType& get_neighbors(NodeId id) const {
@@ -145,7 +152,6 @@ public:
             ? (sizeof(SearchDataType) / CACHE_LINE_SIZE) : constants::kPrefetchLineCap;
 
     void prefetch_vertex(NodeId id) const {
-        if (id >= search_data_.size()) return;
         const char* base = reinterpret_cast<const char*>(&search_data_[id]);
         for (size_t line = 0; line < PREFETCH_LINES; ++line) {
             prefetch_t<1>(base + line * CACHE_LINE_SIZE);
@@ -153,7 +159,6 @@ public:
     }
 
     void prefetch_vector(NodeId id) const {
-        if (id >= raw_vectors_.size()) return;
         const char* base = reinterpret_cast<const char*>(raw_vectors_[id].data());
         constexpr size_t VEC_LINES = (D * sizeof(float) + CACHE_LINE_SIZE - 1) / CACHE_LINE_SIZE;
         constexpr size_t MAX_VEC_LINES = (VEC_LINES < constants::kMaxVecPrefetchLines) ? VEC_LINES : constants::kMaxVecPrefetchLines;
@@ -177,12 +182,8 @@ public:
         return centroid;
     }
 
-    NodeId find_medoid() const {
-        if (empty()) return INVALID_NODE;
-
+    NodeId find_nearest_to_centroid(const std::vector<double>& centroid) const {
         size_t n = raw_vectors_.size();
-        auto centroid = compute_centroid();
-
         NodeId best = 0;
         double best_dist = std::numeric_limits<double>::max();
         for (size_t i = 0; i < n; ++i) {
@@ -197,20 +198,18 @@ public:
                 best = static_cast<NodeId>(i);
             }
         }
-
         return best;
     }
 
     struct Permutation {
         std::vector<NodeId> old_to_new;
-        std::vector<NodeId> new_to_old;
     };
 
     Permutation reorder_bfs(NodeId entry) {
         size_t n = search_data_.size();
         Permutation perm;
         perm.old_to_new.resize(n, INVALID_NODE);
-        perm.new_to_old.resize(n);
+        std::vector<NodeId> new_to_old(n);
 
         std::vector<bool> visited(n, false);
         std::queue<NodeId> bfs_queue;
@@ -224,7 +223,7 @@ public:
                 NodeId curr = bfs_queue.front();
                 bfs_queue.pop();
                 perm.old_to_new[curr] = next_new_id;
-                perm.new_to_old[next_new_id] = curr;
+                new_to_old[next_new_id] = curr;
                 next_new_id++;
 
                 const auto& nb = search_data_[curr].neighbors;
@@ -250,7 +249,7 @@ public:
         std::vector<RawVector> new_vectors(n);
         AlignedVector<float> new_norms(n);
         for (size_t new_id = 0; new_id < n; ++new_id) {
-            NodeId old_id = perm.new_to_old[new_id];
+            NodeId old_id = new_to_old[new_id];
             new_search[new_id] = std::move(search_data_[old_id]);
             new_vectors[new_id] = raw_vectors_[old_id];
             new_norms[new_id] = norm_sq_[old_id];
@@ -270,19 +269,28 @@ public:
         raw_vectors_ = std::move(new_vectors);
         norm_sq_ = std::move(new_norms);
 
-        NodeId old_ep = entry_point_.load(std::memory_order_relaxed);
+        NodeId old_ep = entry_point_;
         if (old_ep != INVALID_NODE && old_ep < n) {
-            entry_point_.store(perm.old_to_new[old_ep], std::memory_order_release);
+            entry_point_ = perm.old_to_new[old_ep];
         }
 
         return perm;
     }
 
-    NodeId find_hub_entry() const {
+    NodeId find_hub_entry(const std::vector<double>& centroid) const {
         if (empty()) return INVALID_NODE;
+        return find_hub_entry_impl(centroid);
+    }
 
+private:
+    size_t dim_;
+    std::vector<SearchDataType, AlignedAllocator<SearchDataType>> search_data_;
+    std::vector<RawVector> raw_vectors_;
+    AlignedVector<float> norm_sq_;
+    NodeId entry_point_ = INVALID_NODE;
+
+    NodeId find_hub_entry_impl(const std::vector<double>& centroid) const {
         size_t n = raw_vectors_.size();
-        auto centroid = compute_centroid();
 
         struct CentroidDist {
             NodeId id;
@@ -308,7 +316,6 @@ public:
 
         NodeId best = INVALID_NODE;
         size_t best_degree = 0;
-
         for (size_t i = 0; i < top_k && i < n; ++i) {
             NodeId cand = dists[i].id;
             size_t deg = search_data_[cand].neighbors.size();
@@ -317,17 +324,8 @@ public:
                 best = cand;
             }
         }
-
         return best;
     }
-
-private:
-    size_t dim_;
-    std::vector<SearchDataType, AlignedAllocator<SearchDataType>> search_data_;
-    std::vector<RawVector> raw_vectors_;
-    AlignedVector<float> norm_sq_;
-    std::atomic<NodeId> entry_point_;
-    mutable std::mutex graph_mutex_;
 };
 
-}  // namespace cphnsw
+}
